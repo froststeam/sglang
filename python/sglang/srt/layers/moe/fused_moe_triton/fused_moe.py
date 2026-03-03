@@ -20,6 +20,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_xpu,
     use_intel_xpu_backend,
 )
@@ -44,6 +45,7 @@ _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_xpu = is_xpu()
 _use_sgl_xpu = use_intel_xpu_backend()
+_is_musa = is_musa()
 
 from sglang.srt.server_args import get_global_server_args
 
@@ -63,6 +65,10 @@ elif _is_hip:
     # because the code uses moe_sum_reduce_triton as fallback (line 619)
 elif _is_xpu:
     from sgl_kernel import moe_sum_reduce, silu_and_mul
+elif _is_musa:
+    from sgl_kernel import moe_sum_reduce
+
+    _silu_and_mul_musa = torch.nn.SwishGLU()
 
 # Try to import vllm_ops for non-CUDA/HIP/XPU platforms
 _has_vllm_ops = False
