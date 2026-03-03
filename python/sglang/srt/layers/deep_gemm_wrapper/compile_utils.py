@@ -373,7 +373,6 @@ class _BF16F32WarmupExecutor(_BaseWarmupExecutor):
     def execute(self, m):
         deep_gemm.bf16_gemm_nt(self.lhs[:m], self.rhs, self.out[:m])
 
-
 class _BF16GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
         self.a = torch.empty(

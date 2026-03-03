@@ -128,7 +128,7 @@ _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
-if _is_cuda:
+if _is_cuda or _is_musa:
     from sgl_kernel import moe_fused_gate
 
     try:
@@ -171,7 +171,7 @@ if _is_cuda:
     except ImportError as e:
         pass
 
-if _is_cuda or _is_hip or _is_xpu:
+if _is_cuda or _is_hip or _is_xpu or _is_musa:
     from sgl_kernel import topk_softmax
 
     try:
@@ -1074,7 +1074,7 @@ def biased_grouped_topk_gpu(
         return topk_weights, topk_ids
 
     elif (
-        _is_cuda
+        (_is_cuda or _is_musa)
         # moe_fused_gate kernel ensures that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
         and experts_per_group <= 32
         and is_power_of_two(num_experts)
