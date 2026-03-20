@@ -2359,6 +2359,13 @@ class ServerArgs:
             if model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
 
+        # MUSA platforms compatible backends
+        if is_musa() and self.attention_backend == "fa3":
+            logger.warning(
+                "FA3 attention backend on MUSA only supports a page_size of 64, change page_size to 64."
+            )
+            self.page_size = 64
+
         # Other platforms backends
         if (
             self.attention_backend == "intel_amx"
