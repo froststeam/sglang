@@ -451,8 +451,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         )
 
         if has_finished:
-            accept_length = (accept_index.cpu() != -1).sum(dim=1) - 1
-            accept_length = accept_length.to(device=accept_index.device)
+            accept_length = (accept_index != -1).sum(dim=1) - 1
+            # accept_length = (accept_index.cpu() != -1).sum(dim=1) - 1
+            # accept_length = accept_length.to(device=accept_index.device)
         logger.info(
             f"===has_finished end======={has_finished=} {accept_length=} {accept_index=} {accept_index.is_contiguous()=}"
         )
