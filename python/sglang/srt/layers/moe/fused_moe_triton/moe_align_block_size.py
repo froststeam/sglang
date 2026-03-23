@@ -11,7 +11,7 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 
-if _is_cuda or _is_hip or _is_xpu:
+if _is_cuda or _is_hip or _is_xpu or True:
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
 
 

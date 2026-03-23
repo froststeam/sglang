@@ -396,7 +396,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             dispatch_output=dispatch_output,
         )
 
-    def forward_cuda(
+    def forward_musa(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,

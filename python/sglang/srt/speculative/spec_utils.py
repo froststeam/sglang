@@ -20,11 +20,12 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.common import get_last_loc
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_musa = is_musa()
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
@@ -46,7 +47,9 @@ SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
-TREE_SPEC_KERNEL_AVAILABLE = _is_cuda  # This kernel is only available for CUDA now
+TREE_SPEC_KERNEL_AVAILABLE = (
+    _is_cuda or _is_musa
+)  # This kernel is only available for CUDA now
 
 
 def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
@@ -118,6 +121,9 @@ def assign_req_to_token_pool(
         load_offset += BLOCK_SIZE
 
 
+count = 1
+
+
 def assign_req_to_token_pool_func(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -126,6 +132,23 @@ def assign_req_to_token_pool_func(
     out_cache_loc: torch.Tensor,
     batch_size: int,
 ):
+    # logger.info(f"=====start====")
+    # global count
+    # base = f"/mnt/seed17/001688/qzg/sgl_056_qwen3_5/assign-dumps/{torch.distributed.get_rank()}/{count}"
+    # import os
+    # os.makedirs(base, exist_ok=True)
+    # torch.save(req_pool_indices, f"{base}/req_pool_indices")
+    # torch.save(req_to_token, f"{base}/req_to_token")
+    # torch.save(start_offset, f"{base}/start_offset")
+    # torch.save(end_offset, f"{base}/end_offset")
+    # torch.save(out_cache_loc, f"{base}/out_cache_loc")
+    logger.info(f"{batch_size=} {end_offset=}")
+    # count += 1
+    if any(end_offset.abs() > 100000000):
+        logger.info(f"{end_offset=}")
+        raise
+    # logger.info(f"{req_pool_indices.stride()=} {req_to_token.stride()=} {start_offset.stride()=} {end_offset.stride()=} {out_cache_loc.stride()=}")
+
     assign_req_to_token_pool[(batch_size,)](
         req_pool_indices,
         req_to_token,
@@ -177,7 +200,7 @@ def assign_draft_cache_locs(
         mask = copy_offset < copy_len
         data = tl.load(out_cache_ptr + copy_offset, mask=mask)
         tl.store(token_pool + kv_start + copy_offset, data, mask=mask)
-    if page_size != 1 and topk != 1 and duplicate_cache_len > 0:
+    if (page_size != 1 and topk != 1) and duplicate_cache_len > 0:
         # Part 2: Copy indices into source_cache_loc and target_cache_loc
         # Expected output: src:[8,9,10,8,9,10...] tgt:[16,17,18,24,25,26...]
         prefix_len = tl.load(seq_lens + pid)

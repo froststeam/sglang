@@ -39,9 +39,9 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, next_power_of_2
+from sglang.srt.utils import is_cuda, is_musa, next_power_of_2
 
-if is_cuda():
+if is_cuda() or is_musa():
     from sgl_kernel import (
         top_k_renorm_prob,
         top_p_renorm_prob,
@@ -124,6 +124,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 batch.req_pool_indices,
                 prefix_lens,
             )
+            logger.info(f"0 {end_offset=}")
+            logger.info(f"1 {end_offset_cpu=}")
+
             batch.out_cache_loc = alloc_paged_token_slots_extend(
                 batch.tree_cache,
                 prefix_lens,
@@ -134,6 +137,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 len(batch.input_ids),
             )
             self.last_loc = last_loc
+
+            logger.info(f"2 {end_offset=}")
+            logger.info(f"3 {end_offset_cpu=}")
 
         bs = batch.batch_size()
         assign_req_to_token_pool_func(
@@ -323,6 +329,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 target_predict=target_predict,
                 topk=self.topk,
             )
+            logger.info(f"===verify_tree_greedy_func end======={accept_index=}")
 
         else:
             # apply temperature and get target probs
@@ -386,12 +393,18 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 bs=bs,
                 spec_steps=self.spec_steps,
             )
+        logger.info(
+            f"===generate_simulated_accept_index end======={accept_length=} {accept_index=}"
+        )
 
         unfinished_index = []
         unfinished_accept_index = []
         accept_index_cpu = accept_index.tolist()
         predict_cpu = predict.tolist()
         has_finished = False
+        logger.info(
+            f"===generate_simulated_accept_index end======={accept_length=} {accept_index_cpu=}"
+        )
 
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
@@ -408,6 +421,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     has_finished = True
                     # set all tokens after finished token to -1 and break
                     accept_index[i, j + 1 :] = -1
+                    logger.info(f"==={has_finished=}======={i=} {j=} {accept_index}")
                     break
                 else:
                     if req.grammar is not None:
@@ -432,8 +446,16 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             req.spec_accepted_tokens += accepted_draft_tokens
             req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
+        logger.info(
+            f"===has_finished start======={has_finished=} {accept_length=} {accept_index=}"
+        )
+
         if has_finished:
-            accept_length = (accept_index != -1).sum(dim=1) - 1
+            accept_length = (accept_index.cpu() != -1).sum(dim=1) - 1
+            accept_length = accept_length.to(device=accept_index.device)
+        logger.info(
+            f"===has_finished end======={has_finished=} {accept_length=} {accept_index=} {accept_index.is_contiguous()=}"
+        )
 
         # Free the KV cache for unaccepted tokens
         # TODO: fuse them
@@ -452,6 +474,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         else:
             if self.topk == 1:
                 # Only evict full empty page. Do not evict partial empty page
+                logger.info(
+                    f"===align_evict_mask_to_page_size start======={batch.seq_lens=}"
+                )
+
                 align_evict_mask_to_page_size[len(batch.seq_lens),](
                     batch.seq_lens,
                     evict_mask,
@@ -459,6 +485,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     self.draft_token_num,
                     next_power_of_2(self.draft_token_num),
                 )
+                logger.info(
+                    f"===align_evict_mask_to_page_size end======={batch.seq_lens=}"
+                )
+
                 token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
             else:
                 # Shift the accepted tokens to the beginning.
@@ -540,6 +570,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 accepted_indices=accept_index,
             )
         else:
+            logger.info(
+                f"{page_size=}, {self.topk=} {batch.seq_lens=} {accept_length=} {batch.seq_lens + accept_length + 1=}"
+            )
             if page_size == 1 or self.topk == 1:
                 assign_req_to_token_pool_func(
                     batch.req_pool_indices,
