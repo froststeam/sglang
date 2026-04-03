@@ -1367,7 +1367,6 @@ class FlashAttentionBackend(AttentionBackend):
         **kwargs,
     ):
         """Internal implementation of forward_decode, wrapped by context manager."""
-        k_descale, v_descale = None, None
         flash_attn_with_kvcache_base = flash_attn_with_kvcache_fa3
 
         flash_attn_with_kvcache = (
