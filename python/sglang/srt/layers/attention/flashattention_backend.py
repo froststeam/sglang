@@ -431,6 +431,12 @@ class FlashAttentionBackend(AttentionBackend):
                 model_runner.model_config.full_attention_interval
             )
 
+    def _get_attention_kernels(self):
+        """Get the appropriate attention kernels based on the implementation version."""
+        if self.fa_impl_ver == 4:
+            return flash_attn_varlen_func_fa4, flash_attn_with_kvcache_fa4
+        return flash_attn_varlen_func_fa3, flash_attn_with_kvcache_fa3
+
     # TODO: This function is currently designed to create a context for MUSA devices
     # to automatically inject scheduler metadata. Refactoring may be required
     # if other devices use it in the future.
@@ -881,19 +887,6 @@ class FlashAttentionBackend(AttentionBackend):
             and not is_swa_layer
         )
 
-        flash_attn_varlen_func_base = flash_attn_varlen_func_fa3
-        flash_attn_with_kvcache_base = flash_attn_with_kvcache_fa3
-
-        flash_attn_varlen_func = (
-            flash_attn_varlen_func_fa4
-            if self.fa_impl_ver == 4
-            else flash_attn_varlen_func_base
-        )
-        flash_attn_with_kvcache = (
-            flash_attn_with_kvcache_fa4
-            if self.fa_impl_ver == 4
-            else flash_attn_with_kvcache_base
-        )
 
         kwargs = {}
         if sinks is not None:
@@ -982,6 +975,8 @@ class FlashAttentionBackend(AttentionBackend):
         **kwargs,
     ):
         """Internal implementation of forward_extend, wrapped by context manager."""
+        flash_attn_varlen_func, flash_attn_with_kvcache = self._get_attention_kernels()
+
         # Use Flash Attention for prefill
         if not self.use_mla:
             # Do multi-head attention
@@ -1367,13 +1362,7 @@ class FlashAttentionBackend(AttentionBackend):
         **kwargs,
     ):
         """Internal implementation of forward_decode, wrapped by context manager."""
-        flash_attn_with_kvcache_base = flash_attn_with_kvcache_fa3
-
-        flash_attn_with_kvcache = (
-            flash_attn_with_kvcache_fa4
-            if self.fa_impl_ver == 4
-            else flash_attn_with_kvcache_base
-        )
+        _, flash_attn_with_kvcache = self._get_attention_kernels()
 
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
