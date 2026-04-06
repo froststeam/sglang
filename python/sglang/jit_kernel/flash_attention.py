@@ -2,10 +2,20 @@ from typing import Optional, Union
 
 import torch
 
+from sglang.srt.utils import is_musa
+
 from .flash_attention_v3 import flash_attn_varlen_func as fa3_flash_attn_varlen_func
 from .flash_attention_v3 import flash_attn_with_kvcache as fa3_flash_attn_with_kvcache
 from .flash_attention_v4 import flash_attn_varlen_func as fa4_flash_attn_varlen_func
 from .flash_attention_v4 import flash_attn_with_kvcache as fa4_flash_attn_with_kvcache
+
+if is_musa():
+    from sglang.srt.hardware_backend.musa.attention import (
+        flash_attn_varlen_func as fa3_flash_attn_varlen_func,
+    )
+    from sglang.srt.hardware_backend.musa.attention import (
+        flash_attn_with_kvcache as fa3_flash_attn_with_kvcache,
+    )
 
 
 def flash_attn_with_kvcache(
