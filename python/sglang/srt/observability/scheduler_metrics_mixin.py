@@ -409,6 +409,7 @@ class SchedulerMetricsMixin:
             {
                 "cpu": "cpu graph",
                 "npu": "npu graph",
+                "musa": "musa graph",
             },
         )
 
@@ -649,6 +650,7 @@ class SchedulerMetricsMixin:
             {
                 "cpu": "cpu graph",
                 "npu": "npu graph",
+                "musa": "musa graph",
             },
         )
         msg += (
