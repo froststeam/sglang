@@ -49,12 +49,13 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 _is_npu = is_npu()
+_is_musa = is_musa()
 
 if _is_npu:
     import torch_npu
@@ -83,8 +84,14 @@ elif _is_xpu:
     from sgl_kernel import awq_dequantize
 
     warnings.warn(f"XPU does not support fused_marlin_moe currently.")
+elif _is_musa:
+    from sglang.srt.layers.quantization.awq_triton import (
+        awq_dequantize_triton as awq_dequantize,
+    )
+
+    warnings.warn(f"MUSA does not support fused_marlin_moe currently.")
 else:
-    warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+    warnings.warn(f"Only CUDA, HIP, XPU and MUSA support AWQ currently.")
 
 logger = logging.getLogger(__name__)
 

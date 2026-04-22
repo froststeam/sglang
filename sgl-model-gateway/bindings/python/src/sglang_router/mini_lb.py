@@ -433,8 +433,14 @@ async def handle_completion_request(request_data: dict):
     return await _forward_to_backend(request_data, "v1/completions")
 
 
+DP_ROUND_ROBIN = 0
+
+
 def _generate_bootstrap_room():
-    return random.randint(0, 2**63 - 1)
+    global DP_ROUND_ROBIN
+    DP_ROUND_ROBIN = (DP_ROUND_ROBIN + 1) % 128
+    bootstrap_room = (random.randint(0, 2**63 - 1) // 128) * 128 + DP_ROUND_ROBIN
+    return bootstrap_room
 
 
 # We may utilize `GenerateReqInput`'s logic later

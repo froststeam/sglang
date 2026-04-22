@@ -88,6 +88,26 @@ class MoeRunner:
     def run(
         self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo, lora_info=None
     ) -> CombineInput:
+        # XXX (MUSA): Prevent crash when the expert receives a token value of zero
+        if dispatch_output.format.is_deepep_normal():
+            (
+                hidden_states,
+                _,
+                topk_ids,
+                topk_weights,
+                num_recv_tokens_per_expert,
+            ) = dispatch_output
+            all_tokens = sum(num_recv_tokens_per_expert)
+            if all_tokens == 0:
+                from sglang.srt.layers.moe.token_dispatcher.deepep import (
+                    DeepEPNormalCombineInput,
+                )
+
+                return DeepEPNormalCombineInput(
+                    hidden_states=hidden_states.bfloat16(),
+                    topk_ids=topk_ids,
+                    topk_weights=topk_weights,
+                )
         if self.fused_func is not None and not self.lora_enabled:
             return self.fused_func(dispatch_output, quant_info, self.config)
 

@@ -16,14 +16,15 @@ from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
+from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_musa, is_npu
 
 global _use_multi_stream
 _is_cuda = is_cuda()
+_is_musa = is_musa()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
-if _is_cuda:
+if _is_cuda or _is_musa:
     try:
         import deep_gemm
     except ImportError as e:
@@ -182,7 +183,7 @@ class Indexer(MultiPlatformOp):
         else:
             self.cp_size = None
             self.cp_rank = None
-        if _is_cuda:
+        if _is_cuda or _is_musa:
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
             pp_size = get_global_server_args().pp_size
@@ -209,7 +210,7 @@ class Indexer(MultiPlatformOp):
             self.hidden_size,
             self.n_heads,
             bias=False,
-            params_dtype=torch.bfloat16 if _is_cuda else torch.float32,
+            params_dtype=torch.bfloat16 if (_is_cuda or _is_musa) else torch.float32,
             prefix=add_prefix("weights_proj", prefix),
         )
         self.k_norm = LayerNorm(self.head_dim, dtype=torch.float32)
@@ -418,7 +419,7 @@ class Indexer(MultiPlatformOp):
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
-        if _is_cuda:
+        if _is_cuda or _is_musa:
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32, blocksize, self.sm_count
@@ -979,7 +980,7 @@ class Indexer(MultiPlatformOp):
 
         # Fast path: JIT fused store (CUDA, page_size=64, non-fnuz)
         if (
-            _is_cuda
+            (_is_cuda or _is_musa)
             and (not _is_fp8_fnuz)
             and can_use_nsa_fused_store(
                 key.dtype,
@@ -1149,7 +1150,7 @@ class Indexer(MultiPlatformOp):
 
             weights = self._get_logits_head_gate(x_for_gate, q_scale)
 
-        if _is_cuda or _is_hip:
+        if _is_cuda or _is_hip or _is_musa:
             assert forward_batch.seq_lens_cpu is not None
             if len(forward_batch.seq_lens_cpu) == 0:
                 # this seems b/c max-pad, no worries?

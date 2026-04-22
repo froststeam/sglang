@@ -352,7 +352,6 @@ class MoEGate(nn.Module):
 
 
 class DeepseekV2MoE(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -777,6 +776,9 @@ class DeepseekV2MoE(nn.Module):
         sbo_overlap_combine_flag = (
             sbo_enabled_flag and SboFlags.enable_combine_shared_two_stream_overlap()
         )
+        sbo_overlap_combine_shared_flag = (
+            sbo_enabled_flag and SboFlags.enable_combine_shared_one_stream_overlap()
+        )
 
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
@@ -844,6 +846,22 @@ class DeepseekV2MoE(nn.Module):
             )
             post_combine_hook_handle = (
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
+            )
+
+        elif sbo_overlap_combine_shared_flag:
+            shared_output = None
+
+            def _deepep_combine_hook(dispatcher: BaseDispatcher):
+                nonlocal shared_output
+                shared_output = self._forward_shared_experts(hidden_states)
+                for handle in deepep_combine_hook_handle:
+                    handle.remove()
+
+            assert isinstance(self.experts.dispatcher, MaybeTboDeepEPDispatcher)
+            deepep_combine_hook_handle = (
+                self.experts.dispatcher.register_deepep_combine_hook(
+                    _deepep_combine_hook
+                )
             )
 
         elif sbo_overlap_combine_flag:
@@ -1550,7 +1568,6 @@ class DeepseekV2AttentionMLA(
 
 
 class DeepseekV2DecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,

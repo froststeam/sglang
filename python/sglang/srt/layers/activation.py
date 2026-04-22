@@ -51,12 +51,10 @@ _is_cpu = is_cpu()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 
-if _is_cuda or _is_xpu:
+if _is_cuda or _is_xpu or _is_musa:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 elif _is_hip:
     from sgl_kernel import gelu_and_mul, gelu_quick, gelu_tanh_and_mul, silu_and_mul
-elif _is_musa:
-    from sgl_kernel import silu_and_mul
 
 if is_npu():
     import torch_npu

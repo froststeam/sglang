@@ -22,7 +22,10 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.utils import is_sbo_enabled
-from sglang.srt.utils import is_blackwell
+from sglang.srt.utils import get_bool_env_var, is_blackwell, is_musa
+
+_is_musa = is_musa()
+_is_combine_shared_one_stream = get_bool_env_var("SGLANG_SBO_COMBINE_SHARED")
 
 
 class SboFlags:
@@ -30,6 +33,11 @@ class SboFlags:
 
     @classmethod
     def enable_combine_down_gemm_two_stream_overlap(cls):
+        # XXX (MUSA): MUSA does not support combine_down_gemm_two_stream_overlap
+        # TODO: enable it when MUSA supports it
+        if _is_musa:
+            return False
+
         return (
             is_sbo_enabled()
             # currently only cutedsl backend supports it
@@ -48,14 +56,23 @@ class SboFlags:
         )
 
     @classmethod
+    def enable_combine_shared_one_stream_overlap(cls):
+        return is_sbo_enabled() and _is_combine_shared_one_stream
+
+    @classmethod
     def enable_dispatch_shared_one_stream_overlap(cls):
-        return is_sbo_enabled() and not is_blackwell()
+        return (
+            is_sbo_enabled()
+            and not is_blackwell()
+            and not _is_combine_shared_one_stream
+        )
 
     @classmethod
     def fuse_shared_experts_inside_sbo(cls):
         return (
             cls.enable_combine_shared_two_stream_overlap()
             or cls.enable_dispatch_shared_one_stream_overlap()
+            or cls.enable_combine_shared_one_stream_overlap()
         )
 
 
@@ -83,7 +100,8 @@ def compute_overlap_args(dispatch_output, alt_stream):
         SboFlags.enable_combine_down_gemm_two_stream_overlap()
         or SboFlags.enable_combine_shared_two_stream_overlap()
     ):
-        return None, None, {}
+        # XXX (MUSA): remove the None return when MUSA supports overall of SBO
+        return None, None, {} if not _is_musa else None
 
     hidden_states = dispatch_output.hidden_states
 

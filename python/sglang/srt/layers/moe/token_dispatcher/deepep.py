@@ -67,6 +67,13 @@ class DeepEPPDispatchHooks(DispatcherBaseHooks):
             hook_fun(dispatcher)
 
 
+class DeepEPPCombineHooks(DispatcherBaseHooks):
+
+    def __call__(self, dispatcher: BaseDispatcher):
+        for hook_fun in self.hook_dict.values():
+            hook_fun(dispatcher)
+
+
 class DeepEPNormalDispatchOutput(NamedTuple):
     """DeepEP normal dispatch output."""
 
@@ -226,6 +233,7 @@ class DeepEPBuffer:
             num_qps_per_rank=num_qps_per_rank,
             # TODO can be false when unneeded
             allow_mnnvl=True,
+            allow_nvlink_for_low_latency_mode=envs.SGLANG_DEEPEP_LL_USE_NVLINK.get(),
         )
         return cls._buffer
 
@@ -466,7 +474,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
-            expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
+            expert_alignment=(
+                deep_gemm_wrapper.DEEPGEMM_BLOCK_M
+                if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                else 1
+            ),
             config=DeepEPConfig.get_instance().normal_dispatch_config,
         )
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
@@ -770,6 +782,7 @@ class DeepEPDispatcher(BaseDispatcher):
 
         self._stage = _Stage.INITIAL
         self._deepep_dispatch_hooks = DeepEPPDispatchHooks()
+        self._deepep_combine_hooks = DeepEPPCombineHooks()
 
     def dispatch(
         self,
@@ -805,6 +818,8 @@ class DeepEPDispatcher(BaseDispatcher):
         combine_input: CombineInput,
     ) -> torch.Tensor:
         self.combine_a(combine_input)
+        if self._deepep_combine_hooks is not None:
+            self._deepep_combine_hooks(self)
         ret = self.combine_b()
         return ret
 
@@ -870,3 +885,6 @@ class DeepEPDispatcher(BaseDispatcher):
 
     def register_deepep_dispatch_hook(self, hook):
         return self._deepep_dispatch_hooks.register_hook(hook)
+
+    def register_deepep_combine_hook(self, hook):
+        return self._deepep_combine_hooks.register_hook(hook)

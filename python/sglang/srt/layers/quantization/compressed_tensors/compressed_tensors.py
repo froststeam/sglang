@@ -65,11 +65,13 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_musa = is_musa()
 _is_hip = is_hip()
+
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -136,7 +138,7 @@ class CompressedTensorsConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 70
+        return 70 if not _is_musa else 31
 
     def get_name(self) -> str:
         return "compressed_tensors"

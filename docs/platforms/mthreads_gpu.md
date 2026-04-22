@@ -9,10 +9,6 @@ You can install SGLang using one of the methods below.
 ### Install from Source
 
 ```bash
-# Use the default branch
-git clone https://github.com/sgl-project/sglang.git
-cd sglang
-
 # Compile sgl-kernel
 pip install --upgrade pip
 cd sgl-kernel

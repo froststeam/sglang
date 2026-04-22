@@ -2730,6 +2730,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        # XXX (MUSA): Draft worker should not record expert distribution, which maybe cause hang
+        if self.is_draft_worker:
+            return self._forward_raw(
+                forward_batch,
+                skip_attn_backend_init,
+                pp_proxy_tensors,
+                reinit_attn_backend,
+                split_forward_count,
+            )
+
         self.forward_pass_id += 1
 
         with get_global_expert_distribution_recorder().with_forward_pass(

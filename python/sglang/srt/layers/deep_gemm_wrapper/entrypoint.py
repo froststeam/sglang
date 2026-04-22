@@ -8,6 +8,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper import compile_utils
 from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     DEEPGEMM_BLACKWELL,
+    DEEPGEMM_BLOCK_M,
     DEEPGEMM_NEED_TMA_ALIGNED_SCALES,
     DEEPGEMM_SCALE_LAYOUT_COLUMN_MAJOR,
     DEEPGEMM_SCALE_TMA_ALIGNED,
@@ -15,6 +16,7 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     ENABLE_JIT_DEEPGEMM,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import is_musa
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +25,8 @@ if ENABLE_JIT_DEEPGEMM:
     from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor  # noqa: F401
 
 _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
+
+_is_musa = is_musa()
 
 
 # TODO maybe rename these functions
@@ -49,22 +53,56 @@ def grouped_gemm_nt_f8f8bf16_masked(
             overlap_args.num_sms if overlap_args is not None else None
         ):
 
+            kwargs = {}
+            if overlap_args is not None:
+                kwargs = {
+                    "enable_overlap": True,
+                    "signal": overlap_args.signal,
+                }
+                # XXX (MUSA): max_block_n is not supported on MUSA
+                if not _is_musa:
+                    kwargs["max_block_n"] = max_block_n
+
             return deep_gemm.fp8_m_grouped_gemm_nt_masked(
                 lhs,
                 rhs,
                 out,
                 masked_m,
                 expected_m,
-                **(
-                    dict(
-                        enable_overlap=True,
-                        max_block_n=max_block_n,
-                        signal=overlap_args.signal,
-                    )
-                    if overlap_args is not None
-                    else {}
-                ),
+                **kwargs,
             )
+
+
+def grouped_gemm_nt_bf16_masked(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    d: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    overlap_args: Optional[Any] = None,
+    max_block_n: int = 256,
+):
+    with configure_deep_gemm_num_sms(
+        overlap_args.num_sms if overlap_args is not None else None
+    ):
+        kwargs = {}
+        if overlap_args is not None:
+            kwargs = {
+                "enable_overlap": True,
+                "signal": overlap_args.signal,
+            }
+            # XXX (MUSA): max_block_n is not supported on MUSA
+            if not _is_musa:
+                kwargs["max_block_n"] = max_block_n
+
+        return deep_gemm.m_grouped_bf16_gemm_nt_masked(
+            a,
+            b,
+            d,
+            masked_m,
+            expected_m,
+            **kwargs,
+        )
 
 
 def grouped_gemm_nt_f8f8bf16_contig(
@@ -81,7 +119,21 @@ def grouped_gemm_nt_f8f8bf16_contig(
     _sanity_check_input(rhs)
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
-        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(lhs, rhs, out, m_indices)
+        kwargs = {"alignment_m": DEEPGEMM_BLOCK_M} if _is_musa else {}
+        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+            lhs,
+            rhs,
+            out,
+            m_indices,
+            **kwargs,
+        )
+
+
+def grouped_gemm_nt_bf16_contig(
+    a: torch.Tensor, b: torch.Tensor, d: torch.Tensor, m_indices: torch.Tensor
+):
+    kwargs = {"alignment_m": DEEPGEMM_BLOCK_M} if _is_musa else {}
+    deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, m_indices, **kwargs)
 
 
 def gemm_nt_f8f8bf16(

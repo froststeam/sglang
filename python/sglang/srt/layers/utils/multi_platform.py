@@ -96,6 +96,9 @@ class MultiPlatformOp(nn.Module):
     def forward_cpu(self, *args, **kwargs):
         return self.forward_native(*args, **kwargs)
 
+    def forward_musa(self, *args, **kwargs):
+        return self.forward_cuda(*args, **kwargs)
+
     def dispatch_forward(self):
         if _is_cuda:
             return self.forward_cuda
