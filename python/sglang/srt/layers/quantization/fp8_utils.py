@@ -672,8 +672,8 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     q_input, x_scale = sglang_per_token_group_quant_fp8(
         input_2d,
         block_size[1],
-        column_major_scales=True,
-        scale_tma_aligned=True,
+        column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_LAYOUT_COLUMN_MAJOR,
+        scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_TMA_ALIGNED,
         scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
     )
 
