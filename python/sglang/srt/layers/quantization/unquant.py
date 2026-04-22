@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.srt.custom_op import CustomOp
+from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.moe import (
     MoeRunner,
@@ -25,6 +26,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_hip,
+    is_musa,
     next_power_of_2,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -41,6 +43,8 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_musa = is_musa()
+_use_musa_fused_kernel = envs.SGLANG_USE_MUSA_FUSED_KERNEL.get() and _is_musa
 
 if _use_aiter:
     from aiter import ActivationType
@@ -139,7 +143,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
-
         return F.linear(x, layer.weight, bias)
 
 
@@ -232,12 +235,28 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+
+        from sglang.srt.layers import deep_gemm_wrapper
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
         self.moe_runner_config = moe_runner_config
-        backend = (
-            MoeRunnerBackend.TRITON_KERNELS
-            if self.use_triton_kernels
-            else MoeRunnerBackend.TRITON
-        )
+        backend = get_moe_runner_backend()
+        if backend.is_auto():
+            if (
+                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and (
+                    get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_mooncake()
+                )
+                and get_bool_env_var("SGLANG_DEEPEP_BF16_DISPATCH")
+            ):
+                backend = MoeRunnerBackend.DEEP_GEMM
+            else:
+                if self.use_triton_kernels:
+                    backend = MoeRunnerBackend.TRITON_KERNELS
+                else:
+                    backend = MoeRunnerBackend.TRITON
+
         self.runner = MoeRunner(backend, moe_runner_config)
 
     @property
@@ -263,7 +282,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
 
         moe_runner_config = self.moe_runner_config
 
@@ -280,11 +298,22 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 w2_bias=getattr(layer, "w2_weight_bias", None),
             )
             return self.runner.run(dispatch_output, quant_info)
+        elif self.runner.runner_backend.is_deep_gemm():
+            w13_weight = layer.w13_weight
+            w2_weight = layer.w2_weight
+            from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
+
+            quant_info = DeepGemmMoeQuantInfo(
+                w13_weight=w13_weight,
+                w2_weight=w2_weight,
+                use_fp8=False,
+            )
+            return self.runner.run(dispatch_output, quant_info)
         elif self.use_flashinfer_cutlass:
             output = flashinfer_cutlass_fused_moe(
                 input=x,
-                token_selected_experts=topk_output.topk_ids,
-                token_final_scales=topk_output.topk_weights,
+                token_selected_experts=dispatch_output.topk_output.topk_ids,
+                token_final_scales=dispatch_output.topk_output.topk_weights,
                 fc1_expert_weights=layer.w13_weight,
                 fc2_expert_weights=layer.w2_weight,
                 output_dtype=x.dtype,
@@ -299,7 +328,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         else:
             if _use_aiter:
                 assert not moe_runner_config.no_combine, "unsupported"
-                topk_weights, topk_ids, _ = topk_output
+                topk_weights, topk_ids, _ = dispatch_output.topk_output
                 if moe_runner_config.apply_router_weight_on_input:
                     assert (
                         topk_weights.dim() == 2
@@ -412,10 +441,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             .contiguous()
         )
 
-        hidden_states, expanded_row_idx, expanded_expert_idx = (
-            torch_npu.npu_moe_init_routing(
-                x, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens
-            )
+        (
+            hidden_states,
+            expanded_row_idx,
+            expanded_expert_idx,
+        ) = torch_npu.npu_moe_init_routing(
+            x, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens
         )
 
         expert_tokens = torch_npu.npu_moe_compute_expert_tokens(

@@ -20,6 +20,7 @@ import torch
 import torch.distributed
 from torch.distributed import P2POp
 
+from sglang.srt.distributed import get_moe_ep_group
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
@@ -42,6 +43,7 @@ class ExpertLocationUpdater:
         routed_experts_weights_of_layer: Dict[int, List[torch.Tensor]],
         new_expert_location_metadata: ExpertLocationMetadata,
         update_layer_ids: List[int],
+        rebalance_experts_per_chunk: int,
         nnodes: int,
         rank: int,
     ):
@@ -52,11 +54,12 @@ class ExpertLocationUpdater:
         old_expert_location_metadata = get_global_expert_location_metadata()
         assert old_expert_location_metadata is not None
 
-        _update_expert_weights(
+        yield from _update_expert_weights(
             routed_experts_weights_of_layer=routed_experts_weights_of_layer,
             old_expert_location_metadata=old_expert_location_metadata,
             new_expert_location_metadata=new_expert_location_metadata,
             update_layer_ids=update_layer_ids,
+            rebalance_experts_per_chunk=rebalance_experts_per_chunk,
             nnodes=nnodes,
             rank=rank,
         )
@@ -70,7 +73,7 @@ def _update_expert_weights(**kwargs):
     if get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_CANARY"):
         return _update_expert_weights_with_canary(**kwargs)
     else:
-        return _update_expert_weights_raw(**kwargs)
+        yield from _update_expert_weights_raw(**kwargs)
 
 
 # can add watchdog as well
@@ -79,6 +82,7 @@ def _update_expert_weights_with_canary(
     old_expert_location_metadata: ExpertLocationMetadata,
     new_expert_location_metadata: ExpertLocationMetadata,
     update_layer_ids: List[int],
+    rebalance_experts_per_chunk: int,
     nnodes: int,
     rank: int,
 ):
@@ -126,6 +130,7 @@ def _update_expert_weights_raw(
     old_expert_location_metadata: ExpertLocationMetadata,
     new_expert_location_metadata: ExpertLocationMetadata,
     update_layer_ids: List[int],
+    rebalance_experts_per_chunk: int,
     nnodes: int,
     rank: int,
 ):
@@ -140,7 +145,7 @@ def _update_expert_weights_raw(
     num_gpu_per_node = world_size // nnodes
 
     for layer_id in update_layer_ids:
-        update_expert_weights_single_layer(
+        yield from update_expert_weights_single_layer(
             routed_experts_weights=routed_experts_weights_of_layer[layer_id],
             temp_buffers=temp_buffers,
             old_physical_to_logical_map=old_expert_location_metadata.physical_to_logical_map_cpu[
@@ -149,6 +154,7 @@ def _update_expert_weights_raw(
             new_physical_to_logical_map=new_expert_location_metadata.physical_to_logical_map_cpu[
                 layer_id
             ].tolist(),
+            rebalance_experts_per_chunk=rebalance_experts_per_chunk,
             num_local_physical_experts=num_local_physical_experts,
             num_gpu_per_node=num_gpu_per_node,
             rank=rank,
@@ -166,6 +172,7 @@ def update_expert_weights_single_layer(
     temp_buffers: List[torch.Tensor],
     old_physical_to_logical_map: List[int],  # (num_physical_Experts,)
     new_physical_to_logical_map: List[int],  # (num_physical_Experts,)
+    rebalance_experts_per_chunk: int,
     num_local_physical_experts: int,
     num_gpu_per_node: int,
     rank: int,
@@ -205,16 +212,16 @@ def update_expert_weights_single_layer(
         (rank + 1) * num_local_physical_experts,
     )
 
-    def _entrypoint():
+    # List[Tuple[temp_buffers_expert_location, routed_experts_weights_expert_location]]
+    buffer2weight_copy_infos: List[Tuple[int, int]] = []
+
+    def _entrypoint(target_logical_experts_ids):
         # List[Tuple[logical_expert_id, List[P2POp]]]
         p2p_op_infos: List[Tuple[int, List[P2POp]]] = []
-        # List[Tuple[temp_buffers_expert_location, routed_experts_weights_expert_location]]
-        buffer2weight_copy_infos: List[Tuple[int, int]] = []
 
-        _handle_recv(buffer2weight_copy_infos, p2p_op_infos)
-        _create_isend_ops(p2p_op_infos)
+        _handle_recv(buffer2weight_copy_infos, p2p_op_infos, target_logical_experts_ids)
+        _create_isend_ops(p2p_op_infos, target_logical_experts_ids)
         _execute_p2p_ops(p2p_op_infos)
-        _execute_buffer2weight_copies(buffer2weight_copy_infos)
 
         if log_metrics:
             _log_p2p_op_metrics(
@@ -228,16 +235,26 @@ def update_expert_weights_single_layer(
             output_logs.append(f"{p2p_op_infos=}")
             output_logs.append(f"{buffer2weight_copy_infos=}")
 
-    def _handle_recv(buffer2weight_copy_infos, p2p_op_infos):
+    def _handle_recv(
+        buffer2weight_copy_infos, p2p_op_infos, target_logical_experts_ids
+    ):
         for dst_expert_location in range(*local_expert_location_range):
             _handle_recv_of_dst_expert_location(
-                dst_expert_location, buffer2weight_copy_infos, p2p_op_infos
+                dst_expert_location,
+                buffer2weight_copy_infos,
+                p2p_op_infos,
+                target_logical_experts_ids,
             )
 
     def _handle_recv_of_dst_expert_location(
-        dst_expert_location: int, buffer2weight_copy_infos, p2p_op_infos
+        dst_expert_location: int,
+        buffer2weight_copy_infos,
+        p2p_op_infos,
+        target_logical_experts_ids,
     ):
         logical_expert_id = new_physical_to_logical_map[dst_expert_location]
+        if logical_expert_id not in target_logical_experts_ids:
+            return
 
         # case 1: unchanged
         if old_physical_to_logical_map[dst_expert_location] == logical_expert_id:
@@ -332,7 +349,8 @@ def update_expert_weights_single_layer(
                     P2POp(
                         op=torch.distributed.irecv,
                         tensor=_get_tensor(temp_buffers, i, dst_expert_location),
-                        peer=src_rank,
+                        peer=get_moe_ep_group().ranks[src_rank],
+                        group=get_moe_ep_group().device_group,
                     )
                     for i in range(num_tensors)
                 ],
@@ -340,10 +358,12 @@ def update_expert_weights_single_layer(
         )
         buffer2weight_copy_infos.append((dst_expert_location, dst_expert_location))
 
-    def _create_isend_ops(p2p_op_infos):
+    def _create_isend_ops(p2p_op_infos, target_logical_experts_ids):
         handled_logical_expert_ids = set()
         for src_expert_location in range(*local_expert_location_range):
             logical_expert_id = old_physical_to_logical_map[src_expert_location]
+            if logical_expert_id not in target_logical_experts_ids:
+                continue
 
             if logical_expert_id in handled_logical_expert_ids:
                 continue
@@ -382,7 +402,8 @@ def update_expert_weights_single_layer(
                         tensor=_get_tensor(
                             routed_experts_weights, i, src_expert_location
                         ),
-                        peer=dst_rank,
+                        peer=get_moe_ep_group().ranks[dst_rank],
+                        group=get_moe_ep_group().device_group,
                     )
                     for dst_rank in all_dst_ranks
                     for i in range(num_tensors)
@@ -465,7 +486,24 @@ def update_expert_weights_single_layer(
         )
         return expert_location % num_local_physical_experts
 
-    _entrypoint()
+    num_logical_experts = len(set(old_physical_to_logical_map))
+
+    def _chunk_list(items: List, chunk_size):
+        for start_index in range(0, len(items), chunk_size):
+            yield items[start_index : start_index + chunk_size]
+
+    def _compute_expert_ids_chunks() -> List[List[int]]:
+        all_layer_ids = list(range(num_logical_experts))
+        chunk_size = rebalance_experts_per_chunk
+        return list(_chunk_list(all_layer_ids, chunk_size=chunk_size))
+
+    expert_ids_chunks = _compute_expert_ids_chunks()
+    for _, target_logical_experts_ids in enumerate(expert_ids_chunks):
+        if len(expert_ids_chunks) > 1:
+            yield
+        _entrypoint(target_logical_experts_ids)
+
+    _execute_buffer2weight_copies(buffer2weight_copy_infos)
 
     return output_logs
 

@@ -14,7 +14,7 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
-from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
+from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -62,12 +62,14 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     is_cuda,
+    is_musa,
     is_npu,
     next_power_of_2,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 _is_npu = is_npu()
+_is_musa = is_musa()
 
 if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
@@ -228,6 +230,7 @@ class EAGLEWorker(TpModelWorker):
         Device2DraftCudaGraphRunner = {
             "npu": EAGLEDraftNpuGraphRunner,
             "cuda": EAGLEDraftCudaGraphRunner,
+            "musa": EAGLEDraftCudaGraphRunner,
         }
         # Capture draft
         if self.speculative_num_steps > 1:
@@ -283,7 +286,11 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 self.forward_draft_extend(
-                    batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
+                    batch,
+                    logits_output.hidden_states,
+                    next_token_ids,
+                    seq_lens_cpu,
+                    logits_output.mm_input_embeds,
                 )
             return GenerationBatchResult(
                 logits_output=logits_output,
@@ -316,6 +323,7 @@ class EAGLEWorker(TpModelWorker):
                 logits_output=logits_output,
                 next_token_ids=verify_output.verified_id,
                 num_accepted_tokens=sum(verify_output.accept_length_per_req_cpu),
+                accept_length_per_req_cpu=verify_output.accept_length_per_req_cpu,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
@@ -647,9 +655,9 @@ class EAGLEWorker(TpModelWorker):
             spec_info.hidden_states = hidden_states
 
             # Run forward
-            logits_output, _ = self.draft_model_runner.forward(
+            logits_output = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
-            )
+            ).logits_output
             if self.server_args.enable_nan_detection:
                 detect_nan(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
@@ -669,6 +677,7 @@ class EAGLEWorker(TpModelWorker):
         pass
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
+        seq_lens_pre_verify = batch.seq_lens.clone()
         spec_info.prepare_for_verify(batch, self.page_size)
         spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
         batch.return_hidden_states = False
@@ -743,44 +752,8 @@ class EAGLEWorker(TpModelWorker):
             self.target_worker.model_runner.hybrid_gdn_config is not None
             or self.target_worker.model_runner.mamba2_config is not None
         ):
-            accepted_length = (
-                torch.tensor(
-                    res.accept_length_per_req_cpu,
-                    device=logits_output.hidden_states.device,
-                    dtype=torch.int64,
-                )
-                + 1
-            )
-
-            # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
-            # res.accepted_indices.shape[0] > 0 skips DP attn idle batch
-            if spec_info.topk > 1 and res.accepted_indices.shape[0] > 0:
-                # accepted_indices=[0,2,3,4,5,7,9,10,11], accepted_length=[4, 3, 2], cumulative_accepted_lengths=[4, 7, 9]
-                # first_token_indices_per_req=prepend(0, accepted_indices[cumulative_accepted_lengths[:-1]]) = [0, 5, 10]
-                # last_token_indices_per_req=accepted_indices[cumulative_accepted_lengths - 1] = [4, 9, 11] (last token ID of each req)
-                # max_relative_indices_per_req = [4,4,1]; those are the per-req spec-decoding step offsets that contain the correct mamba caches
-                cumulative_accepted_lengths = torch.cumsum(accepted_length, dim=0)
-                req_start_positions = torch.cat(
-                    [
-                        torch.zeros(
-                            1,
-                            dtype=cumulative_accepted_lengths.dtype,
-                            device=cumulative_accepted_lengths.device,
-                        ),
-                        cumulative_accepted_lengths[:-1],
-                    ]
-                )
-                first_token_indices_per_req = res.accepted_indices[req_start_positions]
-                last_token_indices_per_req = res.accepted_indices[
-                    cumulative_accepted_lengths - 1
-                ]
-                max_relative_indices_per_req = (
-                    last_token_indices_per_req - first_token_indices_per_req
-                )
-            else:
-                max_relative_indices_per_req = accepted_length - 1
-            self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
-                max_relative_indices_per_req, self.target_worker.model_runner.model
+            self._mamba_verify_update(
+                batch, res, logits_output, spec_info, seq_lens_pre_verify
             )
 
         if batch.return_logprob:
@@ -793,6 +766,90 @@ class EAGLEWorker(TpModelWorker):
         batch.spec_info = res.draft_input
 
         return logits_output, res, model_worker_batch, can_run_cuda_graph
+
+    def _mamba_verify_update(
+        self,
+        batch: ScheduleBatch,
+        res: EagleVerifyOutput,
+        logits_output: LogitsProcessorOutput,
+        spec_info: EagleVerifyInput,
+        seq_lens_pre_verify: torch.Tensor,
+    ):
+        # Under DP attention, some ranks can be IDLE during target verify and never
+        # initialize mamba forward metadata for this step.
+        if batch.forward_mode.is_idle():
+            return
+
+        accepted_length = (
+            torch.tensor(
+                res.accept_length_per_req_cpu,
+                device=logits_output.hidden_states.device,
+                dtype=torch.int64,
+            )
+            + 1
+        )
+        cumulative_accepted_lengths = torch.cumsum(accepted_length, dim=0)
+        # prepend 0 to the cumulative_accepted_lengths
+        accepted_indices_start = torch.cat(
+            [
+                torch.zeros(
+                    1,
+                    dtype=cumulative_accepted_lengths.dtype,
+                    device=cumulative_accepted_lengths.device,
+                ),
+                cumulative_accepted_lengths[:-1],
+            ]
+        )
+        accepted_indices_offset = torch.arange(
+            0,
+            len(batch.seq_lens) * batch.spec_info.draft_token_num,
+            step=batch.spec_info.draft_token_num,
+            dtype=accepted_indices_start.dtype,
+            device=accepted_indices_start.device,
+        )
+
+        # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
+        # res.accepted_indices.shape[0] > 0 skips DP attn idle batch
+        if spec_info.topk > 1 and res.accepted_indices.shape[0] > 0:
+            # accepted_indices=[0,2,3,4,5,7,9,10,11], accepted_length=[4, 3, 2], cumulative_accepted_lengths=[4, 7, 9]
+            # first_token_indices_per_req=prepend(0, accepted_indices[cumulative_accepted_lengths[:-1]]) = [0, 5, 10]
+            # last_token_indices_per_req=accepted_indices[cumulative_accepted_lengths - 1] = [4, 9, 11] (last token ID of each req)
+            # max_relative_indices_per_req = [4,4,1]; those are the per-req spec-decoding step offsets that contain the correct mamba caches
+            # first_token_indices_per_req = res.accepted_indices[accepted_indices_start]
+            accepted_steps = (
+                res.accepted_indices[cumulative_accepted_lengths - 1]
+                - accepted_indices_offset
+            )
+        else:
+            accepted_steps = accepted_length - 1
+
+        if batch.mamba_track_indices is not None:
+            # If after verify, the request's seq_lens has crossed a mamba track interval,
+            # we need to update the mamba state for the request at the crossing point.
+            mamba_track_interval = self.server_args.mamba_track_interval
+            to_track_mask = (
+                seq_lens_pre_verify // mamba_track_interval
+                != batch.seq_lens // mamba_track_interval
+            )
+            tracking_point = (
+                batch.seq_lens // mamba_track_interval * mamba_track_interval
+            )
+            to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
+            mamba_steps_to_track = torch.where(
+                to_track_mask,
+                res.accepted_indices[to_track_ith + accepted_indices_start]
+                - accepted_indices_offset,
+                -1,
+            )
+        else:
+            mamba_steps_to_track = None
+
+        self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
+            accepted_steps=accepted_steps,
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            model=self.target_worker.model_runner.model,
+        )
 
     def add_logprob_values(
         self,
@@ -879,6 +936,7 @@ class EAGLEWorker(TpModelWorker):
         hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
+        mm_input_embeds: Optional[torch.Tensor] = None,
     ):
         """Run draft model extend. This API modifies the states of the batch.
 
@@ -903,7 +961,9 @@ class EAGLEWorker(TpModelWorker):
             model_worker_batch, self.draft_model_runner
         )
         forward_batch.return_logprob = False
-        logits_output, _ = self.draft_model_runner.forward(forward_batch)
+        if mm_input_embeds is not None:
+            forward_batch.mm_input_embeds = mm_input_embeds
+        logits_output = self.draft_model_runner.forward(forward_batch).logits_output
         if self.enable_nan_detection:
             detect_nan(logits_output)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
@@ -952,7 +1012,6 @@ class EAGLEWorker(TpModelWorker):
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
 
-        batch.spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
         batch.spec_info.num_tokens_for_logprob_per_batch = 1
         batch.spec_info.prepare_extend_after_decode(
             batch,
@@ -966,6 +1025,7 @@ class EAGLEWorker(TpModelWorker):
 
         batch.return_hidden_states = False
         model_worker_batch = batch.get_model_worker_batch()
+        batch.spec_info.num_tokens_per_batch = model_worker_batch.input_ids.shape[0]
         assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
@@ -995,9 +1055,9 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_model_runner.attn_backend.init_forward_metadata(
                     forward_batch
                 )
-            logits_output, _ = self.draft_model_runner.forward(
+            logits_output = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
-            )
+            ).logits_output
             self.capture_for_decode(logits_output, forward_batch.spec_info)
 
         if self.enable_nan_detection:
@@ -1040,7 +1100,7 @@ class EAGLEWorker(TpModelWorker):
         return success, message
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=True, disable=(_is_npu or _is_musa))
 def get_last_loc_large_page_size_top_k_1(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,

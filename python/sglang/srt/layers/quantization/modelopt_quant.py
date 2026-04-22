@@ -100,7 +100,8 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-@torch.library.custom_op("sglang::fp4_gemm", mutates_args=())
+# XXX (MUSA): fp4_gemm is not supported
+# @torch.library.custom_op("sglang::fp4_gemm", mutates_args=())
 def _sglang_fp4_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -119,7 +120,8 @@ def _sglang_fp4_gemm(
         return fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
 
 
-@torch.library.register_fake("sglang::fp4_gemm")
+# XXX (MUSA): fp4_gemm is not supported
+# @torch.library.register_fake("sglang::fp4_gemm")
 def _sglang_fp4_gemm_fake(
     input,
     weight,

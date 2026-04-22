@@ -100,6 +100,7 @@ class ModelConfig:
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
         sampling_defaults: str = "openai",
         quantize_and_serve: bool = False,
+        disable_hybrid_swa_memory: bool = False,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -109,6 +110,7 @@ class ModelConfig:
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
         self.quantize_and_serve = quantize_and_serve
+        self.disable_hybrid_swa_memory = disable_hybrid_swa_memory
 
         # Validate quantize_and_serve configuration
         self._validate_quantize_and_serve_config()
@@ -246,6 +248,7 @@ class ModelConfig:
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
             override_config_file=server_args.decrypted_config_file,
+            disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
             **kwargs,
         )
 
@@ -284,6 +287,41 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] == "Qwen3NextForCausalLM":
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
+
+        if is_draft_model and self.hf_config.architectures[0] in [
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+        ]:
+            self.hf_config.architectures[0] = "Qwen3_5ForCausalLMMTP"
+            self.hf_config.num_nextn_predict_layers = 1
+
+        if is_draft_model and self.hf_config.architectures[0] == "ExaoneMoEForCausalLM":
+            self.hf_config.architectures[0] = "ExaoneMoEForCausalLMMTP"
+            self.hf_config.num_nextn_predict_layers = 1
+
+        if is_draft_model and self.hf_config.architectures[0] == "NemotronHForCausalLM":
+            self.hf_config.architectures[0] = "NemotronHForCausalLMMTP"
+            self.hf_config.num_nextn_predict_layers = 1
+
+    def _derive_hybrid_model(self):
+        # Use self.context_len after it has been initialized to prevent using context_len which may be None.
+        self.is_hybrid_swa = (
+            is_hybrid_swa_model(self.hf_config.architectures)
+            and not self.disable_hybrid_swa_memory
+        )
+
+        if self.is_hybrid_swa:
+            self.swa_attention_layer_ids, self.full_attention_layer_ids = (
+                get_hybrid_layer_ids(
+                    self.hf_config.architectures,
+                    self.hf_text_config,
+                )
+            )
+
+        self.is_hybrid_swa_compress = self.hf_config.architectures[0] in [
+            "MiMoV2FlashForCausalLM",
+            "MiMoV2MTP",
+        ]
 
     def _derive_context_length(self, context_length: int):
         is_draft_model = self.is_draft_model
@@ -410,6 +448,12 @@ class ModelConfig:
         self.num_attention_heads = self.hf_text_config.num_attention_heads
         self.num_key_value_heads = getattr(
             self.hf_text_config, "num_key_value_heads", None
+        )
+        self.first_k_dense_replace = getattr(
+            self.hf_text_config, "first_k_dense_replace", None
+        )
+        self.full_attention_interval = getattr(
+            self.hf_text_config, "full_attention_interval", None
         )
 
         # for Dbrx and MPT models
@@ -972,6 +1016,8 @@ multimodal_model_archs = [
     "Qwen2_5_VLForConditionalGeneration",
     "Qwen3VLForConditionalGeneration",
     "Qwen3VLMoeForConditionalGeneration",
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
     "Qwen3OmniMoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
@@ -1058,7 +1104,24 @@ def is_hybrid_model(
         return None
 
 
-def get_hybrid_layer_ids(model_architectures: List[str], num_hidden_layers: int):
+def is_hybrid_swa_model(model_architectures: List[str]):
+
+    hybrid_swa_archs = {
+        "Llama4ForConditionalGeneration",
+        "GptOssForCausalLM",
+        "MiMoV2FlashForCausalLM",
+        "MiMoV2MTP",
+        "Step3p5ForCausalLM",
+        "Step3p5MTP",
+    }
+    return any(arch in hybrid_swa_archs for arch in model_architectures)
+
+
+def get_hybrid_layer_ids(
+    model_architectures: List[str],
+    hf_text_config: PretrainedConfig,
+):
+    num_hidden_layers = hf_text_config.num_hidden_layers
     if "Llama4ForConditionalGeneration" in model_architectures:
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 != 0
@@ -1066,6 +1129,40 @@ def get_hybrid_layer_ids(model_architectures: List[str], num_hidden_layers: int)
         full_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 == 0
         ]
+    elif "GptOssForCausalLM" in model_architectures:
+        layer_types = getattr(hf_text_config, "layer_types", None)
+        swa_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "sliding_attention"
+        ]
+        full_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "full_attention"
+        ]
+    elif "MiMoV2FlashForCausalLM" in model_architectures:
+        hybrid_layer_pattern = getattr(hf_text_config, "hybrid_layer_pattern", None)
+        swa_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 1
+        ]
+        full_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 0
+        ]
+    elif "MiMoV2MTP" in model_architectures:
+        swa_attention_layer_ids = [0]
+        full_attention_layer_ids = []
+    elif "Step3p5ForCausalLM" in model_architectures:
+        layer_types = hf_text_config.layer_types
+        swa_attention_layer_ids = [
+            i
+            for i, x in enumerate(layer_types)
+            if x == "sliding_attention" and i < num_hidden_layers
+        ]
+        full_attention_layer_ids = [
+            i
+            for i, x in enumerate(layer_types)
+            if x == "full_attention" and i < num_hidden_layers
+        ]
+    elif "Step3p5MTP" in model_architectures:
+        swa_attention_layer_ids = [0]
+        full_attention_layer_ids = []
     else:
         swa_attention_layer_ids = None
         full_attention_layer_ids = None

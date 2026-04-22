@@ -66,6 +66,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     is_hip,
+    is_musa,
     log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -83,6 +84,7 @@ except ImportError:
     KTRANSFORMERS_AVAILABLE = False
 
 _is_hip = is_hip()
+_is_musa = is_musa()
 
 logger = logging.getLogger(__name__)
 
@@ -321,6 +323,11 @@ class CudaGraphRunner:
                 num_tokens_per_bs=self.num_tokens_per_bs,
             )
 
+        enable_mamba_track = (
+            self.model_runner.server_args.enable_mamba_extra_buffer()
+            and self.model_runner.spec_algorithm.is_none()
+        )
+
         if self.require_gathered_buffer:
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
         self.buffers: GraphInputBuffers = GraphInputBuffers.create(
@@ -338,6 +345,7 @@ class CudaGraphRunner:
             encoder_len_fill_value=self.encoder_len_fill_value,
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
+            enable_mamba_track=enable_mamba_track,
         )
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
@@ -484,7 +492,8 @@ class CudaGraphRunner:
 
                 with patch_model(
                     self.model_runner.model,
-                    bs in self.compile_bs,
+                    bs in self.compile_bs
+                    and not _is_musa,  # only compile some function on MUSA platform
                     num_tokens=bs * self.num_tokens_per_bs,
                     tp_group=self.model_runner.tp_group,
                 ) as forward:
@@ -527,7 +536,8 @@ class CudaGraphRunner:
             if memory_saver_adapter.enabled
             else self.device_module.graph
         )
-        with graph_fn(cuda_graph=graph, pool=pool, stream=stream):
+        # XXX (MUSA): cuda_graph argument keyword is not supported
+        with graph_fn(graph, pool=pool, stream=stream):
             out = run_once_fn()
         return out
 
@@ -537,7 +547,7 @@ class CudaGraphRunner:
     def capture_one_batch_size(
         self, bs: int, forward: Callable, stream_idx: Optional[int] = None
     ):
-        buffers = self.buffers
+        buffers: GraphInputBuffers = self.buffers
         graph = self._create_device_graph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
@@ -611,6 +621,18 @@ class CudaGraphRunner:
         else:
             lora_ids = None
 
+        # mamba state tracking
+        mamba_track_indices = (
+            buffers.mamba_track_indices[:bs]
+            if buffers.mamba_track_indices is not None
+            else None
+        )
+        mamba_track_mask = (
+            buffers.mamba_track_mask[:bs]
+            if buffers.mamba_track_mask is not None
+            else None
+        )
+
         if stream_idx is None:
             attn_backend = self.model_runner.attn_backend
         else:
@@ -631,6 +653,9 @@ class CudaGraphRunner:
             attn_backend=attn_backend,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
+            mamba_track_indices=mamba_track_indices,
+            mamba_track_mask=mamba_track_mask,
+            mamba_track_seqlens=None,  # Prefill only
             encoder_lens=encoder_lens,
             return_logprob=False,
             positions=positions,

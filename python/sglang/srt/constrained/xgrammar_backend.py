@@ -108,6 +108,7 @@ class XGrammarGrammar(BaseGrammarObject):
             logits.device.type == "cuda"
             or logits.device.type == "npu"
             or logits.device.type == "xpu"
+            or logits.device.type == "musa"
         ):
             if _is_hip:
                 apply_token_bitmask_inplace_cuda(logits, vocab_mask)

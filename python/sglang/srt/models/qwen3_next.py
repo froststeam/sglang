@@ -28,6 +28,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -44,7 +45,9 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    direct_register_custom_op,
     is_cuda,
+    is_musa,
     is_npu,
     make_layers,
     set_weight_attrs,
@@ -52,14 +55,12 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
+_is_musa = is_musa()
 _is_npu = is_npu()
 
 
 import triton
 import triton.language as tl
-
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
-from sglang.srt.utils import direct_register_custom_op
 
 
 @triton.jit
@@ -307,6 +308,21 @@ class Qwen3GatedDeltaNet(nn.Module):
             tp_size=self.attn_tp_size,
         )
 
+        self.attn = RadixLinearAttention(
+            layer_id=layer_id,
+            num_q_heads=self.num_k_heads // self.attn_tp_size,
+            num_k_heads=self.num_k_heads // self.attn_tp_size,
+            num_v_heads=self.num_v_heads // self.attn_tp_size,
+            head_q_dim=self.head_k_dim,
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
+            conv_weights=self.conv1d.weight.squeeze(1),
+            bias=self.conv1d.bias,
+            activation=self.activation,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+        )
+
     def fix_query_key_value_ordering(self, mixed_qkvz, mixed_ba):
         """
         Derives `query`, `key` and `value` tensors from `mixed_qkvzba`.
@@ -354,7 +370,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         return query, key, value, z, b, a
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
-        if _is_npu or get_global_server_args().enable_piecewise_cuda_graph:
+        if _is_npu or _is_musa or get_global_server_args().enable_piecewise_cuda_graph:
             DUAL_STREAM_TOKEN_THRESHOLD = 0
         else:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
@@ -377,23 +393,6 @@ class Qwen3GatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        output = torch.empty_like(hidden_states)
-        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
-            torch.ops.sglang.gdn_with_output(
-                hidden_states,
-                output,
-                self.layer_id,
-            )
-            return output
-        else:
-            return self._forward(hidden_states, forward_batch)
-
-    def _forward(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ):
-        seq_len, _ = hidden_states.shape
         is_cuda_graph = forward_batch.forward_mode.is_cuda_graph()
 
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
@@ -417,41 +416,11 @@ class Qwen3GatedDeltaNet(nn.Module):
                 lambda x: x.reshape(x.shape[0], -1), (query, key, value)
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
-        # mixed_qkv = rearrange(mixed_qkv, "b l d -> b d l")
-
-        # 2. Convolution sequence transformation
-        conv_weights = self.conv1d.weight.view(
-            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
-        )
-
-        kwargs = {
-            "mixed_qkv": mixed_qkv,
-            "conv_weights": conv_weights,
-            "bias": self.conv1d.bias,
-            "activation": self.activation,
-            "key_dim": self.key_dim,
-            "value_dim": self.value_dim,
-            "attention_tp_size": self.attn_tp_size,
-            "head_k_dim": self.head_k_dim,
-            "head_v_dim": self.head_v_dim,
-            "a": a,
-            "b": b,
-            "A_log": self.A_log,
-            "dt_bias": self.dt_bias,
-            "layer_id": self.layer_id,
-            "seq_len": seq_len,
-            "num_k_heads": self.num_k_heads,
-            "num_v_heads": self.num_v_heads,
-            "z": z,
-        }
-
-        core_attn_out = forward_batch.attn_backend.forward(
-            q=None,
-            k=None,
-            v=None,
-            layer=None,
-            forward_batch=forward_batch,
-            **kwargs,
+        core_attn_out = self.attn(
+            forward_batch,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
         )
 
         z_shape_og = z.shape
@@ -492,6 +461,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         # Qwen3Next all layers are sparse and have no nextn now
         self.is_layer_sparse = True
         is_previous_layer_sparse = True
+        is_next_layer_sparse = True
         self.layer_id = layer_id
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
@@ -499,6 +469,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         if self.is_layer_sparse:
@@ -595,7 +566,10 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = getattr(config, "rope_theta", 10000)
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.rope_scaling = getattr(config, "rope_scaling", None)
+        if "rope_parameters" in config:
+            self.rope_scaling = getattr(config, "rope_parameters", None)
+        else:
+            self.rope_scaling = getattr(config, "rope_scaling", None)
         self.partial_rotary_factor = config.partial_rotary_factor
         self.layer_id = layer_id
 
@@ -647,12 +621,14 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         # Qwen3Next all layers are sparse and have no nextn now
         self.is_layer_sparse = True
         is_previous_layer_sparse = True
+        is_next_layer_sparse = True
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         if self.is_layer_sparse:

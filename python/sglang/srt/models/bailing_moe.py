@@ -75,11 +75,18 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
+from sglang.srt.utils import (
+    add_prefix,
+    is_cuda,
+    is_musa,
+    is_non_idle_and_non_empty,
+    make_layers,
+)
 
 LoraConfig = None
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
+_is_musa = is_musa()
 
 
 class BailingMoEMLP(nn.Module):
@@ -582,12 +589,16 @@ class BailingMoEBlock(nn.Module):
         is_previous_layer_sparse = self._is_layer_sparse(
             config, layer_id=layer_id - 1, is_nextn=False
         )
+        is_next_layer_sparse = self._is_layer_sparse(
+            config, layer_id=layer_id + 1, is_nextn=False
+        )
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         self.is_last_layer = self.layer_id == config.num_hidden_layers - 1
@@ -771,7 +782,7 @@ class BailingMoEForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = torch.cuda.Stream() if _is_cuda or _is_musa else None
 
         self.model = BailingMoEModel(
             config,

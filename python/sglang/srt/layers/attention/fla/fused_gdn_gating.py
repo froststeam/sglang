@@ -4,6 +4,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_musa
+
+_is_musa = is_musa()
+
 
 # g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 # beta_output = b.sigmoid()
@@ -52,6 +56,7 @@ def fused_gdn_gating(
     grid = (batch, seq_len, triton.cdiv(num_heads, 8))
     g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
     beta_output = torch.empty(1, batch, num_heads, dtype=torch.float32, device=b.device)
+    num_warps = 1 if not _is_musa else 2
     fused_gdn_gating_kernel[grid](
         g,
         beta_output,
@@ -64,6 +69,6 @@ def fused_gdn_gating(
         beta,
         threshold,
         8,
-        num_warps=1,
+        num_warps=num_warps,
     )
     return g, beta_output

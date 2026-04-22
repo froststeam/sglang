@@ -49,6 +49,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda_alike,
     is_hip,
+    is_musa,
     is_npu,
     is_shm_available,
     is_xpu,
@@ -58,6 +59,7 @@ from sglang.srt.utils import (
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
+_is_musa = is_musa()
 _supports_custom_op = supports_custom_op()
 
 
@@ -79,7 +81,7 @@ class P2PWork:
 
 
 def _split_tensor_dict(
-    tensor_dict: Dict[str, Union[torch.Tensor, Any]]
+    tensor_dict: Dict[str, Union[torch.Tensor, Any]],
 ) -> Tuple[List[Tuple[str, Any]], List[torch.Tensor]]:
     """Split the tensor dictionary into two parts:
     1. A list of (key, value) pairs. If the value is a tensor, it is replaced
@@ -310,6 +312,11 @@ class GroupCoordinator:
             self.device = torch.device(f"cuda:{device_id}")
         elif _is_npu:
             self.device = torch.device(f"npu:{local_rank}")
+        elif _is_musa:
+            device_id = (
+                0 if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() else local_rank
+            )
+            self.device = torch.device(f"musa:{device_id}")
         else:
             self.device = torch.device("cpu")
         self.device_module = torch.get_device_module(self.device)

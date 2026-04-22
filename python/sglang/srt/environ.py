@@ -147,6 +147,23 @@ class Envs:
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
     SGLANG_LOG_MS = EnvBool(False)
     SGLANG_DISABLE_REQUEST_LOGGING = EnvBool(False)
+    SGLANG_LOG_REQUEST_EXCEEDED_MS = EnvInt(-1)
+    SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
+    SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
+    SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
+
+    # SGLang CI
+    SGLANG_IS_IN_CI = EnvBool(False)
+    SGLANG_IS_IN_CI_AMD = EnvBool(False)
+    SGLANG_CUDA_COREDUMP = EnvBool(False)
+    SGLANG_CUDA_COREDUMP_DIR = EnvStr("/tmp/sglang_cuda_coredumps")
+    SGLANG_TEST_MAX_RETRY = EnvInt(None)
+
+    # Constrained Decoding (Grammar)
+    SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
+    SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
+    SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(False)
+
 
     # Test & Debug
     SGLANG_IS_IN_CI = EnvBool(False)
@@ -235,6 +252,11 @@ class Envs:
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
 
+    # MTHREADS & MUSA
+    SGLANG_USE_MUSA_FUSED_KERNEL = EnvBool(True)
+    SGLANG_USE_MTT = EnvBool(False)
+    SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
+
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
@@ -277,11 +299,14 @@ class Envs:
     SGLANG_DG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/deep_gemm"))
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
+    SGLANG_DEEP_GEMM_BLOCK_M = EnvInt(128)
 
     # DeepEP
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
+    SGLANG_DEEPEP_LL_USE_NVLINK = EnvBool(False)
+    SGLANG_DEEPEP_LL_DISABLE_RECV_HOOK= EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

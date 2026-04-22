@@ -35,6 +35,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_npu,
     is_xpu,
     set_weight_attrs,
@@ -47,8 +48,9 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
+_is_musa = is_musa()
 
-if _is_cuda or _is_xpu:
+if _is_cuda or _is_xpu or _is_musa:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 elif _is_hip:
     from sgl_kernel import gelu_and_mul, gelu_quick, gelu_tanh_and_mul, silu_and_mul
@@ -75,6 +77,9 @@ class SiluAndMul(CustomOp):
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         silu_and_mul(x, out)
         return out
+
+    def forward_musa(self, x: torch.Tensor) -> torch.Tensor:
+        return nn.SwishGLU()(x)
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
         if _is_cpu_amx_available:
@@ -368,7 +373,6 @@ def get_cross_encoder_activation_function(config: PretrainedConfig):
         hasattr(config, "sbert_ce_default_activation_function")
         and config.sbert_ce_default_activation_function is not None
     ):
-
         function_name = config.sbert_ce_default_activation_function
         assert function_name.startswith("torch.nn.modules."), (
             "Loading of activation functions is restricted to "
@@ -381,7 +385,12 @@ def get_cross_encoder_activation_function(config: PretrainedConfig):
 
 
 if not (
-    _is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available) or _is_hip or _is_xpu
+    _is_cuda
+    or _is_npu
+    or (_is_cpu and _is_cpu_amx_available)
+    or _is_hip
+    or _is_xpu
+    or _is_musa
 ):
     logger.info(
         "sgl-kernel is not available on Non-NV, Non-AMD platforms or Non-AMX CPUs. Fallback to other kernel libraries."

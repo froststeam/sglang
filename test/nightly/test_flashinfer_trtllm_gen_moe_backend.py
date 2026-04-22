@@ -1,3 +1,7 @@
+"""
+Qwen3 Next piecewise CUDA graph tests.
+"""
+
 import os
 import unittest
 from types import SimpleNamespace
@@ -12,10 +16,20 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=300, suite="nightly-4-gpu-b200", nightly=True)
+register_cuda_ci(
+    est_time=400,
+    suite="stage-c-test-4-gpu-h100",
+)
+
+QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+
+ACC_THRESHOLDS = {
+    QWEN3_NEXT_MODEL: {"kl_div": 0.0025, "gsm8k": 0.93},
+}
 
 
-class TestFlashinferTrtllmGenMoeBackend(CustomTestCase):
+class TestQwen3NextPiecewiseCudaGraph(CustomTestCase):
+
     @classmethod
     def setUpClass(cls):
         cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"

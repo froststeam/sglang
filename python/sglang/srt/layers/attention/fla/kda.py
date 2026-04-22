@@ -19,7 +19,9 @@ from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
 from sglang.srt.layers.attention.fla.op import exp, log
 from sglang.srt.layers.attention.fla.solve_tril import solve_tril
 from sglang.srt.layers.attention.fla.utils import is_amd
+from sglang.srt.utils import is_musa
 
+_is_musa = is_musa()
 BT_LIST_AUTOTUNE = [32, 64, 128]
 NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if is_amd else [4, 8, 16, 32]
 
@@ -936,8 +938,8 @@ def recompute_w_u_fwd(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = A.shape[-1]
-    BK = 64
-    BV = 64
+    BK = 64 if not _is_musa else 128
+    BV = 64 if not _is_musa else 128
 
     chunk_indices = (
         prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
@@ -947,6 +949,10 @@ def recompute_w_u_fwd(
     w = torch.empty_like(k)
     u = torch.empty_like(v)
     kg = torch.empty_like(k) if gk is not None else None
+    kwargs = {}
+    if _is_musa:
+        kwargs["num_warps"] = 16
+        kwargs["num_stages"] = 1
     recompute_w_u_fwd_kernel[(NT, B * H)](
         q=q,
         k=k,
@@ -971,6 +977,7 @@ def recompute_w_u_fwd(
         STORE_KG=kg is not None,
         IS_VARLEN=cu_seqlens is not None,
         DOT_PRECISION="ieee",
+        **kwargs,
     )
     return w, u, None, kg
 
@@ -1146,7 +1153,7 @@ def chunk_kda_fwd(
     beta: torch.Tensor,
     scale: float,
     initial_state: torch.Tensor,
-    output_final_state: bool,
+    initial_state_indices: torch.Tensor,
     cu_seqlens: torch.LongTensor | None = None,
 ):
     chunk_size = 64
@@ -1172,13 +1179,13 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
     )
     del A
-    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+    h, v_new = chunk_gated_delta_rule_fwd_h(
         k=kg,
         w=w,
         u=u,
         gk=g,
         initial_state=initial_state,
-        output_final_state=output_final_state,
+        initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
     )
     del w, u, kg
@@ -1194,7 +1201,7 @@ def chunk_kda_fwd(
         chunk_size=chunk_size,
     )
     del Aqk, v_new, h
-    return o, final_state
+    return o
 
 
 def chunk_kda(
@@ -1205,7 +1212,7 @@ def chunk_kda(
     beta: torch.Tensor,
     scale: float = None,
     initial_state: torch.Tensor = None,
-    output_final_state: bool = False,
+    initial_state_indices: torch.Tensor = None,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     **kwargs,
@@ -1217,18 +1224,18 @@ def chunk_kda(
         q = l2norm_fwd(q.contiguous())
         k = l2norm_fwd(k.contiguous())
 
-    o, final_state = chunk_kda_fwd(
+    o = chunk_kda_fwd(
         q=q,
         k=k,
         v=v.contiguous(),
         g=g.contiguous(),
         beta=beta.contiguous(),
         scale=scale,
-        initial_state=initial_state.contiguous(),
-        output_final_state=output_final_state,
+        initial_state=initial_state,
+        initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
     )
-    return o, final_state
+    return o
 
 
 @triton.autotune(

@@ -27,11 +27,12 @@ import einops
 import torch
 import torch.distributed
 
+from sglang.srt.distributed import get_moe_ep_group, get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.metrics.collector import ExpertDispatchCollector
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import Withable, get_int_env_var
+from sglang.srt.utils import Withable, get_device, get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
@@ -474,7 +475,7 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
                 ),
             ),
             dtype=torch.int,
-            device="cuda",
+            device=get_device(),
         )
 
     def reset(self):
@@ -687,10 +688,13 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         )
         gpu_physical_count = gpu_physical_count.to(self._server_args.device)
         torch.distributed.reduce(
-            gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
+            gpu_physical_count,
+            dst=get_moe_ep_group().ranks[0],
+            op=torch.distributed.ReduceOp.SUM,
+            group=get_moe_ep_group().device_group,
         )
 
-        if self._rank == 0:
+        if get_moe_ep_group().ranks[0] in get_pp_group().ranks:
             self._collect_metrics_if_needed(gpu_physical_count)
 
             utilization_rate_tensor = compute_utilization_rate(gpu_physical_count)
@@ -848,7 +852,9 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             torch.get_device_module().empty_cache()
 
         torch.distributed.all_reduce(
-            logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
+            logical_count_of_buffered_step,
+            op=torch.distributed.ReduceOp.SUM,
+            group=get_moe_ep_group().device_group,
         )
 
         output = dict(
@@ -858,7 +864,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         )
 
         if output_mode == "file":
-            if self._rank == 0:
+            if get_moe_ep_group().ranks[0] in get_pp_group().ranks:
                 _dump_to_file(f"expert_distribution_recorder_{time.time()}.pt", output)
         elif output_mode == "object":
             return output
@@ -871,7 +877,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         ):
             return None
 
-        if self._rank == 0:
+        if get_moe_ep_group().ranks[0] in get_pp_group().ranks:
             utilization_mean_rates = self._history.mean()
             window_index = self.window_sizes[-1]
             average_utilization_rate_over_window = (
@@ -883,11 +889,15 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             avg_rate_tensor = torch.tensor(
                 [average_utilization_rate_over_window],
                 dtype=torch.float32,
-                device="cuda",
+                device=get_device(),
             )
         else:
-            avg_rate_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
-        torch.distributed.broadcast(avg_rate_tensor, src=0)
+            avg_rate_tensor = torch.empty(1, dtype=torch.float32, device=get_device())
+        torch.distributed.broadcast(
+            avg_rate_tensor,
+            src=get_moe_ep_group().ranks[0],
+            group=get_moe_ep_group().device_group,
+        )
         return avg_rate_tensor.item()
 
 

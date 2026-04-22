@@ -11,6 +11,9 @@ import triton.language as tl
 from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 from sglang.srt.layers.attention.fla.op import exp, safe_exp
 from sglang.srt.layers.attention.fla.utils import check_shared_mem, is_nvidia_hopper
+from sglang.srt.utils import is_musa
+
+_is_musa = is_musa()
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
@@ -148,6 +151,10 @@ def chunk_fwd_o(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
 
+    BV = 64 if not _is_musa else 128
+    num_warps = 4 if not _is_musa else 16
+    num_stages = 2 if not _is_musa else 1
+
     chunk_fwd_kernel_o[grid](
         q,
         k,
@@ -165,10 +172,10 @@ def chunk_fwd_o(
         V=V,
         BT=BT,
         BK=128,
-        BV=64,
+        BV=BV,
         USE_G=g is not None,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
-        num_stages=2,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return o

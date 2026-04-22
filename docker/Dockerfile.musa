@@ -1,0 +1,146 @@
+# Usage (to build SGLang MUSA docker image):
+# 1. eval "$(ssh-agent -s)"
+# 2. ssh-add $HOME/.ssh/id_ed25519
+# 3. docker build --push --build-arg CACHE_DATE="$(date)" --ssh default --build-arg GPU_ARCH=mp_31 -t sh-harbor.mthreads.com/mcc-ai-serving/sglang:v0.5.2-ph1-py310-musa1001 -f Dockerfile.musa .
+
+
+# Default base images
+ARG BASE_IMAGE_PH1="sh-harbor.mthreads.com/mcc-ai-serving/sglang:v0.5.2-ph1-py310-4.3.2-base"
+# This is necessary for scope purpose
+ARG GPU_ARCH=mp_31
+
+# ===============================
+# Base image ph1 and args
+FROM $BASE_IMAGE_PH1 AS mp_31
+RUN mkdir -p /root/.ssh && ssh-keyscan sh-code.mthreads.com >> /root/.ssh/known_hosts && \
+    printf "Host sh-code.mthreads.com\n\tHostName sh-code.mthreads.com\n\tPort 22\n" > /root/.ssh/config && \
+    chmod 600 /root/.ssh/config
+
+ENV BUILD_MOONCAKE="1"
+
+ENV RUSTUP_DIST_SERVER="https://rsproxy.cn"
+ENV RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup"
+RUN apt update && \
+    apt install -y libssl-dev protobuf-compiler && \
+    apt clean && rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh | sh -s -- -y
+ENV PATH="/root/.cargo/bin:$PATH"
+RUN mkdir -p /root/.cargo && \
+    echo '\
+[source.crates-io]\n\
+replace-with = "rsproxy-sparse"\n\
+[source.rsproxy]\n\
+registry = "https://rsproxy.cn/crates.io-index"\n\
+[source.rsproxy-sparse]\n\
+registry = "sparse+https://rsproxy.cn/index/"\n\
+[registries.rsproxy]\n\
+index = "https://rsproxy.cn/crates.io-index"\n\
+[net]\n\
+git-fetch-with-cli = true\n\
+[http]\n\
+check-revoke = false\n\
+[registry]\n\
+default = "rsproxy"\
+' > /root/.cargo/config.toml
+
+# ===============================
+# Chosen arch and args
+FROM ${GPU_ARCH} AS whl_builder
+
+WORKDIR /tmp
+RUN mkdir -p /dist
+ARG CACHE_DATE=2016-01-01
+RUN --mount=type=ssh git clone git@sh-code.mthreads.com:mcc-ai-serving/deepgemm.git
+RUN cd deepgemm && python3 setup.py bdist_wheel && cp dist/*.whl /dist/
+
+# ===============================
+# Chosen arch and args
+FROM ${GPU_ARCH}
+
+# This is necessary for scope purpose, again
+ARG GPU_ARCH=mp_31
+
+ARG SGL_REPO="git@sh-code.mthreads.com:mcc-ai-serving/sglang.git"
+ARG SGL_DEFAULT="xd/musa_0920_dscv2_bf16_fp8"
+ARG SGL_BRANCH=${SGL_DEFAULT}
+
+ARG MOONCAKE_REPO="git@sh-code.mthreads.com:mcc-ai-serving/Mooncake.git"
+ARG MOONCAKE_COMMIT="0.3.7-update-submodule"
+
+USER root
+
+# Install some basic utilities
+RUN python -m pip install --upgrade pip pytest matplotlib
+
+WORKDIR /sgl-workspace
+
+COPY --from=whl_builder /dist/* /dist/
+RUN python -m pip install /dist/*.whl && \
+    rm -rf /dist
+
+# -----------------------
+# Build Mooncake
+ENV PATH=$PATH:/usr/local/go/bin
+
+RUN --mount=type=ssh \
+     if [ "$BUILD_MOONCAKE" = "1" ]; then \
+     apt update && apt install -y zip unzip wget && \
+     apt install -y gcc make libtool autoconf librdmacm-dev rdmacm-utils infiniband-diags ibverbs-utils perftest ethtool libibverbs-dev rdma-core && \
+     apt install -y openssh-server openmpi-bin openmpi-common libopenmpi-dev && \
+     git clone ${MOONCAKE_REPO} && \
+     cd Mooncake && \
+     git checkout ${MOONCAKE_COMMIT} && \
+     git submodule update --init --recursive && \
+     bash dependencies.sh -y && \
+     mkdir -p build && \
+     cd build && \
+     cmake .. -DUSE_ETCD=ON -DUSE_MUSA=ON && \
+     make -j "$(nproc)" && make install; \
+    fi
+
+# -----------------------
+# Build SGLang
+ARG BUILD_TYPE=all
+
+RUN python -m pip uninstall -y sgl-kernel sglang sglang-router
+ARG CACHE_DATE=2016-01-01
+RUN --mount=type=ssh \
+    rm -rf sglang \
+    && git clone ${SGL_REPO} \
+    && cd sglang \
+    && if [ "${SGL_BRANCH}" = ${SGL_DEFAULT} ]; then \
+         echo "Using ${SGL_DEFAULT}, default branch."; \
+         git checkout ${SGL_DEFAULT}; \
+       else \
+         echo "Using ${SGL_BRANCH} branch."; \
+         git checkout ${SGL_BRANCH}; \
+       fi \
+    && cd sgl-kernel \
+    && rm -f pyproject.toml \
+    && mv pyproject_musa.toml pyproject.toml \
+    && MTGPU_TARGET=$GPU_ARCH python setup_musa.py install \
+    && cd .. \
+    && rm -f python/pyproject.toml \
+    && mv python/pyproject_other.toml python/pyproject.toml \
+    && if [ "$BUILD_TYPE" = "srt" ]; then \
+         python -m pip --no-cache-dir install -e "python[srt_musa]" ${NO_DEPS_FLAG}; \
+       else \
+         python -m pip --no-cache-dir install -e "python[all_musa]" ${NO_DEPS_FLAG}; \
+       fi \
+    && cd sgl-router && python -m build && python -m pip install --force-reinstall dist/*.whl \
+    && pip uninstall pynvml -y
+
+RUN python -m pip cache purge
+WORKDIR /sgl-workspace/sglang
+
+# Performance environment variable.
+ENV SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+ENV SGLANG_SET_CPU_AFFINITY=1
+
+ENV SGLANG_USE_DEEPGEMM_BMM=0
+ENV SGLANG_MOE_PADDING=1
+ENV SGLANG_USE_MUSA_FUSED_KERNEL=1
+ENV VLLM_CONFIGURE_LOGGING=0
+ENV VLLM_PATCH_MUSA_CUSTOM_OPS=1
+
+CMD ["/bin/bash"]

@@ -20,7 +20,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.utils import is_cuda, is_hip, is_xpu, set_weight_attrs
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_xpu, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -31,8 +31,9 @@ if TYPE_CHECKING:
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
+_is_musa = is_musa()
 
-if _is_cuda:
+if _is_cuda or _is_musa:
     from sgl_kernel import gelu_and_mul, moe_align_block_size, moe_sum, silu_and_mul
     from sgl_kernel.quantization import (
         ggml_dequantize,
@@ -69,7 +70,10 @@ class GGUFConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 60
+        if not _is_musa:
+            return 60
+        else:
+            return 31
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:

@@ -8,14 +8,16 @@ from einops import rearrange
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.layernorm import LayerNorm
-from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
+from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_musa, is_npu
 
-if is_cuda():
+_is_cuda = is_cuda()
+_is_musa = is_musa()
+
+if _is_cuda or _is_musa:
     try:
         import deep_gemm
     except ImportError as e:
         deep_gemm = e
-
 
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.utils import (
@@ -122,7 +124,7 @@ class Indexer(CustomOp):
         else:
             self.cp_size = None
             self.cp_rank = None
-        if is_cuda():
+        if is_cuda() or is_musa():
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
 
@@ -163,7 +165,7 @@ class Indexer(CustomOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
-    @torch.compile(dynamic=True)
+    @torch.compile(dynamic=True, disable=_is_musa)
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
         weights, _ = self.weights_proj(x.float())
         weights = weights * self.n_heads**-0.5
@@ -391,7 +393,10 @@ class Indexer(CustomOp):
             )
             extend_seq_len = forward_batch.extend_seq_lens_cpu[i]
             ks = torch.full(
-                (extend_seq_len,), k_offset, dtype=torch.int32, device="cuda"
+                (extend_seq_len,),
+                k_offset,
+                dtype=torch.int32,
+                device="cuda" if not _is_musa else "musa",
             )
             ke = ks + seq_lens_expanded[q_offset : q_offset + extend_seq_len]
             k_fp8_list.append(k_fp8)
@@ -835,6 +840,8 @@ class Indexer(CustomOp):
                 max_kv_len = forward_batch.seq_lens_cpu.max().item()
                 skip_logits_computation = max_kv_len <= self.index_topk
 
+        # NOTICE(MUSA): always use nsa indexer
+        skip_logits_computation = False
         # Optimization: fast path when skipping topk computation
         if skip_logits_computation and (not self.nsa_enable_prefill_cp):
             return self._forward_cuda_k_only(
@@ -879,7 +886,7 @@ class Indexer(CustomOp):
 
         weights = self._get_logits_head_gate(x, q_scale)
 
-        if is_cuda():
+        if is_cuda() or is_musa():
             assert forward_batch.seq_lens_cpu is not None
             if len(forward_batch.seq_lens_cpu) == 0:
                 # this seems b/c max-pad, no worries?
@@ -888,7 +895,10 @@ class Indexer(CustomOp):
                 #         "HACK: seq_lens empty but x not empty, hackily return all-invalid topk_result"
                 #     )
                 return torch.full(
-                    (x.shape[0], self.index_topk), -1, dtype=torch.int, device="cuda"
+                    (x.shape[0], self.index_topk),
+                    -1,
+                    dtype=torch.int,
+                    device="cuda" if not _is_musa else "musa",
                 )
 
             if (

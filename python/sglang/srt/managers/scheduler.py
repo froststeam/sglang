@@ -59,11 +59,14 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     prepare_abort,
 )
-from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.distributed import get_pp_group, get_tp_group, get_world_group
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+from sglang.srt.layers.dp_attention import (
+    compute_dp_attention_world_info,
+    get_attention_tp_group,
+)
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.managers.io_struct import (
@@ -304,7 +307,7 @@ class Scheduler(
         self.init_tokenizer()
 
         # Init moe config
-        self.init_moe_config()
+        self.init_moe_gemm_config()
 
         # Init GEMM config (FP8 GEMM, etc.)
         self.init_gemm_config()
@@ -402,7 +405,7 @@ class Scheduler(
 
         # Hybrid memory pool
         self.is_hybrid_swa = self.tp_worker.is_hybrid_swa
-        self.is_ssm_model = (
+        self.is_hybrid_ssm = (
             self.tp_worker.model_runner.hybrid_gdn_config is not None
             or self.tp_worker.model_runner.mamba2_config is not None
         )
@@ -712,6 +715,127 @@ class Scheduler(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
 
+    def init_moe_gemm_config(self):
+        # For the MM models, check the text_config for MoE settings
+        config_to_check = getattr(
+            self.model_config.hf_config, "text_config", self.model_config.hf_config
+        )
+        if hasattr(config_to_check, "num_experts_per_tok"):
+            initialize_moe_config(self.server_args)
+
+        # Initialize GEMM-related configuration for FP8 and FP4 backends.
+        initialize_fp8_gemm_config(self.server_args)
+        # initialize_fp4_gemm_config(self.server_args)
+
+        # This must be called after initialize_moe_config
+        self.require_mlp_sync = require_mlp_sync(self.server_args)
+
+    def init_tp_model_worker(self):
+        from sglang.srt.managers.tp_worker import TpModelWorker
+
+        self.tp_worker = TpModelWorker(
+            server_args=self.server_args,
+            gpu_id=self.gpu_id,
+            tp_rank=self.tp_rank,
+            moe_ep_rank=self.moe_ep_rank,
+            pp_rank=self.pp_rank,
+            dp_rank=self.dp_rank,
+            nccl_port=self.nccl_port,
+        )
+
+    def maybe_init_draft_worker(self):
+        if self.spec_algorithm.is_none():
+            self.draft_worker = None
+            return
+
+        # Launch a draft worker for speculative decoding
+        draft_worker_kwargs = dict(
+            server_args=self.server_args,
+            gpu_id=self.gpu_id,
+            tp_rank=self.tp_rank,
+            moe_ep_rank=self.moe_ep_rank,
+            nccl_port=self.nccl_port,
+            target_worker=self.tp_worker,
+            dp_rank=self.dp_rank,
+        )
+
+        if self.server_args.speculative_draft_load_format is not None:
+            self.server_args.load_format = (
+                self.server_args.speculative_draft_load_format
+            )
+            logger.info(
+                f"Using draft model load_format: '{self.server_args.speculative_draft_load_format}'"
+            )
+
+        DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
+        self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
+
+    def init_model_worker(self):
+        self.init_tp_model_worker()
+        self.maybe_init_draft_worker()
+
+        # Dispatch the model worker
+        if self.spec_algorithm.is_none():
+            self.model_worker = self.tp_worker
+        else:
+            self.model_worker = self.draft_worker
+
+        # Get token and memory info from the model worker
+        (
+            self.max_total_num_tokens,
+            self.max_prefill_tokens,
+            self.max_running_requests,
+            self.max_queued_requests,
+            self.max_req_len,
+            self.max_req_input_len,
+            self.random_seed,
+            self.device,
+            self.forward_stream,
+            _,
+            _,
+            _,
+        ) = self.tp_worker.get_worker_info()
+        if get_global_server_args().pp_max_micro_batch_size is None:
+            get_global_server_args().pp_max_micro_batch_size = max(
+                self.max_running_requests // self.pp_size, 1
+            )
+
+        self.tp_group = get_tp_group()
+        self.tp_cpu_group = self.tp_group.cpu_group
+        self.attn_tp_group = get_attention_tp_group()
+        self.attn_tp_cpu_group = self.attn_tp_group.cpu_group
+        self.pp_group = get_pp_group()
+        self.world_group = get_world_group()
+
+        # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
+        # When DP attention is enabled, scope to the attention-TP group; otherwise use
+        # the base TP group. Entry rank is the local rank 0 in that group.
+        # Use the CPU (gloo) group to broadcast VLM Python objects and avoid CUDA
+        # stream/device coupling (#11910).
+        self.dp_tp_group = (
+            self.attn_tp_group
+            if self.server_args.enable_dp_attention
+            else self.tp_group
+        )
+        self.dp_tp_cpu_group = self.dp_tp_group.cpu_group
+
+        self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
+        set_random_seed(self.random_seed)
+
+        # Print debug info
+        if self.tp_rank == 0:
+            avail_mem = get_available_gpu_memory(
+                self.device, self.gpu_id, empty_cache=False
+            )
+            logger.info(
+                f"max_total_num_tokens={self.max_total_num_tokens}, "
+                f"chunked_prefill_size={self.server_args.chunked_prefill_size}, "
+                f"max_prefill_tokens={self.max_prefill_tokens}, "
+                f"max_running_requests={self.max_running_requests}, "
+                f"context_len={self.model_config.context_len}, "
+                f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
+            )
+
     def init_cache_with_memory_pool(self):
         server_args = self.server_args
 
@@ -733,6 +857,7 @@ class Scheduler(
             eviction_policy=server_args.radix_eviction_policy,
             enable_metrics=self.enable_metrics,
             enable_kv_cache_events=self.enable_kv_cache_events,
+            enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
         )
 
         if (
@@ -769,7 +894,7 @@ class Scheduler(
                 self.tree_cache = SWARadixCache(
                     params=params, sliding_window_size=self.sliding_window_size
                 )
-            elif self.is_ssm_model:
+            elif self.is_hybrid_ssm:
                 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 
                 self.tree_cache = MambaRadixCache(params)
@@ -965,10 +1090,6 @@ class Scheduler(
         #       we shall keep its reference not being release during all the forwarding pass
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         self.batch_record_buf[self.batch_record_ct] = model_worker_batch
-
-    def init_moe_config(self):
-        if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
-            initialize_moe_config(self.server_args)
 
     def init_gemm_config(self):
         # Initialize GEMM-related configuration (currently FP8 Blockwise GEMM backend).

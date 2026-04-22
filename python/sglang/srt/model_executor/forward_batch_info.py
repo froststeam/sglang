@@ -249,6 +249,12 @@ class ForwardBatch:
     # The indices of output tokens in the token_to_kv_pool_swa
     # TODO(shiyang, biao): integrate out_cache_loc_swa into multiple attention backends
     out_cache_loc_swa: Optional[torch.Tensor] = None
+    # The indices to track mamba state with
+    mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
+    # The mask to track mamba state if needed
+    mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
+    # The seqlens to track mamba state if masked, prefill only.
+    mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
 
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
@@ -363,6 +369,7 @@ class ForwardBatch:
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
     spec_algorithm: SpeculativeAlgorithm = None
+    mm_input_embeds: Optional[torch.Tensor] = None
     capture_hidden_mode: CaptureHiddenMode = None
 
     # For padding
@@ -397,6 +404,9 @@ class ForwardBatch:
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_track_mask=batch.mamba_track_mask,
+            mamba_track_seqlens=batch.mamba_track_seqlens,
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
             encoder_lens=batch.encoder_lens,
@@ -686,7 +696,7 @@ class ForwardBatch:
                         mm_input, self.seq_lens[batch_idx], model_runner.device
                     )
                     mrope_positions_list[batch_idx] = mrope_positions
-            elif self.forward_mode.is_extend():
+            elif self.forward_mode.is_extend(include_draft_extend_v2=True):
                 extend_seq_len, extend_prefix_len = (
                     batch.extend_seq_lens[batch_idx],
                     batch.extend_prefix_lens[batch_idx],
@@ -834,7 +844,10 @@ class ForwardBatch:
                 self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
             else:
                 setattr(self, "_original_batch_size", self.batch_size)
-                if self.spec_info is not None:
+                if (
+                    self.spec_info is not None
+                    and self.spec_info.num_tokens_per_batch != 0
+                ):
                     bs = self.batch_size = (
                         num_tokens // self.spec_info.num_tokens_per_batch
                     )
@@ -877,9 +890,27 @@ class ForwardBatch:
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
+        if self.mamba_track_indices is not None:
+            self.mamba_track_indices = self._pad_tensor_to_size(
+                self.mamba_track_indices, bs
+            )
+        if self.mamba_track_mask is not None:
+            self.mamba_track_mask = self._pad_tensor_to_size(self.mamba_track_mask, bs)
+        if self.mamba_track_seqlens is not None:
+            self.mamba_track_seqlens = self._pad_tensor_to_size(
+                self.mamba_track_seqlens, bs
+            )
 
         if self.mrope_positions is not None:
-            self.mrope_positions = self._pad_tensor_to_size(self.mrope_positions, bs)
+            self.mrope_positions = torch.cat(
+                [
+                    self.mrope_positions,
+                    self.mrope_positions.new_zeros(
+                        3, num_tokens - self.mrope_positions.shape[1]
+                    ),
+                ],
+                dim=1,
+            )
 
         # TODO: check if we need to pad other tensors
         if self.extend_seq_lens is not None:

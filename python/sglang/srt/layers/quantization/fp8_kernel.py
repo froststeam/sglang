@@ -33,6 +33,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     log_info_on_rank0,
     supports_custom_op,
 )
@@ -40,9 +41,10 @@ from sglang.srt.utils import (
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
+_is_musa = is_musa()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if _is_cuda:
+if _is_cuda or _is_musa:
     from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
 
     # Temporary
@@ -54,6 +56,7 @@ if _is_cuda:
         from sgl_kernel import sgl_per_token_group_quant_fp8
 
         enable_sgl_per_token_group_quant_8bit = False
+
 
 if _is_hip:
     if _use_aiter:
@@ -70,6 +73,7 @@ if _is_hip:
             import vllm._C  # noqa: F401
         except ImportError:
             raise ImportError("vllm is required when SGLANG_USE_AITER is set to False")
+
 
 logger = logging.getLogger(__name__)
 

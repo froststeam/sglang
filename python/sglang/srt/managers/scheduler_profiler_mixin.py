@@ -10,11 +10,12 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_musa, is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
 from sglang.srt.utils.profile_utils import ProfileManager
 
 _is_npu = is_npu()
+_is_musa = is_musa()
 if _is_npu:
     import torch_npu
 
@@ -146,7 +147,11 @@ class SchedulerProfilerMixin:
 
         activity_map = {
             "CPU": torch.profiler.ProfilerActivity.CPU,
-            "GPU": torch.profiler.ProfilerActivity.CUDA,
+            "GPU": (
+                torch.profiler.ProfilerActivity.CUDA
+                if not _is_musa
+                else torch.profiler.ProfilerActivity.PrivateUse1
+            ),
         }
         torchprof_activities = [
             activity_map[a] for a in activities if a in activity_map

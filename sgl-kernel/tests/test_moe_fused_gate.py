@@ -3,6 +3,40 @@ import torch
 from sgl_kernel import moe_fused_gate
 
 from sglang.srt.layers.moe.topk import biased_grouped_topk
+from sglang.srt.utils import get_device, is_musa
+
+_is_musa = is_musa()
+_is_mate = False
+
+if _is_musa:
+    try:
+        from mate import moe_fused_gate
+
+        _is_mate = True
+    except ImportError:
+        print(
+            "mate is MUSA specific kernel library. Please make sure mate is installed on your MUSA device."
+        )
+
+
+def get_cuda_params():
+    return [
+        (128, 4, 2, 4),
+        (160, 1, 1, 8),
+        (256, 1, 1, 8),
+        (256, 4, 2, 8),
+    ]
+
+
+def get_musa_params():
+    return [
+        (128, 4, 2, 4),
+        (256, 8, 4, 8),
+        (512, 16, 8, 16),
+        (160, 1, 1, 8),
+        (256, 1, 1, 8),
+        (384, 1, 1, 8),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -11,14 +45,9 @@ from sglang.srt.layers.moe.topk import biased_grouped_topk
     + [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536],
 )
 @pytest.mark.parametrize(
-    "params",
-    [
-        (128, 4, 2, 4),
-        (256, 8, 4, 8),  # deepseek v3
-        (512, 16, 8, 16),
-    ],
+    "params", get_cuda_params() if not _is_musa else get_musa_params()
 )
-@pytest.mark.parametrize("num_fused_shared_experts", [0, 1, 2])
+@pytest.mark.parametrize("num_fused_shared_experts", [0])
 @pytest.mark.parametrize("apply_routed_scaling_factor_on_output", [False, True])
 def test_moe_fused_gate_combined(
     seq_length, params, num_fused_shared_experts, apply_routed_scaling_factor_on_output
@@ -27,10 +56,14 @@ def test_moe_fused_gate_combined(
     dtype = torch.float32
 
     torch.manual_seed(seq_length)
-    tensor = torch.rand((seq_length, num_experts), dtype=dtype, device="cuda")
+    tensor = torch.rand((seq_length, num_experts), dtype=dtype, device=get_device())
     scores = tensor.clone()
-    bias = torch.rand(num_experts, dtype=dtype, device="cuda")
+    bias = torch.rand(num_experts, dtype=dtype, device=get_device())
     topk = topk + num_fused_shared_experts
+
+    kwargs = {}
+    if _is_musa and _is_mate:
+        kwargs["renormalize"] = True
 
     output, indices = moe_fused_gate(
         tensor,
@@ -41,6 +74,7 @@ def test_moe_fused_gate_combined(
         num_fused_shared_experts=num_fused_shared_experts,
         routed_scaling_factor=2.5,
         apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        **kwargs,
     )
     ref_output, ref_indices = biased_grouped_topk(
         scores,

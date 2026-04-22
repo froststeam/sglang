@@ -28,9 +28,17 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
 )
-from sglang.srt.utils.common import fast_topk, is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils.common import (
+    fast_topk,
+    is_cuda,
+    is_hip,
+    is_musa,
+    is_npu,
+    next_power_of_2,
+)
 
 _is_cuda = is_cuda()
+_is_musa = is_musa()
 _is_hip = is_hip()
 _is_npu = is_npu()
 
@@ -41,7 +49,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 
-if is_cuda():
+if is_cuda() or is_musa():
     from sgl_kernel import (
         top_k_renorm_prob,
         top_p_renorm_prob,
@@ -227,6 +235,17 @@ class EagleVerifyInputV2Mixin:
                 draft_token_num=self.draft_token_num,
                 device=device,
             )
+
+            # Set mamba_track_indices for mamba prefix-cache state tracking
+            if get_global_server_args().enable_mamba_extra_buffer():
+                batch.mamba_track_indices = torch.tensor(
+                    [
+                        req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx]
+                        for req in batch.reqs
+                    ],
+                    dtype=torch.int64,
+                    device=device,
+                )
 
         # Get a forward batch
         batch.forward_mode = (
@@ -500,7 +519,7 @@ def assign_extend_cache_locs_func(
     draft_token_num: int,
     device,
 ) -> torch.Tensor:
-    if _is_cuda or _is_hip:
+    if _is_cuda or _is_hip or _is_musa:
         out_cache_loc = torch.empty(
             (batch_size * draft_token_num,),
             dtype=torch.int64,

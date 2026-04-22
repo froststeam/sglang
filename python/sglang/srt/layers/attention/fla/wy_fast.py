@@ -9,6 +9,9 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
+from sglang.srt.utils import is_musa
+
+_is_musa = is_musa()
 
 
 # @triton.autotune(
@@ -124,8 +127,11 @@ def recompute_w_u_fwd(
         prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     )
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    BK = 64
-    BV = 64
+    BK = 64 if not _is_musa else 128
+    BV = 64 if not _is_musa else 128
+    num_warps = 4 if not _is_musa else 16
+    num_stages = 3 if not _is_musa else 1
+
     u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)
     recompute_w_u_fwd_kernel[(NT, B * H)](
@@ -147,8 +153,8 @@ def recompute_w_u_fwd(
         BK=BK,
         BV=BV,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
-        num_stages=3,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return w, u
 

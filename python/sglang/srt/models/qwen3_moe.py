@@ -71,6 +71,7 @@ from sglang.srt.utils import (
     add_prefix,
     is_cuda,
     is_flashinfer_available,
+    is_musa,
     is_non_idle_and_non_empty,
     is_npu,
 )
@@ -88,6 +89,7 @@ _is_flashinfer_available = is_flashinfer_available()
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
+_is_musa = is_musa()
 _is_npu = is_npu()
 
 if _is_npu:
@@ -728,12 +730,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
         # Qwen3MoE all layers are sparse and have no nextn now
         self.is_layer_sparse = True
         is_previous_layer_sparse = True
+        is_next_layer_sparse = True
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         if self.is_layer_sparse:
@@ -883,7 +887,7 @@ class Qwen3MoeModel(Qwen2MoeModel):
         prefix: str = "",
         decoder_layer_type=Qwen3MoeDecoderLayer,
     ) -> None:
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = torch.cuda.Stream() if _is_cuda or _is_musa else None
         super().__init__(
             config=config,
             quant_config=quant_config,

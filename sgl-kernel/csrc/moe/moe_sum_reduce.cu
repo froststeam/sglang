@@ -225,8 +225,8 @@ __global__ void moe_sum_reduce_kernel_warp_token_general(
 }
 
 void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling_factor) {
-  TORCH_CHECK(input.is_cuda(), "input must be CUDA tensor");
-  TORCH_CHECK(output.is_cuda(), "output must be CUDA tensor");
+  CHECK_CUDA(input);
+  CHECK_CUDA(output);
   TORCH_CHECK(input.dim() == 3, "input must be a 3D tensor like [token_num, topk_num, hidden_dim]");
   TORCH_CHECK(output.dim() == 2, "output must be [token_num, hidden_dim]");
   TORCH_CHECK(input.size(0) == output.size(0), "token dim mismatch");

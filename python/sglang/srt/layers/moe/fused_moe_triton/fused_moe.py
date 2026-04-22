@@ -13,14 +13,17 @@ import torch
 import torch.nn.functional as F
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.utils import (
     cpu_has_amx_support,
     direct_register_custom_op,
     get_bool_env_var,
+    get_compiler_backend,
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
 )
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
@@ -39,6 +42,8 @@ _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_musa = is_musa()
+_use_musa_fused_kernel = envs.SGLANG_USE_MUSA_FUSED_KERNEL.get() and _is_musa
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, moe_sum_reduce, silu_and_mul
@@ -54,6 +59,9 @@ elif _is_hip:
             raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
     else:
         from vllm import _custom_ops as vllm_ops
+elif _is_musa:
+    from sgl_kernel import moe_sum_reduce, silu_and_mul
+    from vllm import _custom_ops as vllm_ops
 
 padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 
@@ -347,7 +355,7 @@ def fused_experts(
         )
 
 
-@torch.compile
+@torch.compile(backend=get_compiler_backend())
 def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
     torch.sum(x, dim=1, out=out)
     out.mul_(routed_scaling_factor)
@@ -555,6 +563,10 @@ def fused_experts_impl(
                 )
             elif _is_cuda or _is_hip:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+            elif is_musa:
+                intermediate_cache2 = torch.nn.SwishGLU()(
+                    intermediate_cache1.view(-1, N)
+                )
             else:
                 vllm_ops.silu_and_mul(
                     intermediate_cache2, intermediate_cache1.view(-1, N)
@@ -562,7 +574,7 @@ def fused_experts_impl(
         elif activation == "gelu" and is_gated:
             assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
             assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
-            if _is_cuda or _is_hip:
+            if _is_cuda or _is_hip or _is_musa:
                 gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
                 vllm_ops.gelu_and_mul(
@@ -615,7 +627,7 @@ def fused_experts_impl(
 
         if no_combine:
             pass
-        elif _is_cuda:
+        elif _is_cuda or _is_musa:
             if topk_ids.shape[1] == 1 and routed_scaling_factor == 1.0:
                 pass  # we write directly into out_hidden_states
             elif topk_ids.shape[1] == 2 and routed_scaling_factor == 1.0:

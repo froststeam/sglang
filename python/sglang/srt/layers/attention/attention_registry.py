@@ -1,6 +1,10 @@
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.utils import is_musa
+
+_is_musa = is_musa()
+
 logger = logging.getLogger(__name__)
 
 
@@ -127,10 +131,20 @@ def create_flashmla_backend(runner):
 def create_flashattention_v3_backend(runner):
     import torch
 
-    assert (
-        torch.cuda.get_device_capability()[0] == 8 and not runner.use_mla_backend
-    ) or torch.cuda.get_device_capability()[0] == 9, (
-        "FlashAttention v3 Backend requires SM>=80 and SM<=90. "
+    if _is_musa:
+        condition = (
+            torch.cuda.get_device_capability()[0] >= 3
+            and torch.cuda.get_device_capability()[1] >= 1
+        )
+        message = "MP>=31"
+    else:
+        condition = (
+            torch.cuda.get_device_capability()[0] == 8 and not runner.use_mla_backend
+        ) or torch.cuda.get_device_capability()[0] == 9
+        message = "SM>=80 and SM<=90"
+
+    assert condition, (
+        f"FlashAttention v3 Backend requires {message}. "
         "Please use `--attention-backend flashinfer`."
     )
     from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
@@ -189,14 +203,18 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
     if cfg := runner.mambaish_config:
         from sglang.srt.layers.attention.fla.utils import check_environments
         from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-            GDNAttnBackend,
             HybridLinearAttnBackend,
-            KimiLinearAttnBackend,
             Mamba2AttnBackend,
+        )
+        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+        from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+        from sglang.srt.layers.attention.linear.utils import (
+            initialize_linear_attn_config,
         )
         from sglang.srt.utils import is_blackwell, is_npu
 
         check_environments()
+        initialize_linear_attn_config(runner.server_args)
         if runner.hybrid_gdn_config is not None:
             if is_blackwell():
                 assert (
@@ -212,7 +230,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         elif runner.mamba2_config is not None:
             linear_attn_backend = Mamba2AttnBackend(runner)
         elif runner.kimi_linear_config is not None:
-            linear_attn_backend = KimiLinearAttnBackend(runner)
+            linear_attn_backend = KDAAttnBackend(runner)
         else:
             raise ValueError(
                 "Expected hybrid GDN or NemotronH models, but got unknown model."

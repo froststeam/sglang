@@ -18,7 +18,10 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.utils import get_communication_backend, get_device, is_musa
 from sglang.test.test_utils import CustomTestCase
+
+_is_musa = is_musa()
 
 
 def get_open_port() -> int:
@@ -44,8 +47,10 @@ def multi_process_parallel(
     # as compared to multiprocessing.
     # NOTE: We need to set working_dir for distributed tests,
     # otherwise we may get import errors on ray workers
-
-    ray.init(log_to_driver=True)
+    if _is_musa:
+        ray.init(log_to_driver=True, num_gpus=torch.cuda.device_count())
+    else:
+        ray.init(log_to_driver=True)
 
     distributed_init_port = get_open_port()
     refs = []
@@ -89,7 +94,7 @@ class TestCustomAllReduce(CustomTestCase):
     @ray.remote(num_gpus=1, max_calls=1)
     def graph_allreduce(self, world_size, rank, distributed_init_port):
         del os.environ["CUDA_VISIBLE_DEVICES"]
-        device = torch.device(f"cuda:{rank}")
+        device = torch.device(get_device(rank))
         torch.cuda.set_device(device)
         distributed_init_method = f"tcp://localhost:{distributed_init_port}"
         init_distributed_environment(
@@ -97,6 +102,7 @@ class TestCustomAllReduce(CustomTestCase):
             rank=rank,
             distributed_init_method=distributed_init_method,
             local_rank=rank,
+            backend=get_communication_backend(),
         )
         initialize_model_parallel(tensor_model_parallel_size=world_size)
         group = get_tensor_model_parallel_group().device_group
@@ -111,12 +117,16 @@ class TestCustomAllReduce(CustomTestCase):
         # graph capture immediately.
         data = torch.zeros(1)
         data = data.to(device=device)
-        torch.distributed.all_reduce(data, group=group)
+        dist.all_reduce(data, group=group)
         torch.cuda.synchronize()
         del data
 
         for sz in self.TEST_SIZES:
-            for dtype in [torch.float32, torch.float16, torch.bfloat16]:
+            for dtype in (
+                [torch.float32, torch.float16, torch.bfloat16]
+                if not _is_musa
+                else [torch.bfloat16]
+            ):
                 for _ in range(self.TEST_LOOP):
                     with graph_capture() as graph_capture_context:
                         # use integers so result matches NCCL exactly
@@ -144,15 +154,19 @@ class TestCustomAllReduce(CustomTestCase):
                             # synchronization
                             dist.all_reduce(inp1, group=group)
                             out2 = tensor_model_parallel_all_reduce(inp2)
-                            dist.all_reduce(inp2, group=group)
+                            if not _is_musa:
+                                # XXX (MUSA): currently, MUSA distributed backend does not support consecutive AllReduce operations within a single graph capture.
+                                dist.all_reduce(inp2, group=group)
                     graph.replay()
                     torch.testing.assert_close(out1, inp1)
-                    torch.testing.assert_close(out2, inp2)
+                    if not _is_musa:
+                        # XXX (MUSA): currently, MUSA distributed backend does not support consecutive AllReduce operations within a single graph capture.
+                        torch.testing.assert_close(out2, inp2)
 
     @ray.remote(num_gpus=1, max_calls=1)
     def eager_allreduce(self, world_size, rank, distributed_init_port):
         del os.environ["CUDA_VISIBLE_DEVICES"]
-        device = torch.device(f"cuda:{rank}")
+        device = torch.device(get_device(rank))
         torch.cuda.set_device(device)
         distributed_init_method = f"tcp://localhost:{distributed_init_port}"
         init_distributed_environment(
@@ -160,6 +174,7 @@ class TestCustomAllReduce(CustomTestCase):
             rank=rank,
             distributed_init_method=distributed_init_method,
             local_rank=rank,
+            backend=get_communication_backend(),
         )
         initialize_model_parallel(tensor_model_parallel_size=world_size)
         group = get_tensor_model_parallel_group().device_group
@@ -168,7 +183,11 @@ class TestCustomAllReduce(CustomTestCase):
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
         for sz in self.TEST_SIZES:
-            for dtype in [torch.float32, torch.float16, torch.bfloat16]:
+            for dtype in (
+                [torch.float32, torch.float16, torch.bfloat16]
+                if not _is_musa
+                else [torch.bfloat16]
+            ):
                 for _ in range(self.TEST_LOOP):
                     inp1 = torch.randint(
                         1, 16, (sz,), dtype=dtype, device=torch.cuda.current_device()

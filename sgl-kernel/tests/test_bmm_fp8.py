@@ -5,6 +5,8 @@ import torch
 import torch.nn.functional as F
 from sgl_kernel import bmm_fp8
 
+from sglang.srt.utils import get_device
+
 
 def to_float8(x, dtype=torch.float8_e4m3fn):
     finfo = torch.finfo(dtype)
@@ -22,16 +24,16 @@ def test_bmm_fp8(input_dtype, mat2_dtype, res_dtype):
     if input_dtype == torch.float8_e5m2 and mat2_dtype == torch.float8_e5m2:
         pytest.skip("Invalid combination: both input and mat2 are e5m2")
 
-    input = torch.randn([16, 48, 64], device="cuda", dtype=torch.bfloat16)
+    input = torch.randn([16, 48, 64], device=get_device(), dtype=torch.bfloat16)
     input_fp8, input_inv_s = to_float8(input, dtype=input_dtype)
 
     # mat2 row  major -> column major
-    mat2 = torch.randn([16, 80, 64], device="cuda", dtype=torch.bfloat16).transpose(
-        -2, -1
-    )
+    mat2 = torch.randn(
+        [16, 80, 64], device=get_device(), dtype=torch.bfloat16
+    ).transpose(-2, -1)
     mat2_fp8, mat2_inv_s = to_float8(mat2, dtype=mat2_dtype)
 
-    res = torch.empty([16, 48, 80], device="cuda", dtype=res_dtype)
+    res = torch.empty([16, 48, 80], device=get_device(), dtype=res_dtype)
     bmm_fp8(input_fp8, mat2_fp8, input_inv_s, mat2_inv_s, res_dtype, res)
 
     reference = torch.bmm(input, mat2)

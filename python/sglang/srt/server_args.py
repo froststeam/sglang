@@ -47,6 +47,7 @@ from sglang.srt.utils.common import (
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
+    is_musa,
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_port_available,
@@ -182,6 +183,13 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
 ]
 
 MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16"]
+
+MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16", "float16"]
+
+MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
+
+MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
+LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl"]
 
 
 # Allow external code to add more choices
@@ -400,6 +408,7 @@ class ServerArgs:
     nsa_prefill_backend: str = "flashmla_sparse"
     nsa_decode_backend: str = "fa3"
     enable_flashinfer_autotune: bool = False
+    mamba_backend: str = "triton"
 
     # Speculative decoding
     speculative_algorithm: Optional[str] = None
@@ -436,9 +445,12 @@ class ServerArgs:
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
     init_expert_location: str = "trivial"
     enable_eplb: bool = False
+    enable_eplb_rebalance_async: bool = False
+    disable_eplb_warmup: bool = False
     eplb_algorithm: str = "auto"
     eplb_rebalance_num_iterations: int = 1000
     eplb_rebalance_layers_per_chunk: Optional[int] = None
+    eplb_rebalance_experts_per_chunk: int = 10000
     eplb_min_rebalancing_utilization_threshold: float = 1.0
     expert_distribution_recorder_mode: Optional[
         Literal["stat", "stat_approx", "per_pass", "per_token"]
@@ -454,6 +466,11 @@ class ServerArgs:
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: str = "float32"
     mamba_full_memory_ratio: float = 0.9
+    mamba_scheduler_strategy: str = "auto"
+    mamba_track_interval: int = 256
+    linear_attn_backend: str = "triton"
+    linear_attn_decode_backend: Optional[str] = None
+    linear_attn_prefill_backend: Optional[str] = None
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
@@ -724,6 +741,10 @@ class ServerArgs:
             self.random_seed = random.randint(0, 1 << 30)
         if self.mm_process_config is None:
             self.mm_process_config = {}
+        if self.mamba_scheduler_strategy == "auto":
+            # TODO: when extra_buffer is more verified, we can set the default path based on
+            #       [overlap, non-overlap]
+            self.mamba_scheduler_strategy = "no_buffer"
 
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
@@ -1289,12 +1310,6 @@ class ServerArgs:
                         f"{model_arch}"
                     )
         elif model_arch in ["Qwen3NextForCausalLM"]:
-            if not self.disable_radix_cache:
-                logger.warning(
-                    "Disabling overlap schedule since MambaRadixCache is not compatible with "
-                    "overlap schedule currently, try to use --disable-radix-cache if overlap schedule is necessary"
-                )
-                self.disable_overlap_schedule = True
             if is_sm100_supported():
                 quantization_config = getattr(hf_config, "quantization_config", None)
                 quant_method = (
@@ -1328,18 +1343,12 @@ class ServerArgs:
                     )
                     self.disable_radix_cache = True
                     self.disable_overlap_schedule = False
-        elif model_arch in [
-            "NemotronHForCausalLM",
-            "FalconH1ForCausalLM",
-            "JetNemotronForCausalLM",
-            "JetVLMForConditionalGeneration",
-        ]:
-            if not self.disable_radix_cache:
-                logger.warning(
-                    "Disabling overlap schedule since MambaRadixCache is not compatible with "
-                    "overlap schedule currently, try to use --disable-radix-cache if overlap schedule is necessary"
-                )
-                self.disable_overlap_schedule = True
+            else:
+                if not self.disable_radix_cache:
+                    raise ValueError(
+                        f"Speculative decoding for {model_arch} is not compatible with radix cache when using --mamba-scheduler-strategy no_buffer."
+                        "To use radix cache with speculative decoding, please use --mamba-scheduler-strategy extra_buffer and set SGLANG_ENABLE_SPEC_V2=1."
+                    )
 
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:
@@ -1441,6 +1450,12 @@ class ServerArgs:
                 "Cutlass MLA only supports a page_size of 128, change page_size to 128."
             )
             self.page_size = 128
+
+        if is_musa() and self.attention_backend == "fa3":
+            logger.warning(
+                "FA3 attention backend on MUSA only supports a page_size of 64, change page_size to 64."
+            )
+            self.page_size = 64
 
         if (
             self.attention_backend == "trtllm_mla"
@@ -2484,7 +2499,7 @@ class ServerArgs:
             "--device",
             type=str,
             default=ServerArgs.device,
-            help="The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified.",
+            help="The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu', 'musa'). Defaults to auto-detection if not specified.",
         )
         parser.add_argument(
             "--tensor-parallel-size",
@@ -3210,6 +3225,16 @@ class ServerArgs:
             help="Enable EPLB algorithm",
         )
         parser.add_argument(
+            "--enable-eplb-rebalance-async",
+            action="store_true",
+            help="Enable asynchronous rebalance mode",
+        )
+        parser.add_argument(
+            "--disable-eplb-warmup",
+            action="store_true",
+            help="Disable eplb warmup",
+        )
+        parser.add_argument(
             "--eplb-algorithm",
             type=str,
             default=ServerArgs.eplb_algorithm,
@@ -3226,6 +3251,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.eplb_rebalance_layers_per_chunk,
             help="Number of layers to rebalance per forward pass.",
+        )
+        parser.add_argument(
+            "--eplb-rebalance-experts-per-chunk",
+            type=int,
+            default=ServerArgs.eplb_rebalance_experts_per_chunk,
+            help="Number of experts to rebalance per forward pass.",
         )
         parser.add_argument(
             "--eplb-min-rebalancing-utilization-threshold",
@@ -3297,6 +3328,52 @@ class ServerArgs:
             type=float,
             default=ServerArgs.mamba_full_memory_ratio,
             help="The ratio of mamba state memory to full kv cache memory.",
+        )
+        parser.add_argument(
+            "--mamba-scheduler-strategy",
+            type=str,
+            choices=MAMBA_SCHEDULER_STRATEGY_CHOICES,
+            default=ServerArgs.mamba_scheduler_strategy,
+            help="The strategy to use for mamba radix cache.",
+        )
+        parser.add_argument(
+            "--mamba-track-interval",
+            type=int,
+            default=ServerArgs.mamba_track_interval,
+            help="The interval to track the mamba state during decode.",
+        )
+        parser.add_argument(
+            "--mamba-backend",
+            type=str,
+            choices=MAMBA_BACKEND_CHOICES,
+            default=ServerArgs.mamba_backend,
+            help="Choose the kernel backend for Mamba SSM operations. Default is 'triton'. "
+            "Options: 'triton' (default), 'flashinfer' (requires FlashInfer with Mamba support).",
+        )
+        parser.add_argument(
+            "--linear-attn-backend",
+            type=str,
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+            default=ServerArgs.linear_attn_backend,
+            help="The default kernel backend for linear attention (GDN/KDA). "
+            "Can be overridden per-mode by --linear-attn-decode-backend "
+            "and --linear-attn-prefill-backend.",
+        )
+        parser.add_argument(
+            "--linear-attn-decode-backend",
+            type=str,
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+            default=ServerArgs.linear_attn_decode_backend,
+            help="Override the kernel backend for linear attention decode. "
+            "If not set, uses --linear-attn-backend.",
+        )
+        parser.add_argument(
+            "--linear-attn-prefill-backend",
+            type=str,
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+            default=ServerArgs.linear_attn_prefill_backend,
+            help="Override the kernel backend for linear attention prefill/extend. "
+            "If not set, uses --linear-attn-backend.",
         )
 
         # Hierarchical cache
@@ -4076,6 +4153,9 @@ class ServerArgs:
 
         model_config = self.get_model_config()
         return model_config.attention_arch == AttentionArch.MLA
+
+    def enable_mamba_extra_buffer(self) -> bool:
+        return self.mamba_scheduler_strategy == "extra_buffer"
 
     def check_server_args(self):
         # Check parallel size constraints

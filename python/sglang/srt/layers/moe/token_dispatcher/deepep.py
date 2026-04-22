@@ -27,6 +27,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.utils import (
     get_bool_env_var,
+    get_device,
     is_blackwell,
     is_hip,
     is_npu,
@@ -34,6 +35,7 @@ from sglang.srt.utils import (
 )
 
 _is_npu = is_npu()
+
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
@@ -61,6 +63,13 @@ logger = logging.getLogger(__name__)
 
 
 class DeepEPPDispatchHooks(DispatcherBaseHooks):
+
+    def __call__(self, dispatcher: BaseDispatcher):
+        for hook_fun in self.hook_dict.values():
+            hook_fun(dispatcher)
+
+
+class DeepEPPCombineHooks(DispatcherBaseHooks):
 
     def __call__(self, dispatcher: BaseDispatcher):
         for hook_fun in self.hook_dict.values():
@@ -205,7 +214,7 @@ class DeepEPBuffer:
 
         if not _is_npu:
             total_num_sms = torch.cuda.get_device_properties(
-                device="cuda"
+                device=get_device()
             ).multi_processor_count
             if (
                 (deepep_mode != DeepEPMode.LOW_LATENCY)
@@ -226,6 +235,7 @@ class DeepEPBuffer:
             num_qps_per_rank=num_qps_per_rank,
             # TODO can be false when unneeded
             allow_mnnvl=True,
+            allow_nvlink_for_low_latency_mode=envs.SGLANG_DEEPEP_LL_USE_NVLINK.get(),
         )
         return cls._buffer
 
@@ -466,7 +476,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
-            expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
+            expert_alignment=(
+                deep_gemm_wrapper.DEEPGEMM_BLOCK_M
+                if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                else 1
+            ),
             config=DeepEPConfig.get_instance().normal_dispatch_config,
         )
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
@@ -539,7 +553,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         num_max_dispatch_tokens_per_rank: the actual batch size in the decoding engine should be less than 256
         https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
         """
-        self.return_recv_hook = return_recv_hook
+        self.return_recv_hook = (
+            return_recv_hook and not envs.SGLANG_DEEPEP_LL_DISABLE_RECV_HOOK.get()
+        )
         self.device_module = torch.get_device_module()
         self.quant_config = {}
 
@@ -770,6 +786,7 @@ class DeepEPDispatcher(BaseDispatcher):
 
         self._stage = _Stage.INITIAL
         self._deepep_dispatch_hooks = DeepEPPDispatchHooks()
+        self._deepep_combine_hooks = DeepEPPCombineHooks()
 
     def dispatch(
         self,
@@ -805,6 +822,8 @@ class DeepEPDispatcher(BaseDispatcher):
         combine_input: CombineInput,
     ) -> torch.Tensor:
         self.combine_a(combine_input)
+        if self._deepep_combine_hooks is not None:
+            self._deepep_combine_hooks(self)
         ret = self.combine_b()
         return ret
 
@@ -870,3 +889,6 @@ class DeepEPDispatcher(BaseDispatcher):
 
     def register_deepep_dispatch_hook(self, hook):
         return self._deepep_dispatch_hooks.register_hook(hook)
+
+    def register_deepep_combine_hook(self, hook):
+        return self._deepep_combine_hooks.register_hook(hook)

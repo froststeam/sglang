@@ -50,7 +50,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_musa, is_npu, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -61,7 +61,9 @@ logger = logging.getLogger(__name__)
 
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
+_is_musa = is_cuda()
 _is_npu = is_npu()
+_is_musa = is_musa()
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -80,7 +82,6 @@ class ReqToTokenPool:
         device: str,
         enable_memory_saver: bool,
     ):
-
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
@@ -150,6 +151,7 @@ class MambaPool:
         self,
         *,
         size: int,
+        spec_state_size: int,
         cache_params: BaseLinearStateParams,
         device: str,
         enable_memory_saver: bool = False,
@@ -196,14 +198,14 @@ class MambaPool:
                 intermediate_ssm_state_cache = torch.zeros(
                     size=(
                         num_mamba_layers,
-                        size + 1,
+                        spec_state_size + 1,
                         speculative_num_draft_tokens,
                         temporal_state_shape[0],
                         temporal_state_shape[1],
                         temporal_state_shape[2],
                     ),
                     dtype=ssm_dtype,
-                    device="cuda",
+                    device="cuda" if not _is_musa else "musa",
                 )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
@@ -211,13 +213,13 @@ class MambaPool:
                     torch.zeros(
                         size=(
                             num_mamba_layers,
-                            size + 1,
+                            spec_state_size + 1,
                             speculative_num_draft_tokens,
                             conv_shape[0],
                             conv_shape[1],
                         ),
                         dtype=conv_dtype,
-                        device="cuda",
+                        device="cuda" if not _is_musa else "musa",
                     )
                     for conv_shape in conv_state_shape
                 ]
@@ -265,6 +267,10 @@ class MambaPool:
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
+        # clear at alloc time
+        for i in range(len(self.mamba_cache.conv)):
+            self.mamba_cache.conv[i][:, select_index] = 0
+        self.mamba_cache.temporal[:, select_index] = 0
 
         return select_index
 
@@ -272,9 +278,6 @@ class MambaPool:
         if free_index.numel() == 0:
             return
         self.free_slots = torch.cat((self.free_slots, free_index))
-        for i in range(len(self.mamba_cache.conv)):
-            self.mamba_cache.conv[i][:, free_index] = 0
-        self.mamba_cache.temporal[:, free_index] = 0
 
     def clear(self):
         # Zero the entire mamba cache before resetting free_slots
@@ -331,11 +334,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
         *,
         size: int,
         mamba_size: int,
+        mamba_spec_state_size: int,
         max_context_len: int,
         device: str,
         enable_memory_saver: bool,
         cache_params: BaseLinearStateParams,
+        enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
+        enable_overlap_schedule: bool = True,
     ):
         super().__init__(
             size=size,
@@ -343,23 +349,31 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
         )
+
+        self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
+        self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
         self._init_mamba_pool(
             size=mamba_size,
+            mamba_spec_state_size=mamba_spec_state_size,
             cache_params=cache_params,
             device=device,
+            enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
 
     def _init_mamba_pool(
         self,
         size: int,
+        mamba_spec_state_size: int,
         cache_params: BaseLinearStateParams,
         device: str,
+        enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
     ):
         self.mamba_pool = MambaPool(
             size=size,
+            spec_state_size=mamba_spec_state_size,
             cache_params=cache_params,
             device=device,
             enable_memory_saver=self.enable_memory_saver,
@@ -371,32 +385,67 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
             size, dtype=torch.int32, device=self.device
         )
+        if enable_mamba_extra_buffer:
+            self.req_index_to_mamba_ping_pong_track_buffer_mapping: torch.Tensor = (
+                torch.zeros(
+                    (size, self.mamba_ping_pong_track_buffer_size),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            )
 
     # For chunk prefill req, we do not need to allocate mamba cache,
     # We could use allocated mamba cache instead.
-    def alloc(
-        self, need_size: int, reqs: Optional[List[Req]] = None
-    ) -> Optional[List[int]]:
+    def alloc(self, need_size: int, reqs: Optional[List["Req"]]) -> Optional[List[int]]:
+        assert reqs is not None
         select_index = super().alloc(need_size)
         if select_index == None:
             return None
 
         mamba_index = []
+        mamba_ping_pong_track_buffer_list = []
         for req in reqs:
             mid = None
             if req.mamba_pool_idx is not None:  # for radix cache
                 mid = req.mamba_pool_idx
             else:
-                mid = self.mamba_pool.alloc(1)[0]
+                mid = self.mamba_pool.alloc(1)
+                assert (
+                    mid is not None
+                ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_pool.available_size()=}, {len(reqs)=}"
+                mid = mid[0]
                 req.mamba_pool_idx = mid
-            if mid is not None:
-                mamba_index.append(mid)
+            mamba_index.append(mid)
+            if self.enable_mamba_extra_buffer:
+                if req.mamba_ping_pong_track_buffer is None:
+                    req.mamba_ping_pong_track_buffer = self.mamba_pool.alloc(
+                        self.mamba_ping_pong_track_buffer_size
+                    )
+                    assert (
+                        req.mamba_ping_pong_track_buffer is not None
+                    ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
+                    req.mamba_next_track_idx = 0
+                mamba_ping_pong_track_buffer_list.append(
+                    req.mamba_ping_pong_track_buffer.tolist()
+                )
         assert len(select_index) == len(
             mamba_index
-        ), f"Not enough space for mamba cache, try to increase --max-mamba-cache-size."
+        ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
+        if self.enable_mamba_extra_buffer:
+            assert len(select_index) == len(
+                mamba_ping_pong_track_buffer_list
+            ), f"Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
         self.req_index_to_mamba_index_mapping[select_index] = torch.tensor(
             mamba_index, dtype=torch.int32, device=self.device
         )
+        if self.enable_mamba_extra_buffer:
+            self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
+                torch.tensor(
+                    mamba_ping_pong_track_buffer_list,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            )
         return select_index
 
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
@@ -409,8 +458,19 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:
         return self.mamba_pool.get_speculative_mamba2_params_all_layers()
 
+    def get_mamba_ping_pong_other_idx(self, mamba_next_track_idx: int) -> int:
+        if self.mamba_ping_pong_track_buffer_size == 2:
+            return 1 - mamba_next_track_idx
+        else:
+            return mamba_next_track_idx
+
     # For chunk prefill, we can not free mamba cache, we need use it in the future
-    def free(self, free_index: Union[int, List[int]], free_mamba_cache: bool = True):
+    def free(
+        self,
+        free_index: Union[int, List[int]],
+        free_mamba_cache: bool = True,
+        mamba_ping_pong_track_buffer_to_keep: Optional[int] = None,
+    ):
         if isinstance(free_index, (int,)):
             free_index = [free_index]
         super().free(free_index)
@@ -418,9 +478,31 @@ class HybridReqToTokenPool(ReqToTokenPool):
             mamba_index = self.req_index_to_mamba_index_mapping[free_index]
             self.mamba_pool.free(mamba_index)
 
+            if self.enable_mamba_extra_buffer:
+                mamba_ping_pong_track_buffer_to_free = (
+                    self.req_index_to_mamba_ping_pong_track_buffer_mapping[
+                        free_index
+                    ].squeeze(0)
+                )
+                if mamba_ping_pong_track_buffer_to_keep is not None:
+                    assert mamba_ping_pong_track_buffer_to_keep in [
+                        0,
+                        1,
+                    ], f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
+                    idx_to_free = list(range(self.mamba_ping_pong_track_buffer_size))
+                    idx_to_free.remove(mamba_ping_pong_track_buffer_to_keep)
+                    mamba_ping_pong_track_buffer_to_free = (
+                        mamba_ping_pong_track_buffer_to_free[idx_to_free]
+                    )
+                self.mamba_pool.free(mamba_ping_pong_track_buffer_to_free)
+
     def clear(self):
+        logger.info("Reset HybridReqToTokenPool")
         super().clear()
         self.mamba_pool.clear()
+        self.req_index_to_mamba_index_mapping.zero_()
+        if self.enable_mamba_extra_buffer:
+            self.req_index_to_mamba_ping_pong_track_buffer_mapping.zero_()
 
 
 class KVCache(abc.ABC):
@@ -520,7 +602,6 @@ class KVCache(abc.ABC):
 
 
 class MHATokenToKVPool(KVCache):
-
     def __init__(
         self,
         size: int,
@@ -553,7 +634,9 @@ class MHATokenToKVPool(KVCache):
 
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = (
-            self.device_module.Stream() if _is_cuda and enable_alt_stream else None
+            self.device_module.Stream()
+            if (_is_cuda or _is_musa) and enable_alt_stream
+            else None
         )
 
         if enable_kv_cache_copy:
@@ -1127,6 +1210,9 @@ class HybridLinearKVPool(KVCache):
                     cache_v,
                 )
 
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
+
     def get_v_head_dim(self):
         return self.full_kv_pool.get_value_buffer(0).shape[-1]
 
@@ -1276,7 +1362,6 @@ class SWAKVPool(KVCache):
         k_scale: float = 1.0,
         v_scale: float = 1.0,
     ):
-
         layer_id = layer.layer_id
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:

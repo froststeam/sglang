@@ -84,6 +84,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
     make_layers,
@@ -91,6 +92,7 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_musa = is_musa()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -714,12 +716,14 @@ class Glm4MoeDecoderLayer(nn.Module):
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
+        is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=1 if is_nextn else config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         if self.is_layer_sparse:
@@ -901,7 +905,7 @@ class Glm4MoeModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+        self.alt_stream = torch.cuda.Stream() if _is_cuda or _is_musa else None
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Glm4MoeDecoderLayer(

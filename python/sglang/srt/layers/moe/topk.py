@@ -29,6 +29,8 @@ from typing import (
 )
 
 import torch
+import triton
+import triton.language as tl
 
 try:
     from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx, routing
@@ -55,6 +57,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_npu,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
@@ -70,8 +73,9 @@ _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_musa = is_musa()
 
-if _is_cuda:
+if _is_cuda or _is_musa:
     from sgl_kernel import moe_fused_gate
 
     try:
@@ -79,7 +83,10 @@ if _is_cuda:
     except ImportError as e:
         pass
 
-if _is_cuda or _is_hip:
+if _is_musa:
+    from mate import moe_fused_gate as mate_moe_fused_gate
+
+if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import topk_softmax
 
     try:
@@ -117,7 +124,6 @@ class TopKConfig:
 
 
 class TopKOutputChecker:
-
     @staticmethod
     def format_is_standard(topk_output: TopKOutput) -> TypeGuard[StandardTopKOutput]:
         return topk_output.format.is_standard()
@@ -441,6 +447,285 @@ def apply_topk_weights_cpu(need_apply, topk_weights, inputs):
     return inputs, topk_weights
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=1, num_stages=1),
+        triton.Config({}, num_warps=1, num_stages=2),
+        triton.Config({}, num_warps=2, num_stages=1),
+        triton.Config({}, num_warps=2, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=1),
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=1),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=3),
+        triton.Config({}, num_warps=16, num_stages=1),
+        triton.Config({}, num_warps=16, num_stages=2),
+        triton.Config({}, num_warps=16, num_stages=3),
+        triton.Config({}, num_warps=32, num_stages=1),
+        triton.Config({}, num_warps=32, num_stages=2),
+    ],
+    key=["num_tokens", "num_experts"],
+)
+@triton.jit
+def topk_softmax_triton_kernel(
+    gating_output_ptr,
+    selected_expert_ptr,
+    moe_weights_ptr,
+    renormalize_flag,
+    num_experts,
+    num_tokens,  # kept for autotune key
+    K: tl.constexpr,
+    BLOCK_WIDTH_SIZE_UP: tl.constexpr,
+):
+    curr_row_idx = tl.program_id(0)
+
+    FLOAT_MINIMUM = -10000.0
+    LOG2E = 1.4426950408889634
+
+    weights_local_final = tl.zeros((16,), dtype=tl.float32)
+    selected_local_final = tl.zeros((16,), dtype=tl.int32)
+
+    offset = tl.arange(0, BLOCK_WIDTH_SIZE_UP)
+    k_offset = tl.arange(0, 16)
+    mask_expert = offset < num_experts
+    mask_topk = k_offset < K
+
+    row_offset = curr_row_idx * num_experts
+
+    gating_output = tl.load(
+        gating_output_ptr + row_offset + offset, mask=mask_expert, other=FLOAT_MINIMUM
+    )
+
+    row_max = tl.max(gating_output, axis=0)
+    gating_output = tl.exp2((gating_output - row_max) * LOG2E)
+    row_sum = tl.sum(gating_output, axis=0)
+    inv_row_sum = 1.0 / row_sum
+    gating_choice = gating_output * inv_row_sum
+    gating_choice = tl.where(mask_expert, gating_choice, FLOAT_MINIMUM)
+    gating_choice = tl.cast(gating_choice, tl.float16)
+
+    weights_selected_sum = 0.0
+
+    for k_idx in range(K):
+        top_k_index = tl.argmax(gating_choice, axis=0)
+
+        top_k_logit = tl.load(
+            gating_output_ptr + row_offset + top_k_index,
+            mask=top_k_index < num_experts,
+            other=FLOAT_MINIMUM,
+        )
+        top_k_value = tl.exp(top_k_logit - row_max) * inv_row_sum
+
+        weights_local_final = tl.where(
+            k_offset == k_idx, top_k_value, weights_local_final
+        )
+        selected_local_final = tl.where(
+            k_offset == k_idx, top_k_index, selected_local_final
+        )
+        weights_selected_sum += top_k_value
+
+        gating_choice = tl.where(
+            offset == top_k_index,
+            FLOAT_MINIMUM,
+            gating_choice,
+        )
+        gating_choice = tl.cast(gating_choice, tl.float16)
+
+    if renormalize_flag:
+        weights_local_final = weights_local_final / weights_selected_sum
+
+    tl.store(
+        moe_weights_ptr + curr_row_idx * K + k_offset,
+        weights_local_final,
+        mask=mask_topk,
+    )
+    tl.store(
+        selected_expert_ptr + curr_row_idx * K + k_offset,
+        selected_local_final,
+        mask=mask_topk,
+    )
+
+
+def topk_softmax_triton(topk_weights, topk_indices, gating_output, topk, renormalize):
+    num_tokens, num_experts = gating_output.shape
+    block_width_up = triton.next_power_of_2(num_experts)
+    grid = (num_tokens,)
+    topk_softmax_triton_kernel[grid](
+        gating_output,
+        topk_indices,
+        topk_weights,
+        renormalize,
+        num_experts,
+        num_tokens,
+        K=topk,
+        BLOCK_WIDTH_SIZE_UP=block_width_up,
+    )
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=1, num_stages=1),
+        triton.Config({}, num_warps=1, num_stages=2),
+        triton.Config({}, num_warps=2, num_stages=1),
+        triton.Config({}, num_warps=2, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=1),
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=1),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=3),
+        triton.Config({}, num_warps=16, num_stages=1),
+        triton.Config({}, num_warps=16, num_stages=2),
+        triton.Config({}, num_warps=16, num_stages=3),
+        triton.Config({}, num_warps=32, num_stages=1),
+        triton.Config({}, num_warps=32, num_stages=2),
+    ],
+    key=["num_tokens", "num_experts"],
+)
+@triton.jit
+def topk_sigmoid_triton_kernel(
+    gating_output_ptr,
+    selected_expert_ptr,
+    moe_weights_ptr,
+    renormalize_flag,
+    correction_bias_ptr,
+    has_correction_bias,
+    num_experts,
+    num_tokens,  # kept for autotune key
+    K: tl.constexpr,
+    BLOCK_WIDTH_SIZE_UP: tl.constexpr,
+):
+    curr_row_idx = tl.program_id(0)
+
+    FLOAT_MINIMUM = -10000.0
+    LOG2E = 1.4426950408889634
+
+    weights_local_final = tl.zeros((16,), dtype=tl.float32)
+    selected_local_final = tl.zeros((16,), dtype=tl.int32)
+
+    offset = tl.arange(0, BLOCK_WIDTH_SIZE_UP)
+    k_offset = tl.arange(0, 16)
+    mask_expert = offset < num_experts
+    mask_topk = k_offset < K
+
+    row_offset = curr_row_idx * num_experts
+
+    gating_output = tl.load(
+        gating_output_ptr + row_offset + offset, mask=mask_expert, other=FLOAT_MINIMUM
+    )
+
+    if has_correction_bias:
+        correction_bias = tl.load(
+            correction_bias_ptr + offset, mask=mask_expert, other=0.0
+        )
+        gating_output = gating_output + correction_bias
+
+    # For numerical stability, we can compute sigmoid as:
+    # For x >= 0: sigmoid = 1 / (1 + exp(-x))
+    # For x < 0: sigmoid = exp(x) / (1 + exp(x))
+    # This avoids overflow for large positive x
+
+    # Compute negative x for exp(-x) when x >= 0
+    is_positive = gating_output >= 0
+    neg_x = tl.where(is_positive, -gating_output, gating_output)
+    exp_neg_x = tl.exp2(neg_x * LOG2E)
+
+    sigmoid_vals = tl.where(
+        is_positive,
+        1.0 / (1.0 + exp_neg_x),  # For x >= 0: 1/(1+exp(-x))
+        exp_neg_x / (1.0 + exp_neg_x),  # For x < 0: exp(x)/(1+exp(x))
+    )
+
+    sigmoid_vals = tl.where(mask_expert, sigmoid_vals, FLOAT_MINIMUM)
+    sigmoid_vals = tl.cast(sigmoid_vals, tl.float16)
+
+    weights_selected_sum = 0.0
+
+    for k_idx in range(K):
+        top_k_index = tl.argmax(sigmoid_vals, axis=0)
+
+        top_k_logit = tl.load(
+            gating_output_ptr + row_offset + top_k_index,
+            mask=top_k_index < num_experts,
+            other=FLOAT_MINIMUM,
+        )
+
+        if has_correction_bias:
+            top_k_correction = tl.load(
+                correction_bias_ptr + top_k_index,
+                mask=top_k_index < num_experts,
+                other=0.0,
+            )
+            top_k_logit_corrected = top_k_logit + top_k_correction
+        else:
+            top_k_logit_corrected = top_k_logit
+
+        if top_k_logit_corrected >= 0:
+            exp_neg_val = tl.exp2(-top_k_logit_corrected * LOG2E)
+            top_k_value = 1.0 / (1.0 + exp_neg_val)
+        else:
+            exp_val = tl.exp2(top_k_logit_corrected * LOG2E)
+            top_k_value = exp_val / (1.0 + exp_val)
+
+        weights_local_final = tl.where(
+            k_offset == k_idx, top_k_value, weights_local_final
+        )
+        selected_local_final = tl.where(
+            k_offset == k_idx, top_k_index, selected_local_final
+        )
+        weights_selected_sum += top_k_value
+
+        sigmoid_vals = tl.where(
+            offset == top_k_index,
+            FLOAT_MINIMUM,
+            sigmoid_vals,
+        )
+        sigmoid_vals = tl.cast(sigmoid_vals, tl.float16)
+
+    if renormalize_flag:
+        weights_local_final = weights_local_final / weights_selected_sum
+
+    tl.store(
+        moe_weights_ptr + curr_row_idx * K + k_offset,
+        weights_local_final,
+        mask=mask_topk,
+    )
+    tl.store(
+        selected_expert_ptr + curr_row_idx * K + k_offset,
+        selected_local_final,
+        mask=mask_topk,
+    )
+
+
+def topk_sigmoid_triton(
+    topk_weights,
+    topk_indices,
+    gating_output,
+    topk,
+    renormalize,
+    correction_bias,
+):
+    num_tokens, num_experts = gating_output.shape
+    block_width_up = triton.next_power_of_2(num_experts)
+    grid = (num_tokens,)
+
+    has_correction_bias = correction_bias is not None
+
+    topk_sigmoid_triton_kernel[grid](
+        gating_output,
+        topk_indices,
+        topk_weights,
+        renormalize,
+        correction_bias,
+        has_correction_bias,
+        num_experts,
+        num_tokens,
+        K=topk,
+        BLOCK_WIDTH_SIZE_UP=block_width_up,
+    )
+
+
 def fused_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -461,25 +746,48 @@ def fused_topk(
     topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
 
     if scoring_func == "softmax":
-        topk_softmax(
-            topk_weights,
-            topk_ids,
-            gating_output,
-            renormalize,
-        )
+        if not _is_musa:
+            topk_softmax(
+                topk_weights,
+                topk_ids,
+                gating_output,
+                renormalize,
+            )
+        else:
+            topk_softmax_triton(
+                topk_weights,
+                topk_ids,
+                gating_output,
+                topk,
+                renormalize,
+            )
     elif scoring_func == "sigmoid":
-        topk_sigmoid(
-            topk_weights,
-            topk_ids,
-            gating_output,
-            renormalize,
-            correction_bias,
-        )
+        if not _is_musa:
+            topk_sigmoid(
+                topk_weights,
+                topk_ids,
+                gating_output,
+                renormalize,
+                correction_bias,
+            )
+        else:
+            topk_sigmoid_triton(
+                topk_weights,
+                topk_ids,
+                gating_output,
+                topk,
+                renormalize,
+                correction_bias,
+            )
     else:
         raise ValueError(f"Invalid scoring function: {scoring_func}")
 
-    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    if (expert_location_dispatch_info is not None) or (
+        num_token_non_padded is not None
+    ):
+        topk_ids = _biased_grouped_topk_postprocess(
+            topk_ids, expert_location_dispatch_info, num_token_non_padded
+        )
     return topk_weights, topk_ids
 
 
@@ -709,7 +1017,13 @@ def _mask_topk_ids_padded_region(
     if num_token_non_padded is None:
         return
     indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
-    topk_ids[indices >= num_token_non_padded, :] = -1
+    if not _is_musa:
+        topk_ids[indices >= num_token_non_padded, :] = -1
+    else:
+        # XXX (MUSA): avoid launch D2H kernel: jira: https://jira.mthreads.com/browse/KUAE-717
+        topk_ids = topk_ids.masked_fill(
+            (indices >= num_token_non_padded).unsqueeze(1), -1
+        )
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
@@ -752,6 +1066,36 @@ def biased_grouped_topk_gpu(
             routed_scaling_factor if routed_scaling_factor is not None else 1.0,
             apply_routed_scaling_factor_on_output,
         )
+        # TODO merge into kernel
+        if (expert_location_dispatch_info is not None) or (
+            num_token_non_padded is not None
+        ):
+            topk_ids = _biased_grouped_topk_postprocess(
+                topk_ids, expert_location_dispatch_info, num_token_non_padded
+            )
+        return topk_weights, topk_ids
+    elif (
+        _is_musa
+        and (
+            gating_output.shape[1] // num_expert_group <= 32
+            or (
+                num_expert_group == 1 and gating_output.shape[1] in {160, 256, 384}
+            )  # XXX (MUSA): will support more cases in the future
+        )
+        and is_power_of_two(correction_bias.shape[0])
+    ):
+        topk_weights, topk_ids = mate_moe_fused_gate(
+            gating_output.to(dtype=torch.float32),
+            correction_bias,
+            num_expert_group,
+            topk_group,
+            topk,
+            num_fused_shared_experts,
+            routed_scaling_factor if routed_scaling_factor is not None else 1.0,
+            renormalize,
+            apply_routed_scaling_factor_on_output,
+        )
+
         # TODO merge into kernel
         if (expert_location_dispatch_info is not None) or (
             num_token_non_padded is not None
@@ -859,7 +1203,6 @@ def select_experts(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ) -> StandardTopKOutput:
-
     top_k = topk_config.top_k
     use_grouped_topk = topk_config.use_grouped_topk
     topk_group = topk_config.topk_group
@@ -878,12 +1221,13 @@ def select_experts(
     )
     scoring_func = topk_config.scoring_func
 
-    router_logits, correction_bias = (
-        expert_location_dispatch.transform_select_experts_inputs(
-            router_logits=router_logits,
-            correction_bias=correction_bias,
-            info=expert_location_dispatch_info,
-        )
+    (
+        router_logits,
+        correction_bias,
+    ) = expert_location_dispatch.transform_select_experts_inputs(
+        router_logits=router_logits,
+        correction_bias=correction_bias,
+        info=expert_location_dispatch_info,
     )
 
     # DeepSeek V2/V3/R1 series models use grouped_top_k

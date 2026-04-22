@@ -1,7 +1,7 @@
 from typing import Optional, Union
 
 import torch
-from sgl_kernel.utils import _to_tensor_scalar_tuple
+from sgl_kernel.utils import _to_tensor_scalar_tuple, is_musa
 
 
 def _top_k_renorm_probs_internal(
@@ -202,7 +202,16 @@ def _top_k_top_p_sampling_from_probs_internal(
             maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
         )
         samples = torch.empty(probs.size(0), dtype=torch.int32, device=device)
-        torch.ops.sgl_kernel.top_k_top_p_sampling_from_probs.default(
+        if is_musa():
+            top_k_top_sampling_func = (
+                torch.ops.sgl_kernel.musa_top_k_top_p_sampling_from_probs
+            )
+        else:
+            top_k_top_sampling_func = (
+                torch.ops.sgl_kernel.top_k_top_p_sampling_from_probs
+            )
+
+        top_k_top_sampling_func.default(
             probs,
             samples,
             indices,

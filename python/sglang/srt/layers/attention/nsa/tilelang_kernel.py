@@ -4,8 +4,9 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_musa
 
+tilelang.disable_cache()
 tilelang.set_log_level("WARNING")
 
 pass_configs = {
@@ -19,6 +20,7 @@ FP8 = "float8_e4m3"
 FP32 = "float32"
 
 _is_hip = is_hip()
+_is_musa = is_musa()
 
 
 def fast_log2_ceil(x):
@@ -201,7 +203,35 @@ def fp8_index(
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+        # tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
+        # tilelang.PassConfigKey.TL_ENABLE_MUSA_BURST: True,
+        tilelang.PassConfigKey.TL_ENABLE_REDUCE_BURST: False,
     },
+    compile_flags=[
+        # "-Od3",
+        "-fmusa-flush-denormals-to-zero",
+        "-mllvm",
+        "-misched=mtgpu-max-ilp",
+        "-mllvm",
+        "-mtgpu-if-convert=1",
+        "-mllvm",
+        "-mtgpu-tiny-offset-hint=1",
+        "-mllvm",
+        "-mtgpu-enable-postra-sched=0",
+        "-mllvm",
+        "-misched-recompute-slotindex=1",
+        "-mllvm",
+        "-mtgpu-combine-instr-with-burst=1",
+        "-mllvm",
+        "-mtgpu-combine-fop-instr=1",
+        "-fno-signed-zeros",
+        "-fno-strict-aliasing",
+        "-mllvm",
+        "-mtgpu-load-cluster-mutation=1",
+        "-mllvm",
+        "--num-dwords-of-load-in-mutation=64",
+    ],
 )
 def sparse_attention_fwd_kernel_v1(
     num_heads,
@@ -213,8 +243,8 @@ def sparse_attention_fwd_kernel_v1(
     sm_scale=None,
     is_causal=True,
     block_I=64,
-    num_stages=2,
-    threads=256,
+    num_stages=0,
+    threads=512,
 ):
     assert dim == tilelang.math.next_power_of_2(
         dim
@@ -245,7 +275,7 @@ def sparse_attention_fwd_kernel_v1(
     accum_dtype = "float"
 
     H = head_kv
-    padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
+    padded_H = max(tilelang.math.next_power_of_2(head_kv), 64)
     if padded_H != H:
         assert kv_group == 1
     BI = block_I
@@ -277,7 +307,6 @@ def sparse_attention_fwd_kernel_v1(
             Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
             KV_shared = T.alloc_shared([BI, D], dtype)
             K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
-            O_shared = T.alloc_shared([H_per_block, D], dtype)
             mask = T.alloc_fragment([BI], "bool")
 
             acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
@@ -301,14 +330,22 @@ def sparse_attention_fwd_kernel_v1(
             H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
             H1 = H0 + H_per_block
 
-            T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
-            T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
+            T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared, force_async_copy=True)
+            T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared, force_async_copy=True)
 
             for i_i in T.Pipelined(NI, num_stages=num_stages):
 
                 for bi_i in T.Parallel(BI):
                     mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] >= 0
 
+                T.annotate_layout(
+                    {
+                        KV_shared: tilelang.layout.make_sqmma_swizzled_layout(
+                            KV_shared, k_major=True
+                        )
+                    },
+                    allow_reannotation=True,
+                )
                 for bi_i, d_i in T.Parallel(BI, D):
                     KV_shared[bi_i, d_i] = KV[
                         b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i
@@ -327,14 +364,14 @@ def sparse_attention_fwd_kernel_v1(
                     KV_shared,
                     acc_s,
                     transpose_B=True,
-                    policy=T.GemmWarpPolicy.FullCol,
+                    policy=T.GemmWarpPolicy.FullRow,
                 )
                 T.gemm(
                     Q_tail_shared,
                     K_tail_shared,
                     acc_s,
                     transpose_B=True,
-                    policy=T.GemmWarpPolicy.FullCol,
+                    policy=T.GemmWarpPolicy.FullRow,
                 )
                 T.copy(m_i, m_i_prev)
                 T.reduce_max(acc_s, m_i, dim=1, clear=False)
@@ -351,7 +388,19 @@ def sparse_attention_fwd_kernel_v1(
                     acc_o[h_i, d_i] = acc_o[h_i, d_i] * alpha[h_i]
 
                 T.copy(acc_s, S_shared)
-                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullCol)
+                T.annotate_layout(
+                    {
+                        KV_shared: tilelang.layout.make_sqmma_swizzled_layout(
+                            KV_shared, continuity=64, k_major=False
+                        )
+                    },
+                    allow_reannotation=True,
+                )
+                for bi_i, d_i in T.Parallel(BI, D):
+                    KV_shared[bi_i, d_i] = KV[
+                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i
+                    ]
+                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
             # Rescale
             for h_i, d_i in T.Parallel(H_per_block, D):
@@ -359,7 +408,6 @@ def sparse_attention_fwd_kernel_v1(
             for h_i in T.Parallel(H_per_block):
                 sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
 
-            T.copy(acc_o, O_shared)
             T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
 
     return main
@@ -774,9 +822,9 @@ def tilelang_sparse_fwd(
     tail_dim = dim - d_v
     topk = indices.shape[-1]
     assert topk == 2048
-    if _is_hip:
+    if _is_hip or _is_musa:
         kernel = sparse_attention_fwd_kernel_v1(
-            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, num_stages=1
+            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, num_stages=0
         )
     else:
         kernel = sparse_attention_fwd_kernel_v2(

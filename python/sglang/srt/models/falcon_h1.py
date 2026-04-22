@@ -35,10 +35,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, make_layers
+from sglang.srt.utils import add_prefix, is_cuda, is_musa, make_layers
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
+_is_musa = is_musa()
 
 
 class FalconH1MLP(nn.Module):
@@ -201,12 +202,14 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         # FalconH1 all layers are sparse and have no nextn now
         self.is_layer_sparse = False
         is_previous_layer_sparse = False
+        is_next_layer_sparse = False
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         self.feed_forward = FalconH1MLP(
@@ -385,7 +388,7 @@ class FalconH1Model(nn.Module):
         super().__init__()
         self.config = config
 
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = torch.cuda.Stream() if _is_cuda or _is_musa else None
         self.embedding_multiplier = config.embedding_multiplier
 
         self.embed_tokens = VocabParallelEmbedding(

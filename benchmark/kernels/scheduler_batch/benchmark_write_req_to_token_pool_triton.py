@@ -5,6 +5,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import get_device
+
 
 @triton.jit
 def write_req_to_token_pool_triton(
@@ -117,13 +119,13 @@ def test_write_req_to_token_pool():
 
     # Initialize input tensors
     req_to_token = torch.zeros(
-        (max_batch, max_context_len), dtype=torch.int32, device="cuda"
+        (max_batch, max_context_len), dtype=torch.int32, device=get_device()
     )
-    req_pool_indices = torch.tensor([42], dtype=torch.int32, device="cuda")
-    pre_lens = torch.tensor([8], dtype=torch.int32, device="cuda")
-    seq_lens = torch.tensor([22], dtype=torch.int32, device="cuda")
-    extend_lens = torch.tensor([extend_len], dtype=torch.int32, device="cuda")
-    out_cache_loc = torch.arange(extend_len, dtype=torch.int32, device="cuda")
+    req_pool_indices = torch.tensor([42], dtype=torch.int32, device=get_device())
+    pre_lens = torch.tensor([8], dtype=torch.int32, device=get_device())
+    seq_lens = torch.tensor([22], dtype=torch.int32, device=get_device())
+    extend_lens = torch.tensor([extend_len], dtype=torch.int32, device=get_device())
+    out_cache_loc = torch.arange(extend_len, dtype=torch.int32, device=get_device())
 
     # Create copies for reference implementation
     req_to_token_ref = req_to_token.clone()
@@ -176,13 +178,17 @@ def test_write_req_to_token_pool():
     total_extend_len = sum(extend_lens_list)
 
     req_to_token = torch.zeros(
-        (max_batch, max_context_len), dtype=torch.int32, device="cuda"
+        (max_batch, max_context_len), dtype=torch.int32, device=get_device()
     )
-    req_pool_indices = torch.tensor([42, 100, 200], dtype=torch.int32, device="cuda")
-    pre_lens = torch.tensor([8, 10, 15], dtype=torch.int32, device="cuda")
-    seq_lens = torch.tensor([22, 30, 45], dtype=torch.int32, device="cuda")
-    extend_lens = torch.tensor(extend_lens_list, dtype=torch.int32, device="cuda")
-    out_cache_loc = torch.arange(total_extend_len, dtype=torch.int32, device="cuda")
+    req_pool_indices = torch.tensor(
+        [42, 100, 200], dtype=torch.int32, device=get_device()
+    )
+    pre_lens = torch.tensor([8, 10, 15], dtype=torch.int32, device=get_device())
+    seq_lens = torch.tensor([22, 30, 45], dtype=torch.int32, device=get_device())
+    extend_lens = torch.tensor(extend_lens_list, dtype=torch.int32, device=get_device())
+    out_cache_loc = torch.arange(
+        total_extend_len, dtype=torch.int32, device=get_device()
+    )
 
     req_to_token_ref = req_to_token.clone()
     req_to_token_opt = req_to_token.clone()
@@ -252,13 +258,19 @@ def get_benchmark():
         total_extend_len = sum(extend_lens_list)
 
         req_to_token = torch.zeros(
-            (max_batch, max_context_len), dtype=torch.int32, device="cuda"
+            (max_batch, max_context_len), dtype=torch.int32, device=get_device()
         )
-        req_pool_indices = torch.arange(batch_size, dtype=torch.int32, device="cuda")
-        pre_lens = torch.ones(batch_size, dtype=torch.int32, device="cuda") * 8
+        req_pool_indices = torch.arange(
+            batch_size, dtype=torch.int32, device=get_device()
+        )
+        pre_lens = torch.ones(batch_size, dtype=torch.int32, device=get_device()) * 8
         seq_lens = pre_lens + extend_len
-        extend_lens = torch.tensor(extend_lens_list, dtype=torch.int32, device="cuda")
-        out_cache_loc = torch.arange(total_extend_len, dtype=torch.int32, device="cuda")
+        extend_lens = torch.tensor(
+            extend_lens_list, dtype=torch.int32, device=get_device()
+        )
+        out_cache_loc = torch.arange(
+            total_extend_len, dtype=torch.int32, device=get_device()
+        )
 
         quantiles = [0.5, 0.2, 0.8]
 

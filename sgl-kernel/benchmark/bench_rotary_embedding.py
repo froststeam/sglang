@@ -11,6 +11,7 @@ from sgl_kernel.testing.rotary_embedding import (
     create_inputs,
 )
 
+from sglang.srt.utils import get_device
 from sglang.srt.utils.bench_utils import bench_kineto
 
 # CI environment detection
@@ -55,7 +56,7 @@ configs = [
     )
 )
 def benchmark(batch_size, seq_len, save_kv_cache, provider):
-    device = torch.device("cuda")
+    device = get_device()
 
     num_q_heads = 32
     num_kv_heads = 8

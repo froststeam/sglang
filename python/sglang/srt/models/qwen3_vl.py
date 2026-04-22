@@ -28,15 +28,18 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 )
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
+from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -75,10 +78,8 @@ class Qwen3_VisionMLP(nn.Module):
         use_data_parallel: bool = False,
     ):
         super().__init__()
-        self.tp_size = (
-            1 if use_data_parallel else get_tensor_model_parallel_world_size()
-        )
-        self.tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
+        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
+        self.tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
         self.linear_fc1 = ColumnParallelLinear(
             in_features,
             hidden_features,
@@ -96,6 +97,7 @@ class Qwen3_VisionMLP(nn.Module):
             prefix=add_prefix("linear_fc2", prefix),
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
+            use_dp_attention_reduce=is_dp_attention_enabled(),
         )
         self.act = ACT2FN[hidden_act]
 
@@ -166,6 +168,7 @@ class Qwen3_VisionBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
             use_data_parallel=use_data_parallel,
+            use_dp_attention_reduce=is_dp_attention_enabled(),
         )
         self.mlp = Qwen3_VisionMLP(
             dim,
@@ -221,10 +224,8 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         self.norm = norm_layer(
             self.hidden_size if use_postshuffle_norm else context_dim
         )
-        self.tp_size = (
-            1 if use_data_parallel else get_tensor_model_parallel_world_size()
-        )
-        self.tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
+        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
+        self.tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
         self.linear_fc1 = ColumnParallelLinear(
             self.hidden_size,
             self.hidden_size,
@@ -243,6 +244,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
             prefix=add_prefix("linear_fc2", prefix),
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
+            use_dp_attention_reduce=is_dp_attention_enabled(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -599,15 +601,16 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         language_model_cls=Qwen3LLMModel,
     ) -> None:
         super().__init__()
+        self.pp_group = get_pp_group()
 
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
         self.visual = Qwen3VLMoeVisionModel(
             config.vision_config,
             # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
             # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=quant_config,
+            quant_config=None,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            prefix=add_prefix("visual", prefix),
+            prefix=add_prefix("model.visual", prefix),
             use_data_parallel=self.use_data_parallel,
         )
 
@@ -617,21 +620,29 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         else:
             self.config = config.text_config  # for qwen3-omni
 
-        self.model = language_model_cls(
-            config=self.config,
-            quant_config=quant_config,
-            prefix=add_prefix("model", prefix),
-        )
-
-        if self.config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
-        else:
-            self.lm_head = ParallelLMHead(
-                self.config.vocab_size,
-                self.config.hidden_size,
+        if not hasattr(config, "encoder_only") or not config.encoder_only:
+            self.model = language_model_cls(
+                config=self.config,
                 quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
+                prefix=add_prefix("model.language_model", prefix),
             )
+            if self.pp_group.is_last_rank:
+                if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
+                    self.lm_head = self.model.embed_tokens
+                else:
+                    self.lm_head = ParallelLMHead(
+                        self.config.vocab_size,
+                        self.config.hidden_size,
+                        quant_config=quant_config,
+                        use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                        prefix=add_prefix("lm_head", prefix),
+                    )
+            else:
+                self.lm_head = PPMissingLayer()
+        else:
+            # encoder_only mode: no language model, so no lm_head needed
+            self.lm_head = None
+
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
         self.logits_processor = LogitsProcessor(self.config)
@@ -706,6 +717,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         """Run forward pass for Qwen3-VL.
 
@@ -739,14 +751,21 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             multimodal_model=self,
             positions=positions,
             use_deepstack=self.use_deepstack,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        if not get_embedding:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
-            )
+        if self.pp_group.is_last_rank:
+            if not get_embedding:
+                return self.logits_processor(
+                    input_ids,
+                    hidden_states,
+                    self.lm_head,
+                    forward_batch,
+                )
+            else:
+                return self.pooler(hidden_states, forward_batch)
         else:
-            return self.pooler(hidden_states, forward_batch)
+            return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -763,6 +782,34 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
+            layer_id = get_layer_id(name)
+
+            # Only copy embed_tokens to lm_head when tie_word_embeddings=True
+            # For models with tie_word_embeddings=False (e.g. 8B), lm_head has independent weights
+            if (
+                self.pp_group.is_last_rank
+                and "model.embed_tokens.weight" in name
+                and self.config.tie_word_embeddings
+            ):
+                if "lm_head.weight" in params_dict:
+                    lm_head_param = params_dict["lm_head.weight"]
+                    weight_loader = getattr(
+                        lm_head_param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(lm_head_param, loaded_weight)
+
+            is_visual = "visual" in name
+            if (
+                not is_visual
+                and layer_id is not None
+                and hasattr(self, "model")
+                and hasattr(self.model, "start_layer")
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
+            ):
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -788,7 +835,11 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
-                    param = params_dict[name]
+                    if name in params_dict.keys():
+                        param = params_dict[name]
+                    else:
+                        continue
+
                 except KeyError:
                     print(params_dict.keys())
                     raise
