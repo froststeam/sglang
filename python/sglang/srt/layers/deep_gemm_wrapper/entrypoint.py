@@ -9,6 +9,8 @@ from sglang.srt.layers.deep_gemm_wrapper import compile_utils
 from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     DEEPGEMM_BLACKWELL,
     DEEPGEMM_NEED_TMA_ALIGNED_SCALES,
+    DEEPGEMM_SCALE_LAYOUT_COLUMN_MAJOR,
+    DEEPGEMM_SCALE_TMA_ALIGNED,
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
 )
