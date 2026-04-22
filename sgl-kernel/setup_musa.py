@@ -77,6 +77,7 @@ include_dirs = [
 
 sources = [
     "csrc/common_extension_musa.cc",
+    "csrc/mamba/causal_conv1d.cu",
     str(_FLASHINFER_REPO.source_dir / "csrc/norm.cu"),
     str(_FLASHINFER_REPO.source_dir / "csrc/renorm.cu"),
     str(_FLASHINFER_REPO.source_dir / "csrc/sampling.cu"),
