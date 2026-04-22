@@ -11,7 +11,7 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_per_layer_mla,
 )
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import get_device, is_hip
 
 
 def ref_copy_with_indices(src_pool, dst_pool, src_indices, dst_indices):
@@ -81,7 +81,7 @@ def test_transfer_kv(
 
     original_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
-    device = "cuda"
+    device = get_device()
     torch.cuda.manual_seed(42)
 
     num_layers = 4  # A small number of layers for pool creation
@@ -315,7 +315,7 @@ def test_transfer_kv_pf_direct(
 ):
     original_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
-    device = "cuda"
+    device = get_device()
     torch.cuda.manual_seed(42)
 
     num_layers = 4
@@ -529,7 +529,7 @@ def test_transfer_kv_page_head(
 ):
     original_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
-    device = "cuda"
+    device = get_device()
     torch.cuda.manual_seed(42)
 
     num_layers = 4

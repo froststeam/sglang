@@ -45,6 +45,7 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     is_cuda,
+    is_musa,
     is_npu,
     make_layers,
     set_weight_attrs,
@@ -52,6 +53,7 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
+_is_musa = is_musa()
 _is_npu = is_npu()
 
 
@@ -793,7 +795,7 @@ class Qwen3NextModel(nn.Module):
         super().__init__()
         self.config = config
 
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = torch.cuda.Stream() if _is_cuda or _is_musa else None
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,

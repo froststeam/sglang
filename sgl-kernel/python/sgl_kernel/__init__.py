@@ -1,6 +1,8 @@
 import torch
 from sgl_kernel.load_utils import _load_architecture_specific_ops, _preload_cuda_library
 
+from sglang.srt.utils import is_musa
+
 # Initialize the ops library based on current GPU
 common_ops = _load_architecture_specific_ops()
 
@@ -145,3 +147,14 @@ def get_sm_available(*args, **kwargs):
     from sgl_kernel.spatial import get_sm_available as _impl
 
     return _impl(*args, **kwargs)
+
+
+if is_musa():
+    from sgl_kernel.musa import (
+        musa_batched_rotary_embedding_contiguous,
+        musa_fused_gemv,
+        musa_fused_moe_gemv,
+        musa_fused_mul_add,
+        musa_mudnn_w8a8_scaled_mm,
+        musa_rotary_embedding_contiguous,
+    )

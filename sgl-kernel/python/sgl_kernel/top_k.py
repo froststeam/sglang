@@ -4,6 +4,11 @@ import torch
 
 
 def fast_topk(values, topk, dim):
+    # XXX (MUSA): The empty input case error for torch.max: https://jira.mthreads.com/browse/KUAE-718
+    if values.shape[0] < 1:
+        return torch.empty([0], device=values.device), torch.empty(
+            [0], dtype=torch.int64, device=values.device
+        )
     if topk == 1:
         # Use max along the specified dimension to get both value and index
         return torch.max(values, dim=dim, keepdim=True)

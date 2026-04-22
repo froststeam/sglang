@@ -1,6 +1,10 @@
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.utils import is_musa
+
+_is_musa = is_musa()
+
 logger = logging.getLogger(__name__)
 
 
@@ -127,10 +131,20 @@ def create_flashmla_backend(runner):
 def create_flashattention_v3_backend(runner):
     import torch
 
-    assert (
-        torch.cuda.get_device_capability()[0] == 8 and not runner.use_mla_backend
-    ) or torch.cuda.get_device_capability()[0] == 9, (
-        "FlashAttention v3 Backend requires SM>=80 and SM<=90. "
+    if _is_musa:
+        condition = (
+            torch.cuda.get_device_capability()[0] >= 3
+            and torch.cuda.get_device_capability()[1] >= 1
+        )
+        message = "MP>=31"
+    else:
+        condition = (
+            torch.cuda.get_device_capability()[0] == 8 and not runner.use_mla_backend
+        ) or torch.cuda.get_device_capability()[0] == 9
+        message = "SM>=80 and SM<=90"
+
+    assert condition, (
+        f"FlashAttention v3 Backend requires {message}. "
         "Please use `--attention-backend flashinfer`."
     )
     from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend

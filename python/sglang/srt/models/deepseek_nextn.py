@@ -51,13 +51,14 @@ from sglang.srt.models.deepseek_v2 import (
     enable_nextn_moe_bf16_cast_to_fp8,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
+from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_musa, is_npu
 
 logger = logging.getLogger(__name__)
 
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_musa = is_musa()
 
 
 class DeepseekModelNextN(nn.Module):
@@ -97,7 +98,7 @@ class DeepseekModelNextN(nn.Module):
 
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
-        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+        self.alt_stream = torch.cuda.Stream() if _is_cuda or _is_musa else None
 
         layer_name = "decoder"
         if _is_npu and (

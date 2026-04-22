@@ -5,6 +5,8 @@ import sgl_kernel
 import torch
 from sgl_kernel.utils import is_arch_support_pdl
 
+from sglang.srt.utils import get_device
+
 
 def llama_rms_norm(x, w, eps=1e-6):
     orig_dtype = x.dtype
@@ -75,9 +77,9 @@ def test_norm(batch_size, hidden_size, dtype, specify_out):
 def test_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     eps = 1e-6
 
-    x = torch.randn(batch_size, hidden_size, dtype=dtype, device="cuda")
+    x = torch.randn(batch_size, hidden_size, dtype=dtype, device=get_device())
     residual = torch.randn_like(x)
-    weight = torch.randn(hidden_size, dtype=dtype, device="cuda")
+    weight = torch.randn(hidden_size, dtype=dtype, device=get_device())
 
     x_native, residual_native = fused_add_rms_norm(
         x.clone(), residual.clone(), weight, eps
@@ -119,9 +121,9 @@ def test_gemma_norm(batch_size, hidden_size, dtype, specify_out):
 def test_gemma_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     eps = 1e-6
 
-    x = torch.randn(batch_size, hidden_size, dtype=dtype, device="cuda")
+    x = torch.randn(batch_size, hidden_size, dtype=dtype, device=get_device())
     residual = torch.randn_like(x)
-    weight = torch.randn(hidden_size, dtype=dtype, device="cuda")
+    weight = torch.randn(hidden_size, dtype=dtype, device=get_device())
 
     x_native, residual_native = gemma_fused_add_rms_norm(
         x.clone(), residual.clone(), weight, eps

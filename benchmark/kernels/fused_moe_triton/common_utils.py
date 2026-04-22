@@ -8,7 +8,7 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import get_config_dtype_st
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
     get_config_file_name,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_musa
 
 
 class BenchmarkConfig(TypedDict):
@@ -162,10 +162,48 @@ def get_rocm_configs_compute_bound() -> List[Dict[str, int]]:
     return configs
 
 
+def get_musa_configs_compute_bound() -> List[Dict[str, int]]:
+    configs: List[BenchmarkConfig] = []
+    for num_stages in [1]:
+        for block_m in [32, 64, 128]:
+            for block_k in [32, 64, 128]:
+                for block_n in [32, 64, 128]:
+                    for num_warps in [4, 8, 16]:
+                        for group_size in [1, 16, 32, 64]:
+                            configs.append(
+                                {
+                                    "BLOCK_SIZE_M": block_m,
+                                    "BLOCK_SIZE_N": block_n,
+                                    "BLOCK_SIZE_K": block_k,
+                                    "GROUP_SIZE_M": group_size,
+                                    "num_warps": num_warps,
+                                    "num_stages": num_stages,
+                                }
+                            )
+    for num_stages in [1]:
+        for block_m, block_n in [(16, 64), (64, 16)]:
+            for block_k in [32, 64, 128]:
+                for num_warps in [4, 8, 16]:
+                    for group_size in [1, 16, 32, 64]:
+                        configs.append(
+                            {
+                                "BLOCK_SIZE_M": block_m,
+                                "BLOCK_SIZE_N": block_n,
+                                "BLOCK_SIZE_K": block_k,
+                                "GROUP_SIZE_M": group_size,
+                                "num_warps": num_warps,
+                                "num_stages": num_stages,
+                            }
+                        )
+    return configs
+
+
 def get_configs_compute_bound() -> List[Dict[str, int]]:
     configs: List[BenchmarkConfig] = []
     if is_hip():
         configs = get_rocm_configs_compute_bound()
+    elif is_musa():
+        configs = get_musa_configs_compute_bound()
     else:
         for num_stages in [2, 3, 4, 5]:
             for block_m in [16, 32, 64, 128, 256]:

@@ -17,7 +17,17 @@
 
 namespace sglang {
 
+#ifdef USE_MUSA
+constexpr int kMaxBlocks = 60;
+constexpr int kDefaultThreads = 1024;
+constexpr int kDefaultBlockLimit = 60;
+constexpr int kMaxThreadsPerBlock = 1024;
+#else
 constexpr int kMaxBlocks = 36;
+constexpr int kDefaultThreads = 512;
+constexpr int kDefaultBlockLimit = 36;
+constexpr int kMaxThreadsPerBlock = 512;
+#endif
 // Counter may overflow, but it's fine since unsigned int overflow is
 // well-defined behavior.
 using FlagType = uint32_t;
@@ -32,7 +42,11 @@ struct Signal {
 };
 
 struct __align__(16) RankData {
+#ifdef USE_MUSA
+  const void* ptrs[8];
+#else
   const void* __restrict__ ptrs[8];
+#endif
 };
 
 struct __align__(16) RankSignals {
@@ -82,7 +96,7 @@ DINLINE float& assign_add(float& a, float b) {
   return a += b;
 }
 
-#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__)) || (__MUSA_ARCH__ >= 220 || !defined(__MUSA_ARCH__))
 DINLINE float upcast_s(nv_bfloat16 val) {
   return __bfloat162float(val);
 }
@@ -133,8 +147,18 @@ DINLINE O downcast(array_t<float, O::size> val) {
   }
 }
 
+template <typename T, int32_t vlen = 8>
+DINLINE void _downcast(T* out, float* val) {
+#pragma unroll
+  for (int32_t i = 0; i < vlen; i++) {
+    out[i] = downcast_s<T>(val[i]);
+  }
+}
+
 static DINLINE void st_flag_release(FlagType* flag_addr, FlagType flag) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#ifdef USE_MUSA
+  volatile_store((uint32_t)flag, (uint32_t*)flag_addr);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
   asm volatile("st.release.sys.global.u32 [%1], %0;" ::"r"(flag), "l"(flag_addr));
 #else
   asm volatile("membar.sys; st.volatile.global.u32 [%1], %0;" ::"r"(flag), "l"(flag_addr));
@@ -142,6 +166,11 @@ static DINLINE void st_flag_release(FlagType* flag_addr, FlagType flag) {
 }
 
 static DINLINE FlagType ld_flag_acquire(FlagType* flag_addr) {
+#ifdef USE_MUSA
+  asm("DMA.CFI_FLUSHINV.SLC.BYPASS");
+  return (uint32_t)volatile_load((uint32_t*)flag_addr);
+#endif
+
   FlagType flag;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
   asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(flag) : "l"(flag_addr));
@@ -152,10 +181,20 @@ static DINLINE FlagType ld_flag_acquire(FlagType* flag_addr) {
 }
 
 static DINLINE void st_flag_volatile(FlagType* flag_addr, FlagType flag) {
+#ifdef USE_MUSA
+  volatile FlagType* volatile_ptr = (volatile FlagType*)flag_addr;
+  *volatile_ptr = flag;
+#else
   asm volatile("st.volatile.global.u32 [%1], %0;" ::"r"(flag), "l"(flag_addr));
+#endif
 }
 
 static DINLINE FlagType ld_flag_volatile(FlagType* flag_addr) {
+#ifdef USE_MUSA
+  volatile FlagType* volatile_ptr = (volatile FlagType*)flag_addr;
+  return *volatile_ptr;
+#endif
+
   FlagType flag;
   asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(flag) : "l"(flag_addr));
   return flag;
@@ -167,7 +206,12 @@ static DINLINE FlagType ld_flag_volatile(FlagType* flag_addr) {
 // barrier.
 template <int ngpus, bool is_start, bool need_fence = false>
 DINLINE void multi_gpu_barrier(const RankSignals& sg, Signal* self_sg, int rank) {
-  if constexpr (!is_start) __syncthreads();
+  if constexpr (!is_start)
+#ifdef USE_MUSA
+    __syncthreads_lm();
+#else
+    __syncthreads();
+#endif
   static_assert(!(is_start && need_fence));  // Start barrier shouldn't need fence.
   if (threadIdx.x < ngpus) {
     // Increment the counter. Technically we only need one counter, but we use
@@ -187,7 +231,25 @@ DINLINE void multi_gpu_barrier(const RankSignals& sg, Signal* self_sg, int rank)
         ;
     }
   }
-  if constexpr (is_start || need_fence) __syncthreads();
+  if constexpr (is_start || need_fence)
+#ifdef USE_MUSA
+    __syncthreads_lm();
+#else
+    __syncthreads();
+#endif
+}
+
+template <int32_t ngpus>
+DINLINE void multi_gpu_barrier_with_atomic(const RankSignals& sg, Signal* self_sg, int32_t rank) {
+  if (threadIdx.x < ngpus) {
+    auto val = self_sg->self_counter[blockIdx.x][threadIdx.x] += 1;
+    auto peer_counter_ptr = &sg.signals[threadIdx.x]->peer_counter[val % 2][blockIdx.x][rank];
+    auto self_counter_ptr = &self_sg->peer_counter[val % 2][blockIdx.x][threadIdx.x];
+    atomicExch(peer_counter_ptr, val);
+    while (atomicAdd(self_counter_ptr, 0) != val) {
+    }
+  }
+  __syncthreads_lm();
 }
 
 template <typename P, int ngpus, typename A>
@@ -201,7 +263,7 @@ DINLINE P packed_reduce(const P* ptrs[], int idx) {
 }
 
 template <typename T, int ngpus>
-__global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(
+__global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) cross_device_reduce_1stage(
     RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size) {
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
@@ -221,8 +283,138 @@ DINLINE P* get_tmp_buf(Signal* sg) {
   return (P*)(((Signal*)sg) + 1);
 }
 
+template <typename T, int32_t nranks, int32_t vlen = 8>
+DINLINE void shfl_reduce(float* res) {
+  if constexpr (nranks >= 4) {
+#pragma unroll
+    for (int32_t i = 0; i < vlen; i++) {
+      res[i] += __shfl_xor_sync(0xffffffff, res[i], 16);
+    }
+  }
+#pragma unroll
+  for (int32_t i = 0; i < vlen; i++) {
+    res[i] += __shfl_xor_sync(0xffffffff, res[i], 8);
+  }
+}
+
+template <typename T, int32_t nranks, int32_t vlen = 8>
+__global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) custom_all_reduce_2shot(
+    RankData* _dp,
+    RankSignals sg,
+    Signal* self_sg,
+    T* __restrict__ result,
+    int32_t local_rank,
+    int32_t size,
+    FlagType round) {
+  constexpr int32_t nranks_sft = (nranks >> 1) - (nranks >> 3);  // 8->3, 4->2, 2->1
+  constexpr int32_t coalesce_num = 8;
+  constexpr int32_t coalesce_sft = 3;                     // 8 threads per rank in group
+  constexpr int32_t group_size = nranks << coalesce_sft;  // 64 threads per group when 8 ranks
+  constexpr int32_t group_stride_sft = nranks_sft + coalesce_sft;
+  const int32_t tidx = threadIdx.x;
+  const int32_t bidx = blockIdx.x;
+  const int32_t thread_num = blockDim.x;
+  const int32_t lane_idx = tidx & 31;
+  const int32_t warp_idx = tidx >> 5;
+  const int32_t group_num = thread_num >> group_stride_sft;
+  const int32_t target_rank = (tidx >> coalesce_sft) & (nranks - 1);
+  const int32_t group_id = tidx >> group_stride_sft;
+  const int32_t coalesce_tid = tidx & (coalesce_num - 1);
+
+  typedef int16_t Vec __attribute__((vector_size(16)));
+
+  const int32_t stride = gridDim.x * thread_num;
+  // coalesce_id + local_rank * coalesce_num + group_id * nranks * coalesce_num
+  //             + bidx * group_num * nranks * coalesce_num
+  int32_t idx_base = bidx * thread_num;
+  int32_t idx_in_blk = coalesce_tid + (local_rank << coalesce_sft) + (group_id << group_stride_sft);
+
+  // first sync barrier
+  FlagType* target_barrier = nullptr;
+  FlagType* local_barrier = nullptr;
+  FlagType flag;
+  if (tidx < nranks) {
+    flag = round << 1;
+    target_barrier = &sg.signals[tidx]->peer_counter[flag & 1][bidx][local_rank];
+    local_barrier = &self_sg->peer_counter[flag & 1][bidx][tidx];
+    atomicExch(target_barrier, flag);
+    while (atomicAdd(local_barrier, 0) != flag) {
+    }
+  }
+  __syncthreads_lm();
+
+  // reduce scatter
+  Vec* target_ptr = (Vec*)_dp->ptrs[target_rank];
+  Vec* buffer_ptr = get_tmp_buf<Vec>(sg.signals[local_rank]);
+  do {
+    int32_t idx = idx_in_blk + idx_base;
+    float temp_res[vlen] = {0};
+    if (idx < size) {
+      T* data = reinterpret_cast<T*>(&(target_ptr[idx]));
+#pragma unroll
+      for (int32_t i = 0; i < vlen; i++) {
+        temp_res[i] = upcast_s(data[i]);
+      }
+    }
+    shfl_reduce<T, nranks, vlen>(temp_res);
+    // reduce cross warp
+    if constexpr (nranks == 8) {
+      __shared__ float smem[kMaxThreadsPerBlock << 1];
+      if (lane_idx < coalesce_num) {
+#pragma unroll
+        for (int32_t i = 0; i < vlen; i++) {
+          smem[warp_idx * vlen * coalesce_num + coalesce_tid * vlen + i] = temp_res[i];
+        }
+      }
+      __syncthreads_lm();
+#pragma unroll
+      for (int32_t i = 0; i < vlen; i++) {
+        temp_res[i] += smem[(warp_idx ^ 1) * vlen * coalesce_num + coalesce_tid * vlen + i];
+      }
+    }
+
+    if (local_rank == target_rank && idx < size) {
+      Vec res;
+#pragma unroll
+      for (int32_t i = 0; i < vlen; i++) {
+        reinterpret_cast<T*>(&res)[i] = downcast_s<T>(temp_res[i]);
+      }
+      buffer_ptr[idx] = res;
+    }
+    idx_base += stride;
+  } while (idx_base < size);
+  // make sure buffer_ptr data ready
+  asm volatile("LSU.BAR.SLC.NEW;");
+  __syncthreads_lm();
+  if (tidx == 0) {
+    asm volatile("LSU.IDF.SLC.BYPASS %0;" ::"R"(uint64_t(0)));
+  }
+  buffer_ptr = get_tmp_buf<Vec>(sg.signals[target_rank]);
+  // second sync barrier
+  if (tidx < nranks) {
+    flag++;
+    target_barrier = &sg.signals[tidx]->peer_counter[flag & 1][bidx][local_rank];
+    local_barrier = &self_sg->peer_counter[flag & 1][bidx][tidx];
+    atomicExch(target_barrier, flag);
+    while (atomicAdd(local_barrier, 0) != flag) {
+    }
+  }
+  __syncthreads_lm();
+
+  // all gather
+  idx_in_blk = coalesce_tid + (target_rank << coalesce_sft) + (group_id << group_stride_sft);
+  idx_base = bidx * thread_num;
+  do {
+    int32_t idx = idx_in_blk + idx_base;
+    if (idx < size) {
+      reinterpret_cast<Vec*>(result)[idx] = buffer_ptr[idx];
+    }
+    idx_base += stride;
+  } while (idx_base < size);
+}
+
 template <typename T, int ngpus>
-__global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(
+__global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) cross_device_reduce_2stage(
     RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int stride = gridDim.x * blockDim.x;
@@ -279,6 +471,7 @@ class CustomAllreduce {
   // Stores an map from a pointer to its peer pointters from all ranks.
   std::unordered_map<void*, RankData*> buffers_;
   Signal* self_sg_;
+  FlagType round;
 
   // Stores rank data from all ranks. This is mainly for cuda graph purposes.
   // For cuda graph to work, all kernel arguments must be fixed during graph
@@ -318,7 +511,8 @@ class CustomAllreduce {
         full_nvlink_(full_nvlink),
         self_sg_(signals[rank]),
         d_rank_data_base_(reinterpret_cast<RankData*>(rank_data)),
-        d_rank_data_end_(d_rank_data_base_ + rank_data_sz / sizeof(RankData)) {
+        d_rank_data_end_(d_rank_data_base_ + rank_data_sz / sizeof(RankData)),
+        round(0) {
     for (int i = 0; i < world_size_; i++) {
       sg_.signals[i] = signals[i];
     }
@@ -414,7 +608,13 @@ class CustomAllreduce {
    * guess is that too many SMs will cause contention on NVLink bus.
    */
   template <typename T>
-  void allreduce(cudaStream_t stream, T* input, T* output, int size, int threads = 512, int block_limit = 36) {
+  void allreduce(
+      cudaStream_t stream,
+      T* input,
+      T* output,
+      int size,
+      int threads = kDefaultThreads,
+      int block_limit = kDefaultBlockLimit) {
     auto d = packed_t<T>::P::size;
     if (size % d != 0)
       throw std::runtime_error(
@@ -458,12 +658,22 @@ class CustomAllreduce {
     }                                                                                             \
     break;                                                                                        \
   }
-
     switch (world_size_) {
       REDUCE_CASE(2)
       REDUCE_CASE(4)
       REDUCE_CASE(6)
-      REDUCE_CASE(8)
+      case 8:
+        if constexpr (!std::is_same<T, float>::value) {
+          custom_all_reduce_2shot<T, 8>
+              <<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size, ++round);
+        } else {
+          if (bytes < 256 * 1024) {
+            KL(8, cross_device_reduce_1stage);
+          } else {
+            KL(8, cross_device_reduce_2stage);
+          }
+        }
+        break;
       default:
         throw std::runtime_error(
             "custom allreduce only supports num gpus in (2,4,6,8). Actual num "

@@ -14,6 +14,7 @@ from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
@@ -65,6 +66,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_npu,
     is_sm90_supported,
     is_sm100_supported,
@@ -89,14 +91,18 @@ _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
+_is_musa = is_musa()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_mtt = envs.SGLANG_USE_MTT.get() and _is_musa
 
 if _use_aiter or _use_hip_int4:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
 
+if _use_mtt:
+    from mtt_torch_ext.weight_convert import gemm_weight_reorder
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
@@ -145,7 +151,10 @@ class Fp8Config(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 80
+        if _is_musa:
+            return 31
+        else:
+            return 80
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
@@ -382,6 +391,8 @@ class Fp8LinearMethod(LinearMethodBase):
                     )
                     layer.weight_scale_inv.format_ue8m0 = True
                 weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
+                if _use_mtt:
+                    weight = gemm_weight_reorder(weight)
 
             layer.weight.data = weight.data
             layer.weight_scale_inv.data = weight_scale.data
@@ -435,12 +446,14 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale = layer.weight_scale
                     # If ROCm, normalize the weights and scales to e4m3fnuz
                     if _is_fp8_fnuz:
-                        weight, weight_scale, input_scale = (
-                            normalize_e4m3fn_to_e4m3fnuz(
-                                weight=weight,
-                                weight_scale=weight_scale,
-                                input_scale=layer.input_scale,
-                            )
+                        (
+                            weight,
+                            weight_scale,
+                            input_scale,
+                        ) = normalize_e4m3fn_to_e4m3fnuz(
+                            weight=weight,
+                            weight_scale=weight_scale,
+                            input_scale=layer.input_scale,
                         )
                         if input_scale is not None:
                             layer.input_scale = Parameter(
@@ -836,12 +849,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
             for expert in range(layer.num_local_experts):
-                w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                    scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
-                )
-                w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                    scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
-                )
+                (
+                    w13_weight[expert, :, :],
+                    layer.w13_weight_scale[expert],
+                ) = scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
+                (
+                    w2_weight[expert, :, :],
+                    layer.w2_weight_scale[expert],
+                ) = scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
             layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
@@ -879,15 +894,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # If ROCm, normalize the weights and scales to e4m3fnuz
             if _is_fp8_fnuz:
                 # Normalize the weights and scales
-                w13_weight, w13_weight_scale, w13_input_scale = (
-                    normalize_e4m3fn_to_e4m3fnuz(
-                        layer.w13_weight, layer.w13_weight_scale, layer.w13_input_scale
-                    )
+                (
+                    w13_weight,
+                    w13_weight_scale,
+                    w13_input_scale,
+                ) = normalize_e4m3fn_to_e4m3fnuz(
+                    layer.w13_weight, layer.w13_weight_scale, layer.w13_input_scale
                 )
-                w2_weight, w2_weight_scale, w2_input_scale = (
-                    normalize_e4m3fn_to_e4m3fnuz(
-                        layer.w2_weight, layer.w2_weight_scale, layer.w2_input_scale
-                    )
+                (
+                    w2_weight,
+                    w2_weight_scale,
+                    w2_input_scale,
+                ) = normalize_e4m3fn_to_e4m3fnuz(
+                    layer.w2_weight, layer.w2_weight_scale, layer.w2_input_scale
                 )
                 # Reset the parameter
                 layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
@@ -1116,7 +1135,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
-
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states

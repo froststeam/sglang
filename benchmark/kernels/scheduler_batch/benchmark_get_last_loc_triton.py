@@ -4,8 +4,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import get_device, is_musa
 
-@torch.compile(dynamic=True)
+
+@torch.compile(dynamic=True, disable=is_musa())
 def get_last_loc_torch(
     req_to_token: torch.Tensor,
     req_pool_indices_tensor: torch.Tensor,
@@ -71,15 +73,15 @@ def test_get_last_loc():
 
     # Initialize input tensors
     req_to_token = torch.zeros(
-        (max_batch, max_context_len), dtype=torch.int32, device="cuda"
+        (max_batch, max_context_len), dtype=torch.int32, device=get_device()
     )
-    req_pool_indices = torch.arange(batch_size, dtype=torch.int64, device="cuda")
+    req_pool_indices = torch.arange(batch_size, dtype=torch.int64, device=get_device())
     pre_lens = torch.randint(
         -max_context_len // 2,
         max_context_len,
         (batch_size,),
         dtype=torch.int64,
-        device="cuda",
+        device=get_device(),
     )
 
     last_loc_res = get_last_loc_triton(req_to_token, req_pool_indices, pre_lens)
@@ -110,15 +112,17 @@ def get_benchmark():
         max_context_len = 16384
 
         req_to_token = torch.zeros(
-            (max_batch, max_context_len), dtype=torch.int32, device="cuda"
+            (max_batch, max_context_len), dtype=torch.int32, device=get_device()
         )
-        req_pool_indices = torch.arange(batch_size, dtype=torch.int64, device="cuda")
+        req_pool_indices = torch.arange(
+            batch_size, dtype=torch.int64, device=get_device()
+        )
         pre_lens = torch.randint(
             -max_context_len // 2,
             max_context_len,
             (batch_size,),
             dtype=torch.int64,
-            device="cuda",
+            device=get_device(),
         )
 
         quantiles = [0.5, 0.2, 0.8]

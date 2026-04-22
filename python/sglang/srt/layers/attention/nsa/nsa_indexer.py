@@ -8,11 +8,17 @@ from einops import rearrange
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.layernorm import LayerNorm
-from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
+from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_musa, is_npu
 
-if is_cuda():
+_is_cuda = is_cuda()
+_is_musa = is_musa()
+
+if _is_cuda or _is_musa:
     try:
-        import deep_gemm
+        if not _is_musa:
+            import mate.deep_gemm as deep_gemm
+        else:
+            import deep_gemm
     except ImportError as e:
         deep_gemm = e
 

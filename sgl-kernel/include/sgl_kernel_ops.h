@@ -129,6 +129,8 @@ int64_t cutlass_mla_get_workspace_size(
 void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
 void sgl_fused_add_rmsnorm(
     torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps, bool enable_pdl);
+void musa_fused_add_rms_norm(
+    torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double epsilon, bool enable_pdl);
 void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
 void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps, bool enable_pdl);
 void silu_and_mul(at::Tensor& out, at::Tensor& input);
@@ -1005,3 +1007,72 @@ std::vector<at::Tensor> fwd_kvcache_mla_fp8(
 
 std::vector<at::Tensor> get_mla_decoding_metadata_dense_fp8(
     at::Tensor& seqlens_k, const int64_t num_heads_per_head_k, const int64_t num_heads_k);
+
+/*
+ * From csrc/musa
+ */
+#ifdef USE_MUSA
+void batched_rotary_embedding_contiguous(
+    torch::Tensor& positions,  // [num_tokens]
+    torch::Tensor& query,      // [num_tokens, num_heads, head_size]
+    torch::Tensor& key,        // [num_tokens, num_kv_heads, head_size]
+    int64_t head_size,
+    torch::Tensor& cos_sin_cache,  // [max_position, rot_dim]
+    bool is_neox,
+    int64_t rot_dim,
+    torch::Tensor& cos_sin_cache_offsets  // [num_tokens]
+);
+
+void rotary_embedding_contiguous(
+    torch::Tensor& positions,  // [num_tokens]
+    torch::Tensor& query,      // [num_tokens, num_heads, head_size]
+    torch::Tensor& key,        // [num_tokens, num_kv_heads, head_size]
+    int64_t head_size,
+    torch::Tensor& cos_sin_cache,  // [max_position, rot_dim]
+    bool is_neox);
+
+void mudnn_w8a8_scaled_mm(
+    torch::Tensor& c,
+    torch::Tensor const& a,
+    torch::Tensor const& b,
+    torch::Tensor const& a_scales,
+    torch::Tensor const& b_scales,
+    std::optional<torch::Tensor> const& bias);
+
+void fused_moe_gemv(
+    torch::Tensor& A,                             // [32768, 2048]    [bseqlen, hidden_size]
+    torch::Tensor& B,                             // [64, 2816, 256]  []
+    torch::Tensor& C,                             // [32768, 6, 2846]
+    const c10::optional<torch::Tensor>& A_scale,  // use for fp8
+    const c10::optional<torch::Tensor>& B_scale,  // use for fp8/int
+    torch::Tensor& topk_weights,
+    torch::Tensor& topk_ids,
+    bool mul_routed_weight,
+    int64_t topk,
+    bool use_int4_w4a16,
+    bool use_swigelu);
+
+void musa_fused_gemv(
+    torch::Tensor& A,                             // [bseqlen, in]
+    torch::Tensor& B,                             // [out, in/8]
+    torch::Tensor& C,                             // [bseqlen, out]
+    const c10::optional<torch::Tensor>& A_scale,  // [out, in/group_size]
+    const c10::optional<torch::Tensor>& B_scale,  // [out, in/group_size]
+    bool use_int4_w4a16,
+    bool use_swigelu,
+    bool use_rms_norm,
+    const c10::optional<torch::Tensor>& gamma,
+    double eps);
+void fused_mul_add(torch::Tensor& output, torch::Tensor& self, torch::Tensor& bias, const double scale);
+
+void musa_top_k_top_p_sampling_from_probs(
+    at::Tensor probs,
+    at::Tensor output,
+    std::optional<at::Tensor> maybe_indices,
+    std::optional<at::Tensor> maybe_top_k_arr,
+    double top_k_val,
+    std::optional<at::Tensor> maybe_top_p_arr,
+    double top_p_val,
+    bool deterministic,
+    std::optional<at::Generator> gen);
+#endif

@@ -76,6 +76,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_musa,
     make_layers,
     use_intel_amx_backend,
 )
@@ -83,6 +84,7 @@ from sglang.srt.utils import (
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
+_is_musa = is_musa()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
@@ -676,7 +678,7 @@ class Qwen2MoeForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = torch.cuda.Stream() if _is_cuda or _is_musa else None
         self.model = Qwen2MoeModel(
             config,
             quant_config,

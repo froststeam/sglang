@@ -14,12 +14,20 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import ceil_div, get_available_gpu_memory, get_bool_env_var
+from sglang.srt.utils import (
+    ceil_div,
+    get_available_gpu_memory,
+    get_bool_env_var,
+    is_musa,
+)
 
 logger = logging.getLogger(__name__)
 
 if ENABLE_JIT_DEEPGEMM:
-    import deep_gemm
+    if not is_musa():
+        import deep_gemm
+    else:
+        import mate.deep_gemm as deep_gemm
 
 
 _BUILTIN_M_LIST = list(range(1, 1024 * 16 + 1))
@@ -69,6 +77,15 @@ class DeepGemmKernelType(IntEnum):
 
 
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
+
+
+def _fake_compile_deep_gemm_one_type_all(
+    kernel_type: DeepGemmKernelType,
+    n: int,
+    k: int,
+    num_groups: int,
+) -> None:
+    pass
 
 
 # TODO improve code
@@ -291,5 +308,8 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
 def deep_gemm_execution_hook(
     m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
 ):
-    _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
+    if is_musa():
+        _fake_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
+    else:
+        _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
     yield

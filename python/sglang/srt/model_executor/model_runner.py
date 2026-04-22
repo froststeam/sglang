@@ -157,6 +157,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     get_cpu_ids_by_node,
+    get_device,
     init_custom_process_group,
     is_cuda,
     is_float4_e2m1fn_x2,
@@ -504,7 +505,7 @@ class ModelRunner:
             server_args.max_running_requests,
             server_args.max_total_tokens,
         )
-        if self.device == "cuda":
+        if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
             self.init_attention_backend()
             self.kernel_warmup()
@@ -641,6 +642,8 @@ class ModelRunner:
             backend = "gloo"
         elif self.device == "npu":
             backend = "hccl"
+        elif self.device == "musa":
+            backend = "mccl"
 
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if not self.server_args.enable_p2p_check:
@@ -895,6 +898,7 @@ class ModelRunner:
         self,
         new_expert_location_metadata: ExpertLocationMetadata,
         update_layer_ids: List[int],
+        rebalance_experts_per_chunk: int,
     ):
         if ElasticEPStateManager.instance() is not None:
             # TODO: refactor the weights update when elastic ep
@@ -910,10 +914,11 @@ class ModelRunner:
                 lambda name: "mlp.experts" in name and "mlp.shared_experts" not in name,
             )
         else:
-            self.expert_location_updater.update(
+            yield from self.expert_location_updater.update(
                 self.model.routed_experts_weights_of_layer,
                 new_expert_location_metadata,
                 update_layer_ids=update_layer_ids,
+                rebalance_experts_per_chunk=rebalance_experts_per_chunk,
                 nnodes=self.server_args.nnodes,
                 rank=self.tp_rank,
             )
@@ -2042,7 +2047,7 @@ class ModelRunner:
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
         dtype = torch.float16
-        device = "cuda"
+        device = get_device()
         a = torch.ones((16, 16), dtype=dtype, device=device)
         b = torch.ones((16, 16), dtype=dtype, device=device)
         c = a @ b
@@ -2646,6 +2651,16 @@ class ModelRunner:
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
+        # XXX (MUSA): Draft worker should not record expert distribution, which maybe cause hang
+        if self.is_draft_worker:
+            return self._forward_raw(
+                forward_batch,
+                skip_attn_backend_init,
+                pp_proxy_tensors,
+                reinit_attn_backend,
+                split_forward_count,
+            )
+
         self.forward_pass_id += 1
 
         with get_global_expert_distribution_recorder().with_forward_pass(

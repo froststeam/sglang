@@ -82,7 +82,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.utils import flatten_nested_list
+from sglang.srt.utils import flatten_nested_list, get_device
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
 if TYPE_CHECKING:
@@ -1172,7 +1172,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     has_grammar: bool = False
 
     # Device
-    device: str = "cuda"
+    device: str = get_device()
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None

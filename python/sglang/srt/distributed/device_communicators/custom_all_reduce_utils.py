@@ -18,18 +18,25 @@ import torch.multiprocessing as mp
 from typing_extensions import ParamSpec
 
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_musa
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_musa = is_musa()
 
 if _is_cuda:
     try:
         import pynvml
     except ImportError as e:
         logger.warning("Failed to import pynvml with %r", e)
+
+if _is_musa:
+    try:
+        import pymtml
+    except ImportError as e:
+        logger.warning("Failed to import pymtml with %r", e)
 
 if _is_hip:
     try:
@@ -318,6 +325,12 @@ def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
                 return fn(*args, **kwargs)
             finally:
                 amdsmi_shut_down()
+        elif _is_musa:
+            pymtml.mtmlLibraryInit()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                pymtml.mtmlLibraryShutDown()
         else:
             pynvml.nvmlInit()
             try:
@@ -347,6 +360,41 @@ def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
                         logger.error("AMD 1 hop XGMI detection failed.", exc_info=error)
                         return False
         return True
+    elif _is_musa:
+        """
+        query if the set of gpus are fully connected by mtlink (1 hop)
+        """
+        handles = [pymtml.mtmlLibraryInitDeviceByIndex(i) for i in physical_device_ids]
+
+        def is_linked(a, b):
+            try:
+                peer_uuid = pymtml.mtmlDeviceGetUUID(b)
+                link_spec = pymtml.mtmlDeviceGetMtLinkSpec(a)
+                for link_idx in range(link_spec.linkNum):
+                    if (
+                        pymtml.mtmlDeviceGetMtLinkState(a, link_idx)
+                        != pymtml.MTML_MTLINK_STATE_UP
+                    ):
+                        continue
+                    remote_handle = pymtml.mtmlDeviceGetMtLinkRemoteDevice(a, link_idx)
+                    if (
+                        remote_handle
+                        and pymtml.mtmlDeviceGetUUID(remote_handle) == peer_uuid
+                    ):
+                        return True
+            except pymtml.MTMLError:
+                logger.exception(
+                    "MTLink detection failed. This is normal if your"
+                    " machine has no MTLink equipped."
+                )
+            return False
+
+        return all(
+            is_linked(a, b)
+            for i, a in enumerate(handles)
+            for j, b in enumerate(handles)
+            if i < j
+        )
     else:
         """
         query if the set of gpus are fully connected by nvlink (1 hop)

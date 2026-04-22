@@ -18,6 +18,8 @@ from typing import Dict, Tuple
 
 import torch
 
+from sglang.srt.utils import is_musa
+
 _cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}
 
 
@@ -42,4 +44,6 @@ def is_arch_support_pdl() -> bool:
     # Hopper arch's compute capability == 9.0
     device = torch.cuda.current_device()
     major, minor = torch.cuda.get_device_capability(device)
+    if is_musa():
+        return major >= 4 and minor >= 3
     return major >= 9

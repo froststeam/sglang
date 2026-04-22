@@ -11,14 +11,17 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
+from sglang.srt.utils import get_communication_backend, get_device, is_musa
+
+_is_musa = is_musa()
 
 
 def _run_correctness_worker(world_size, rank, distributed_init_port, test_sizes):
-    device = torch.device(f"cuda:{rank}")
+    device = torch.device(get_device(rank))
     torch.cuda.set_device(device)
     distributed_init_method = f"tcp://localhost:{distributed_init_port}"
     dist.init_process_group(
-        backend="nccl",
+        backend=get_communication_backend(),
         init_method=distributed_init_method,
         rank=rank,
         world_size=world_size,
@@ -26,7 +29,7 @@ def _run_correctness_worker(world_size, rank, distributed_init_port, test_sizes)
     group = dist.group.WORLD
 
     try:
-        device = torch.device(f"cuda:{rank}")
+        device = torch.device(get_device(rank))
         max_size = 8192 * 1024
         meta_ptrs = TestCustomAllReduce.create_shared_buffer(
             custom_ops.meta_size() + max_size, group=group
@@ -39,8 +42,11 @@ def _run_correctness_worker(world_size, rank, distributed_init_port, test_sizes)
         custom_ops.register_buffer(custom_ptr, buffer_ptrs)
 
         test_loop = 10
+        dtypes = [torch.float16, torch.bfloat16]
+        if not _is_musa:
+            dtypes += [torch.float32]
         for sz in test_sizes:
-            for dtype in [torch.float32, torch.float16, torch.bfloat16]:
+            for dtype in dtypes:
                 for _ in range(test_loop):
                     inp1 = torch.randint(1, 16, (sz,), dtype=dtype, device=device)
                     inp1_ref = inp1.clone()
@@ -118,6 +124,8 @@ class TestCustomAllReduce(unittest.TestCase):
     ) -> List[int]:
         lib = CudaRTLibrary()
         pointer = lib.cudaMalloc(size_in_bytes)
+        if _is_musa:
+            lib.cudaMemset(pointer, 0, size_in_bytes)
         handle = lib.cudaIpcGetMemHandle(pointer)
         if group is None:
             group = dist.group.WORLD
@@ -125,7 +133,7 @@ class TestCustomAllReduce(unittest.TestCase):
         rank = dist.get_rank(group=group)
 
         handle_bytes = ctypes.string_at(ctypes.addressof(handle), ctypes.sizeof(handle))
-        input_tensor = torch.ByteTensor(list(handle_bytes)).to(f"cuda:{rank}")
+        input_tensor = torch.ByteTensor(list(handle_bytes)).to(get_device(rank))
         gathered_tensors = [torch.empty_like(input_tensor) for _ in range(world_size)]
         dist.all_gather(gathered_tensors, input_tensor, group=group)
 

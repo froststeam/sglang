@@ -50,7 +50,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_musa, is_npu, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -61,7 +61,9 @@ logger = logging.getLogger(__name__)
 
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
+_is_musa = is_cuda()
 _is_npu = is_npu()
+_is_musa = is_musa()
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -80,7 +82,6 @@ class ReqToTokenPool:
         device: str,
         enable_memory_saver: bool,
     ):
-
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
@@ -203,7 +204,7 @@ class MambaPool:
                         temporal_state_shape[2],
                     ),
                     dtype=ssm_dtype,
-                    device="cuda",
+                    device="cuda" if not _is_musa else "musa",
                 )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
@@ -217,7 +218,7 @@ class MambaPool:
                             conv_shape[1],
                         ),
                         dtype=conv_dtype,
-                        device="cuda",
+                        device="cuda" if not _is_musa else "musa",
                     )
                     for conv_shape in conv_state_shape
                 ]
@@ -520,7 +521,6 @@ class KVCache(abc.ABC):
 
 
 class MHATokenToKVPool(KVCache):
-
     def __init__(
         self,
         size: int,
@@ -553,7 +553,9 @@ class MHATokenToKVPool(KVCache):
 
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = (
-            self.device_module.Stream() if _is_cuda and enable_alt_stream else None
+            self.device_module.Stream()
+            if (_is_cuda or _is_musa) and enable_alt_stream
+            else None
         )
 
         if enable_kv_cache_copy:
@@ -1276,7 +1278,6 @@ class SWAKVPool(KVCache):
         k_scale: float = 1.0,
         v_scale: float = 1.0,
     ):
-
         layer_id = layer.layer_id
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:

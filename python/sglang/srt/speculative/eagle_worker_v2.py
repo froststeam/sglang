@@ -230,6 +230,7 @@ class EagleDraftWorker(BaseDraftWorker):
         Device2DraftCudaGraphRunner = {
             "npu": EAGLEDraftNpuGraphRunner,
             "cuda": EAGLEDraftCudaGraphRunner,
+            "musa": EAGLEDraftCudaGraphRunner,
         }
         # Capture draft
         if self.speculative_num_steps > 1:
@@ -249,6 +250,7 @@ class EagleDraftWorker(BaseDraftWorker):
         Device2ExtendCudaGraphRunner = {
             "npu": EAGLEDraftExtendNpuGraphRunner,
             "cuda": EAGLEDraftExtendCudaGraphRunner,
+            "musa": EAGLEDraftExtendCudaGraphRunner,
         }
         # Capture extend
         # FIXME cuda not support draft_extend capture

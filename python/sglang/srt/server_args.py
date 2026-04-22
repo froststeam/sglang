@@ -47,6 +47,7 @@ from sglang.srt.utils.common import (
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
+    is_musa,
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_port_available,
@@ -436,9 +437,12 @@ class ServerArgs:
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
     init_expert_location: str = "trivial"
     enable_eplb: bool = False
+    enable_eplb_rebalance_async: bool = False
+    disable_eplb_warmup: bool = False
     eplb_algorithm: str = "auto"
     eplb_rebalance_num_iterations: int = 1000
     eplb_rebalance_layers_per_chunk: Optional[int] = None
+    eplb_rebalance_experts_per_chunk: int = 10000
     eplb_min_rebalancing_utilization_threshold: float = 1.0
     expert_distribution_recorder_mode: Optional[
         Literal["stat", "stat_approx", "per_pass", "per_token"]
@@ -1441,6 +1445,12 @@ class ServerArgs:
                 "Cutlass MLA only supports a page_size of 128, change page_size to 128."
             )
             self.page_size = 128
+
+        if is_musa() and self.attention_backend == "fa3":
+            logger.warning(
+                "FA3 attention backend on MUSA only supports a page_size of 64, change page_size to 64."
+            )
+            self.page_size = 64
 
         if (
             self.attention_backend == "trtllm_mla"
@@ -2484,7 +2494,7 @@ class ServerArgs:
             "--device",
             type=str,
             default=ServerArgs.device,
-            help="The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified.",
+            help="The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu', 'musa'). Defaults to auto-detection if not specified.",
         )
         parser.add_argument(
             "--tensor-parallel-size",
@@ -3210,6 +3220,16 @@ class ServerArgs:
             help="Enable EPLB algorithm",
         )
         parser.add_argument(
+            "--enable-eplb-rebalance-async",
+            action="store_true",
+            help="Enable asynchronous rebalance mode",
+        )
+        parser.add_argument(
+            "--disable-eplb-warmup",
+            action="store_true",
+            help="Disable eplb warmup",
+        )
+        parser.add_argument(
             "--eplb-algorithm",
             type=str,
             default=ServerArgs.eplb_algorithm,
@@ -3226,6 +3246,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.eplb_rebalance_layers_per_chunk,
             help="Number of layers to rebalance per forward pass.",
+        )
+        parser.add_argument(
+            "--eplb-rebalance-experts-per-chunk",
+            type=int,
+            default=ServerArgs.eplb_rebalance_experts_per_chunk,
+            help="Number of experts to rebalance per forward pass.",
         )
         parser.add_argument(
             "--eplb-min-rebalancing-utilization-threshold",

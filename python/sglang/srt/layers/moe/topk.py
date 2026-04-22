@@ -55,6 +55,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_npu,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
@@ -70,8 +71,9 @@ _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_musa = is_musa()
 
-if _is_cuda:
+if _is_cuda or _is_musa:
     from sgl_kernel import moe_fused_gate
 
     try:
@@ -79,7 +81,7 @@ if _is_cuda:
     except ImportError as e:
         pass
 
-if _is_cuda or _is_hip:
+if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import topk_softmax
 
     try:
@@ -117,7 +119,6 @@ class TopKConfig:
 
 
 class TopKOutputChecker:
-
     @staticmethod
     def format_is_standard(topk_output: TopKOutput) -> TypeGuard[StandardTopKOutput]:
         return topk_output.format.is_standard()
@@ -709,7 +710,13 @@ def _mask_topk_ids_padded_region(
     if num_token_non_padded is None:
         return
     indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
-    topk_ids[indices >= num_token_non_padded, :] = -1
+    if not _is_musa:
+        topk_ids[indices >= num_token_non_padded, :] = -1
+    else:
+        # XXX (MUSA): avoid launch D2H kernel: jira: https://jira.mthreads.com/browse/KUAE-717
+        topk_ids = topk_ids.masked_fill(
+            (indices >= num_token_non_padded).unsqueeze(1), -1
+        )
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
@@ -737,7 +744,7 @@ def biased_grouped_topk_gpu(
 ):
     # TODO: moe_fused_gate kernel is not supported for num_fused_shared_experts > 0 now.
     if (
-        _is_cuda
+        (_is_cuda or _is_musa)
         and gating_output.shape[1] // num_expert_group
         <= 32  # moe_fused_gate kernel ensure that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
         and is_power_of_two(correction_bias.shape[0])
@@ -859,7 +866,6 @@ def select_experts(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ) -> StandardTopKOutput:
-
     top_k = topk_config.top_k
     use_grouped_topk = topk_config.use_grouped_topk
     topk_group = topk_config.topk_group
@@ -878,12 +884,13 @@ def select_experts(
     )
     scoring_func = topk_config.scoring_func
 
-    router_logits, correction_bias = (
-        expert_location_dispatch.transform_select_experts_inputs(
-            router_logits=router_logits,
-            correction_bias=correction_bias,
-            info=expert_location_dispatch_info,
-        )
+    (
+        router_logits,
+        correction_bias,
+    ) = expert_location_dispatch.transform_select_experts_inputs(
+        router_logits=router_logits,
+        correction_bias=correction_bias,
+        info=expert_location_dispatch_info,
     )
 
     # DeepSeek V2/V3/R1 series models use grouped_top_k

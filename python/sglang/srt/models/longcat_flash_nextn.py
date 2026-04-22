@@ -80,6 +80,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_npu,
 )
 
@@ -91,12 +92,13 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _device_sm = get_device_sm()
+_is_musa = is_musa()
 
 if _is_cuda:
     from sgl_kernel import awq_dequantize
 elif _is_cpu and _is_cpu_amx_available:
     pass
-elif _is_hip:
+elif _is_hip or _is_musa:
     from sglang.srt.layers.quantization.awq_triton import (
         awq_dequantize_triton as awq_dequantize,
     )

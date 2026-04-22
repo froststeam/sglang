@@ -66,6 +66,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     is_hip,
+    is_musa,
     log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -83,6 +84,7 @@ except ImportError:
     KTRANSFORMERS_AVAILABLE = False
 
 _is_hip = is_hip()
+_is_musa = is_musa()
 
 logger = logging.getLogger(__name__)
 
@@ -484,7 +486,8 @@ class CudaGraphRunner:
 
                 with patch_model(
                     self.model_runner.model,
-                    bs in self.compile_bs,
+                    bs in self.compile_bs
+                    and not _is_musa,  # only compile some function on MUSA platform
                     num_tokens=bs * self.num_tokens_per_bs,
                     tp_group=self.model_runner.tp_group,
                 ) as forward:
@@ -527,7 +530,8 @@ class CudaGraphRunner:
             if memory_saver_adapter.enabled
             else self.device_module.graph
         )
-        with graph_fn(cuda_graph=graph, pool=pool, stream=stream):
+        # XXX (MUSA): cuda_graph argument keyword is not supported
+        with graph_fn(graph, pool=pool, stream=stream):
             out = run_once_fn()
         return out
 

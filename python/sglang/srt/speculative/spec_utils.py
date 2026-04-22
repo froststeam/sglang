@@ -19,17 +19,21 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
 
 _is_cuda = is_cuda()
+_is_musa = is_musa()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_musa = is_musa()
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 
 if _is_cuda:
+    from sgl_kernel import fast_topk
+elif _is_musa:
     from sgl_kernel import fast_topk
 elif _is_hip:
     from sgl_kernel import fast_topk
@@ -45,7 +49,9 @@ SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
-TREE_SPEC_KERNEL_AVAILABLE = _is_cuda  # This kernel is only available for CUDA now
+TREE_SPEC_KERNEL_AVAILABLE = (
+    _is_cuda or _is_musa
+)  # This kernel is only available for CUDA and MUSA now
 
 
 @triton.jit
@@ -168,7 +174,8 @@ def assign_draft_cache_locs(
         mask = copy_offset < copy_len
         data = tl.load(out_cache_ptr + copy_offset, mask=mask)
         tl.store(token_pool + kv_start + copy_offset, data, mask=mask)
-    if page_size != 1 and topk != 1 and duplicate_cache_len > 0:
+    # XXX (MUSA): triton issue: chained boolean operators (A or B or C) are not supported.
+    if (page_size != 1 and topk != 1) and duplicate_cache_len > 0:
         # Part 2: Copy indices into source_cache_loc and target_cache_loc
         # Expected output: src:[8,9,10,8,9,10...] tgt:[16,17,18,24,25,26...]
         prefix_len = tl.load(seq_lens + pid)

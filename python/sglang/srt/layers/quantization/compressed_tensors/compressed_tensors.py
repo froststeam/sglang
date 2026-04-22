@@ -42,6 +42,9 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.utils import is_musa
+
+_is_musa = is_musa()
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +104,7 @@ class CompressedTensorsConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 70
+        return 70 if not _is_musa else 31
 
     def get_name(self) -> str:
         return "compressed_tensors"

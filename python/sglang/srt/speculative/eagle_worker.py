@@ -62,12 +62,14 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     is_cuda,
+    is_musa,
     is_npu,
     next_power_of_2,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 _is_npu = is_npu()
+_is_musa = is_musa()
 
 if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
@@ -228,6 +230,7 @@ class EAGLEWorker(TpModelWorker):
         Device2DraftCudaGraphRunner = {
             "npu": EAGLEDraftNpuGraphRunner,
             "cuda": EAGLEDraftCudaGraphRunner,
+            "musa": EAGLEDraftCudaGraphRunner,
         }
         # Capture draft
         if self.speculative_num_steps > 1:
@@ -1040,7 +1043,7 @@ class EAGLEWorker(TpModelWorker):
         return success, message
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=True, disable=(_is_npu or _is_musa))
 def get_last_loc_large_page_size_top_k_1(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,

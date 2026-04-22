@@ -80,7 +80,11 @@ inline void check_tensor(const at::Tensor& t, int64_t shape0, int64_t shape1, in
   TORCH_CHECK_EQ(t.size(1), shape1);
   TORCH_CHECK_EQ(t.size(2), shape2);
   TORCH_CHECK_EQ(t.dtype(), dtype);
+#if !defined(USE_MUSA)
   TORCH_CHECK(t.device().is_cuda());
+#else
+  TORCH_CHECK(t.device().is_privateuseone())
+#endif
   TORCH_CHECK_EQ(((int64_t)t.data_ptr()) % 16, 0);  // alignment
 }
 

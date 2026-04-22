@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.testing
 
+from sglang.srt.utils import get_device
+
 # CI environment detection
 IS_CI = (
     os.getenv("CI", "false").lower() == "true"
@@ -59,7 +61,7 @@ def calculate_diff(batch_size, vocab_size, p):
     else:
         raise ValueError("p not recognized")
 
-    device = torch.device("cuda")
+    device = get_device()
     pre_norm_prob = torch.rand(batch_size, vocab_size, device=device)
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
 
@@ -109,7 +111,7 @@ def benchmark_sampling(batch_size, vocab_size, p, provider):
     else:
         raise ValueError("p not recognized")
 
-    device = torch.device("cuda")
+    device = get_device()
     pre_norm_prob = torch.rand(batch_size, vocab_size, device=device)
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
     top_p_tensor = torch.full((batch_size,), p, device=device)

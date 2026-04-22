@@ -30,9 +30,15 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.utils.common import get_bool_env_var, is_hip, is_sm120_supported
+from sglang.srt.utils.common import (
+    get_bool_env_var,
+    is_hip,
+    is_musa,
+    is_sm120_supported,
+)
 
 _is_hip = is_hip()
+_is_musa = is_musa()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if TYPE_CHECKING:
@@ -145,14 +151,20 @@ class StandardDispatcher(BaseDispatcher):
         ):
             if self.local_expert_mapping is None:
                 self.local_expert_mapping = torch.full(
-                    (self.num_experts,), -1, dtype=torch.int32, device="cuda"
+                    (self.num_experts,),
+                    -1,
+                    dtype=torch.int32,
+                    device="cuda" if not _is_musa else "musa",
                 )
                 self.local_expert_mapping[
                     self.moe_ep_rank
                     * self.num_local_routed_experts : (self.moe_ep_rank + 1)
                     * self.num_local_routed_experts
                 ] = torch.arange(
-                    0, self.num_local_routed_experts, dtype=torch.int32, device="cuda"
+                    0,
+                    self.num_local_routed_experts,
+                    dtype=torch.int32,
+                    device="cuda" if not _is_musa else "musa",
                 )
 
                 if self.num_local_shared_experts > 0:

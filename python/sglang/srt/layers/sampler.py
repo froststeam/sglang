@@ -14,9 +14,15 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda, is_npu
+from sglang.srt.utils import (
+    crash_on_warnings,
+    get_bool_env_var,
+    is_cuda,
+    is_musa,
+    is_npu,
+)
 
-if is_cuda():
+if is_cuda() or is_musa():
     from sgl_kernel import (
         min_p_sampling_from_probs,
         top_k_renorm_prob,
@@ -26,6 +32,8 @@ if is_cuda():
 
 if is_npu():
     import torch_npu
+
+_is_musa = is_musa()
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +99,12 @@ class Sampler(nn.Module):
 
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
-            batch_next_token_ids = torch.argmax(logits, -1)
+            if _is_musa and logits.shape[0] < 1:
+                batch_next_token_ids = torch.empty(
+                    [0], dtype=torch.int64, device=logits.device
+                )
+            else:
+                batch_next_token_ids = torch.argmax(logits, -1)
             if return_logprob:
                 logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
         else:

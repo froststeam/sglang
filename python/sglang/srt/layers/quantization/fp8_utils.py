@@ -27,12 +27,14 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
     per_token_group_quant_fp8,
     scaled_fp8_quant,
+    sglang_per_token_group_quant_fp8,
     sglang_per_token_quant_fp8,
     static_quant_fp8,
     triton_scaled_mm,
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
 )
+from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.utils import (
     ceil_align,
     ceil_div,
@@ -43,6 +45,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_hip,
+    is_musa,
     is_sm90_supported,
     offloader,
 )
@@ -52,6 +55,17 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
+_is_musa = is_musa()
+
+try:
+    if _is_musa:
+        from sgl_kernel import musa_fused_gemv, musa_mudnn_w8a8_scaled_mm
+    else:
+        from vllm import _custom_ops as ops
+
+    VLLM_AVAILABLE = True
+except ImportError:
+    VLLM_AVAILABLE = False
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -75,6 +89,11 @@ if _is_cuda:
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
 
+_use_mtt = envs.SGLANG_USE_MTT.get() and _is_musa
+
+if _use_mtt:
+    from mtt_torch_ext.ops import gemm_fp8_nt_groupwise, quant_fp8_groupwise
+
 use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
 use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
 
@@ -95,6 +114,9 @@ def use_rowwise_torch_scaled_mm():
         # The condition is determined once as the operations
         # are time consuming.
         return get_device_capability() >= (9, 4) and _TORCH_VERSION_TUPLE >= (2, 7, 0)
+    elif _is_musa:
+        return get_device_capability() >= (3, 1)
+
     return False
 
 
@@ -250,7 +272,10 @@ def _dispatch_auto_backend() -> Callable:
     # 4. AITER (if AMD GPU with AITER enabled)
     # 5. Triton (fallback)
 
-    if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+    # XXX (MUSA): On MUSA devices DeepGEMM does not provide the FP8 GEMM NT kernel
+    if _is_musa:
+        return musa_w8a8_block_fp8_linear
+    elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
     elif is_blackwell_supported() and is_flashinfer_available():
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
@@ -536,6 +561,52 @@ def triton_w8a8_block_fp8_linear(
     output = w8a8_block_fp8_matmul_triton(
         q_input, weight, x_scale, weight_scale, block_size, output_dtype=input_2d.dtype
     )
+    if bias is not None:
+        output += bias
+    return output.to(dtype=input_2d.dtype).view(*output_shape)
+
+
+def musa_w8a8_block_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    assert input_scale is None
+    input_2d = input.view(-1, input.shape[-1])
+    output_shape = [*input.shape[:-1], weight.shape[0]]
+
+    if _use_mtt:
+        q_input, x_scale = quant_fp8_groupwise(input_2d)
+
+        output = gemm_fp8_nt_groupwise(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            out_dtype=input_2d.dtype,
+        )
+    else:
+        if input_2d.shape[0] < 4:
+            output = musa_fused_gemv(
+                input_2d,
+                weight,
+                None,
+                weight_scale,
+            )
+        else:
+            q_input, x_scale = sglang_per_token_group_quant_fp8(
+                input_2d, block_size[1], column_major_scales=False
+            )
+            output = musa_mudnn_w8a8_scaled_mm(
+                q_input,
+                weight,
+                out_dtype=input_2d.dtype,
+                scale_a=x_scale,
+                scale_b=weight_scale,
+            )
     if bias is not None:
         output += bias
     return output.to(dtype=input_2d.dtype).view(*output_shape)

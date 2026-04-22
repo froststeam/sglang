@@ -13,6 +13,8 @@ import triton
 import triton.testing
 from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
+from sglang.srt.utils import get_device
+
 # Optional vLLM import
 try:
     from vllm import _custom_ops as vllm_ops
@@ -53,7 +55,7 @@ def calculate_diff(
     kernel: str, dtype: torch.dtype, batch_size: int, seq_len: int, dim: int
 ) -> bool:
     """Compare vLLM with SGLang for one shape."""
-    device = torch.device("cuda")
+    device = get_device()
 
     if not VLLM_AVAILABLE:
         print(
@@ -130,7 +132,7 @@ else:
     )
 )
 def benchmark(kernel, dtype, batch_size, seq_len, dim, provider):
-    device = torch.device("cuda")
+    device = get_device()
     in_mult = 1 if kernel == "gelu_quick" else 2
     x = torch.randn(batch_size, seq_len, in_mult * dim, dtype=dtype, device=device)
     y0 = torch.zeros(batch_size, seq_len, dim, dtype=dtype, device=device)

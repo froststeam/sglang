@@ -13,6 +13,8 @@ def is_hip() -> bool:
 
 _is_hip = is_hip()
 
+from sglang.srt.utils import get_device
+
 
 def ceil_div(a, b):
     return (a + b - 1) // b
@@ -159,10 +161,9 @@ def moe_align_block_size_triton(
 def test_moe_align_block_size_compare_implementations(
     block_size, num_tokens, topk, num_experts, pad_sorted_token_ids
 ):
-
-    topk_ids = torch.argsort(torch.rand(num_tokens, num_experts, device="cuda"), dim=1)[
-        :, :topk
-    ]
+    topk_ids = torch.argsort(
+        torch.rand(num_tokens, num_experts, device=get_device()), dim=1
+    )[:, :topk]
 
     max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
     if topk_ids.numel() < num_experts + 1:
@@ -261,8 +262,8 @@ def test_moe_align_block_size_compare_implementations(
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.skipif(_is_hip, reason="Skip for AMD GPU")
 def test_moe_sum(m: int, topk: int, k: int, dtype: torch.dtype):
-    input = torch.randn((m, topk, k), device="cuda", dtype=dtype)
-    actual = torch.empty((m, k), device="cuda", dtype=dtype)
+    input = torch.randn((m, topk, k), device=get_device(), dtype=dtype)
+    actual = torch.empty((m, k), device=get_device(), dtype=dtype)
 
     expected = input.sum(dim=1)
     moe_sum(input, actual)

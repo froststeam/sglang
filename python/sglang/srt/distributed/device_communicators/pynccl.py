@@ -19,13 +19,15 @@ from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
     ncclUniqueId,
 )
 from sglang.srt.distributed.utils import StatelessProcessGroup
+from sglang.srt.utils import is_musa
 from sglang.srt.utils.common import get_current_device_stream_fast
+
+_is_musa = is_musa()
 
 logger = logging.getLogger(__name__)
 
 
 class PyNcclCommunicator:
-
     def __init__(
         self,
         group: Union[ProcessGroup, StatelessProcessGroup],
@@ -100,7 +102,7 @@ class PyNcclCommunicator:
         else:
             self.unique_id = group.broadcast_obj(self.unique_id, src=0)
         if isinstance(device, int):
-            device = torch.device(f"cuda:{device}")
+            device = torch.device(f"{'cuda' if not _is_musa else 'musa'}:{device}")
         elif isinstance(device, str):
             device = torch.device(device)
         # now `device` is a `torch.device` object
@@ -109,11 +111,12 @@ class PyNcclCommunicator:
         # nccl communicator and stream will use this device
         # `torch.cuda.device` is a context manager that changes the
         # current cuda device to the specified one
-        with torch.cuda.device(device):
+        self.device_module = torch.get_device_module(self.device)
+        with self.device_module.device(device):
             self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
                 self.world_size, self.unique_id, self.rank
             )
-            self.stream = torch.cuda.Stream()
+            self.stream = self.device_module.Stream()
 
             # A small all_reduce for warmup.
             data = torch.zeros(1, device=device)
@@ -161,7 +164,7 @@ class PyNcclCommunicator:
             ncclDataTypeEnum.from_torch(tensor.dtype),
             ncclRedOpTypeEnum.from_torch(op),
             self.comm,
-            cudaStream_t(stream.cuda_stream),
+            cudaStream_t(stream.cuda_stream if not _is_musa else stream.musa_stream),
         )
 
     def all_gather(
@@ -195,7 +198,9 @@ class PyNcclCommunicator:
                     ncclDataTypeEnum.from_torch(input_tensor.dtype),
                     root,
                     self.comm,
-                    cudaStream_t(stream.cuda_stream),
+                    cudaStream_t(
+                        stream.cuda_stream if not _is_musa else stream.musa_stream
+                    ),
                 )
                 split_offset += split_size
             self.nccl.ncclGroupEnd()
@@ -206,7 +211,9 @@ class PyNcclCommunicator:
                 input_tensor.numel(),
                 ncclDataTypeEnum.from_torch(input_tensor.dtype),
                 self.comm,
-                cudaStream_t(stream.cuda_stream),
+                cudaStream_t(
+                    stream.cuda_stream if not _is_musa else stream.musa_stream
+                ),
             )
 
     def cp_all_gather_into_tensor(
@@ -270,7 +277,9 @@ class PyNcclCommunicator:
                     ncclRedOpTypeEnum.from_torch(op),
                     root,
                     self.comm,
-                    cudaStream_t(stream.cuda_stream),
+                    cudaStream_t(
+                        stream.cuda_stream if not _is_musa else stream.musa_stream
+                    ),
                 )
                 split_offset += split_size
             self.nccl.ncclGroupEnd()
@@ -282,7 +291,9 @@ class PyNcclCommunicator:
                 ncclDataTypeEnum.from_torch(input_tensor.dtype),
                 ncclRedOpTypeEnum.from_torch(op),
                 self.comm,
-                cudaStream_t(stream.cuda_stream),
+                cudaStream_t(
+                    stream.cuda_stream if not _is_musa else stream.musa_stream
+                ),
             )
 
     def send(self, tensor: torch.Tensor, dst: int, stream=None):
@@ -299,7 +310,7 @@ class PyNcclCommunicator:
             ncclDataTypeEnum.from_torch(tensor.dtype),
             dst,
             self.comm,
-            cudaStream_t(stream.cuda_stream),
+            cudaStream_t(stream.cuda_stream if not _is_musa else stream.musa_stream),
         )
 
     def recv(self, tensor: torch.Tensor, src: int, stream=None):
@@ -316,7 +327,7 @@ class PyNcclCommunicator:
             ncclDataTypeEnum.from_torch(tensor.dtype),
             src,
             self.comm,
-            cudaStream_t(stream.cuda_stream),
+            cudaStream_t(stream.cuda_stream if not _is_musa else stream.musa_stream),
         )
 
     def broadcast(self, tensor: torch.Tensor, src: int, stream=None):
@@ -342,7 +353,7 @@ class PyNcclCommunicator:
             ncclDataTypeEnum.from_torch(tensor.dtype),
             src,
             self.comm,
-            cudaStream_t(stream.cuda_stream),
+            cudaStream_t(stream.cuda_stream if not _is_musa else stream.musa_stream),
         )
 
     def register_comm_window_raw(self, ptr: int, size: int):

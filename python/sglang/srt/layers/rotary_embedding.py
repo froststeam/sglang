@@ -16,9 +16,11 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     get_compiler_backend,
+    get_device,
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_npu,
     is_xpu,
 )
@@ -30,6 +32,7 @@ _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
+_is_musa = is_musa()
 
 if _is_cuda:
     from sgl_kernel import FusedSetKVBufferArg, apply_rope_with_cos_sin_cache_inplace
@@ -254,6 +257,17 @@ class RotaryEmbedding(CustomOp):
         key_rot = self._apply_rotary_emb_wrapped(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
+
+    @torch.compile(dynamic=True, backend=get_compiler_backend())
+    def forward_musa(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg=None,  # Optional[FusedSetKVBufferArg]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.forward_native(positions, query, key, offsets)
 
     def forward_npu(
         self,
@@ -793,7 +807,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         beta_slow: int = 1,
         mscale: float = 1,
         mscale_all_dim: float = 0,
-        device: Optional[str] = "cuda" if not _is_npu else "npu",
+        device: Optional[str] = get_device(),
     ) -> None:
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
@@ -957,9 +971,18 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         else:
             return self.forward_native(positions, query, key, offsets)
 
+    @torch.compile(dynamic=True, backend=get_compiler_backend())
+    def forward_musa(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.forward_native(positions, query, key, offsets)
+
 
 class Llama3RotaryEmbedding(RotaryEmbedding):
-
     def __init__(
         self,
         head_size: int,
@@ -1006,7 +1029,6 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
 
 
 class Llama4VisionRotaryEmbedding(RotaryEmbedding):
-
     def __init__(
         self,
         head_size: int,
@@ -2338,9 +2360,13 @@ class DualChunkRotaryEmbedding(CustomOp):
         self.local_size = local_size
         self.dtype = dtype
         self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        (q_cache, qc_cache, k_cache, qc_no_clamp_cache, q_inter_cache) = (
-            self._compute_cos_sin_cache()
-        )
+        (
+            q_cache,
+            qc_cache,
+            k_cache,
+            qc_no_clamp_cache,
+            q_inter_cache,
+        ) = self._compute_cos_sin_cache()
 
         self.register_buffer("cos_sin_q_cache", q_cache, persistent=False)
         self.register_buffer("cos_sin_qc_cache", qc_cache, persistent=False)
