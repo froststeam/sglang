@@ -277,6 +277,31 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
    */
   m.def("weak_ref_tensor(Tensor tensor) -> Tensor");
   m.impl("weak_ref_tensor", torch::kMUSA, &weak_ref_tensor);
+
+  /*
+   * From csrc/mamba
+   */
+  m.def(
+      "causal_conv1d_update(Tensor! x,"
+      "Tensor! conv_state,"
+      "Tensor! weight,"
+      "Tensor? bias_,"
+      "bool silu_activation,"
+      "Tensor? cache_seqlens_,"
+      "Tensor? conv_state_indices,"
+      "int pad_slot_id) -> ()");
+  m.impl("causal_conv1d_update", torch::kMUSA, &causal_conv1d_update);
+
+  m.def(
+      "causal_conv1d_fwd(Tensor! x, Tensor! weight,"
+      "Tensor? bias_,"
+      "Tensor!? conv_states,"
+      "Tensor? query_start_loc,"
+      "Tensor? cache_indices,"
+      "Tensor? has_initial_state,"
+      "bool silu_activation,"
+      "int pad_slot_id) -> ()");
+  m.impl("causal_conv1d_fwd", torch::kMUSA, &causal_conv1d_fwd);
 }
 
 REGISTER_EXTENSION(common_ops)
