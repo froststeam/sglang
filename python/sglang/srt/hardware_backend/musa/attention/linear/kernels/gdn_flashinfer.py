@@ -127,19 +127,38 @@ class MusaFlashInferGDNKernel(LinearAttnKernelBase):
         a_fi = a.view(batch_size, 1, num_v_heads)
         b_fi = b.view(batch_size, 1, num_v_heads)
 
-        output_fi, _ = self._decode_fn(
-            q=query_fi,
-            k=key_fi,
-            v=value_fi,
-            state=None,
+        # TODO:
+        #   1. Remove contiguous() if MATE supports non-contiguous input.
+        #   2. Use state pool if MATE supports it.
+        state_batch = ssm_states[cache_indices]
+        output_fi, new_state = self._decode_fn(
+            q=query_fi.contiguous(),
+            k=key_fi.contiguous(),
+            v=value_fi.contiguous(),
+            state=state_batch,
             A_log=A_log.detach().float(),
             a=a_fi,
             dt_bias=dt_bias.detach().float(),
             b=b_fi,
+            scale=None,
+            output=None,
             use_qk_l2norm=True,
-            initial_state=ssm_states,
-            initial_state_indices=cache_indices,
         )
+        ssm_states[cache_indices] = new_state
+
+        # output_fi, _ = self._decode_fn(
+        #     q=query_fi,
+        #     k=key_fi,
+        #     v=value_fi,
+        #     state=ssm_states,
+        #     A_log=A_log.detach().float(),
+        #     a=a_fi,
+        #     dt_bias=dt_bias.detach().float(),
+        #     b=b_fi,
+        #     state_indices=cache_indices,
+        #     use_qk_l2norm=True,
+        #     disable_state_update=False,
+        # )
 
         return output_fi.view(1, batch_size, num_v_heads, head_v_dim)
 
@@ -261,6 +280,7 @@ class MusaFlashInferGDNKernel(LinearAttnKernelBase):
         a_mtp = a.view(batch_size, draft_token_num, num_v_heads)
         b_mtp = b.view(batch_size, draft_token_num, num_v_heads)
 
+        # TODO: Verify MTP once MATE gdn supports T > 1
         output_fi, _ = self._decode_fn(
             q=query_mtp,
             k=key_mtp,
@@ -277,5 +297,19 @@ class MusaFlashInferGDNKernel(LinearAttnKernelBase):
             disable_state_update=True,
             use_qk_l2norm=True,
         )
+
+        # output_fi, _ = self._decode_fn(
+        #     q=query_mtp.contiguous(),
+        #     k=key_mtp.contiguous(),
+        #     v=value_mtp.contiguous(),
+        #     state=ssm_states,
+        #     A_log=A_log.detach().float(),
+        #     a=a_mtp,
+        #     dt_bias=dt_bias.detach().float(),
+        #     b=b_mtp,
+        #     state_indices=cache_indices,
+        #     use_qk_l2norm=True,
+        #     disable_state_update=False,
+        # )
 
         return output_fi.view(1, seq_len, num_v_heads, head_v_dim)
