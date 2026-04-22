@@ -1139,6 +1139,7 @@ def fill_gateup_input_triton_kernel(
     hidden_size,
     scale_size,
     BLOCK_SIZE: tl.constexpr,
+    IS_FP8: tl.constexpr,
 ):
 
     src_idx_int32 = tl.program_id(0)
@@ -1146,7 +1147,8 @@ def fill_gateup_input_triton_kernel(
     src2dst_ptr = src2dst_ptr + src_idx * topk
     topk_ids_ptr = topk_ids_ptr + src_idx * topk
     src_ptr = input_ptr + src_idx * hidden_size
-    scale_src_ptr = scale_ptr + src_idx * scale_size
+    if IS_FP8:
+        scale_src_ptr = scale_ptr + src_idx * scale_size
 
     vec = tl.arange(0, BLOCK_SIZE)
     for idx in range(topk):
@@ -1160,12 +1162,14 @@ def fill_gateup_input_triton_kernel(
                 mask = offset < hidden_size
                 in_data = tl.load(src_ptr + offset, mask=mask)
                 tl.store(dst_ptr + offset, in_data, mask=mask)
-            scale_dst_ptr = gateup_input_scale_ptr + dst_idx * scale_size
-            for start_offset in tl.range(0, scale_size, BLOCK_SIZE):
-                offset = start_offset + vec
-                mask = offset < scale_size
-                in_scale = tl.load(scale_src_ptr + offset, mask=mask)
-                tl.store(scale_dst_ptr + offset, in_scale, mask=mask)
+
+            if IS_FP8:
+                scale_dst_ptr = gateup_input_scale_ptr + dst_idx * scale_size
+                for start_offset in tl.range(0, scale_size, BLOCK_SIZE):
+                    offset = start_offset + vec
+                    mask = offset < scale_size
+                    in_scale = tl.load(scale_src_ptr + offset, mask=mask)
+                    tl.store(scale_dst_ptr + offset, in_scale, mask=mask)
 
 
 def moe_ep_deepgemm_preprocess(
@@ -1213,15 +1217,19 @@ def moe_ep_deepgemm_preprocess(
         block_shape = [128, 128]
     assert len(block_shape) == 2
     block_n, block_k = block_shape[0], block_shape[1]
+    is_fp8 = output_dtype == torch.float8_e4m3fn
+    if is_fp8:
+        # TODO: fuse this with the preprocess
+        hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
 
-    # TODO: fuse this with the preprocess
-    hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
-
-    gateup_input_scale = torch.empty(
-        (gateup_input.size(0), gateup_input.size(1), scale.size(1)),
-        device=hidden_states.device,
-        dtype=scale.dtype,
-    )
+        gateup_input_scale = torch.empty(
+            (gateup_input.size(0), gateup_input.size(1), scale.size(1)),
+            device=hidden_states.device,
+            dtype=scale.dtype,
+        )
+    else:
+        scale = None
+        gateup_input_scale = None
 
     fill_gateup_input_triton_kernel[(hidden_states.shape[0],)](
         hidden_states,
@@ -1232,8 +1240,9 @@ def moe_ep_deepgemm_preprocess(
         topk_ids,
         top_k,
         hidden_states.size(1),
-        scale.size(1),
+        scale.size(1) if is_fp8 else 0,
         BLOCK_SIZE=1024,
+        IS_FP8=is_fp8,
     )
 
     return (

@@ -36,7 +36,7 @@ from sglang.srt.layers.attention.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_musa
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 
 
 _is_hip = is_hip()
+_is_musa = is_musa()
 
 if _is_hip:
     from sglang.srt.layers.attention.nsa.triton_kernel import get_valid_kv_indices
@@ -60,6 +61,8 @@ if _is_hip:
         print(
             "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
         )
+elif _is_musa:
+    from flash_attn_interface import flash_attn_varlen_func
 else:
     from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 

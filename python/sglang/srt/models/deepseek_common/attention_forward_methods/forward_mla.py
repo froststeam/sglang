@@ -8,6 +8,7 @@ from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cud
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.elementwise import fused_dual_input_rmsnorm
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
     per_tensor_quant_mla_fp8,
@@ -160,7 +161,15 @@ class DeepseekMLAForwardMixin:
                                 res1=None,
                                 output_unquantized_inp1=False,
                             )
-
+                    elif _is_musa:
+                        q, k_nope = fused_dual_input_rmsnorm(
+                            q,
+                            self.q_a_layernorm.weight,
+                            self.q_a_layernorm.variance_epsilon,
+                            k_nope,
+                            self.kv_a_layernorm.weight,
+                            self.kv_a_layernorm.variance_epsilon,
+                        )
                     else:
                         q = self.q_a_layernorm(q)
                         k_nope = self.kv_a_layernorm(k_nope)

@@ -549,6 +549,7 @@ def pre_permute_standard_to_deep_gemm(
             hidden_states,
             runner_config.top_k,
             quant_info.block_shape,
+            output_dtype=torch.float8_e4m3fn if quant_info.use_fp8 else torch.bfloat16,
         )
     )
 

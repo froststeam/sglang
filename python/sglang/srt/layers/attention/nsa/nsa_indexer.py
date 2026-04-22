@@ -1059,6 +1059,8 @@ class Indexer(MultiPlatformOp):
                 max_kv_len = forward_batch.seq_lens_cpu.max().item()
                 skip_logits_computation = max_kv_len <= self.index_topk
 
+        # XXX (MUSA): always use nsa indexer
+        skip_logits_computation = False
         # Optimization: fast path when skipping topk computation
         if skip_logits_computation and (not self.nsa_enable_prefill_cp):
             return self._forward_cuda_k_only(

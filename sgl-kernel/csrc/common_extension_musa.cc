@@ -72,6 +72,23 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("concat_mla_k(Tensor! k, Tensor k_nope, Tensor k_rope) -> ()");
   m.impl("concat_mla_k", torch::kMUSA, &concat_mla_k);
 
+  m.def(
+      "rotary_embedding(Tensor positions, Tensor! query,"
+      "                 Tensor!? key, int head_size,"
+      "                 Tensor cos_sin_cache, bool is_neox) -> ()");
+  m.impl("rotary_embedding", torch::kMUSA, &rotary_embedding);
+
+  m.def("fast_topk(Tensor score, Tensor indices, Tensor lengths, Tensor? row_starts) -> ()");
+  m.impl("fast_topk", torch::kMUSA, &fast_topk_interface);
+  m.def(
+      "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor dst_page_table, Tensor src_page_table, Tensor "
+      "cu_seqlens_q, Tensor? row_starts) -> ()");
+  m.impl("fast_topk_transform_fused", torch::kMUSA, &fast_topk_transform_interface);
+  m.def(
+      "fast_topk_transform_ragged_fused(Tensor score, Tensor lengths, Tensor topk_indices_ragged, Tensor "
+      "topk_indices_offset, Tensor ? row_starts) -> ()");
+  m.impl("fast_topk_transform_ragged_fused", torch::kMUSA, &fast_topk_transform_ragged_interface);
+
   /*
    * From csrc/gemm
    */
@@ -110,6 +127,11 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, float "
       "moe_softcapping, Tensor? correction_bias) -> ()");
   m.impl("topk_softmax", torch::kMUSA, &topk_softmax);
+
+  m.def(
+      "topk_sigmoid(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, Tensor? "
+      "correction_bias) -> ()");
+  m.impl("topk_sigmoid", torch::kMUSA, &topk_sigmoid);
 
   m.def("moe_sum_reduce(Tensor input, Tensor output, float routed_scaling_factor) -> ()");
   m.impl("moe_sum_reduce", torch::kMUSA, &moe_sum_reduce);
@@ -302,15 +324,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "bool silu_activation,"
       "int pad_slot_id) -> ()");
   m.impl("causal_conv1d_fwd", torch::kMUSA, &causal_conv1d_fwd);
-
-  /*
-   * From csrc/elementwise
-   */
-  m.def(
-      "rotary_embedding(Tensor positions, Tensor! query,"
-      "                 Tensor!? key, int head_size,"
-      "                 Tensor cos_sin_cache, bool is_neox) -> ()");
-  m.impl("rotary_embedding", torch::kMUSA, &rotary_embedding);
 }
 
 REGISTER_EXTENSION(common_ops)

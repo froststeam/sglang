@@ -49,7 +49,11 @@ struct Signal {
 };
 
 struct __align__(16) RankData {
+#ifdef USE_MUSA
+  const void* ptrs[8];
+#else
   const void* __restrict__ ptrs[8];
+#endif
 };
 
 struct __align__(16) RankSignals {
@@ -99,7 +103,7 @@ DINLINE float& assign_add(float& a, float b) {
   return a += b;
 }
 
-#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__)) || (__MUSA_ARCH__ >= 220 || !defined(__MUSA_ARCH__))
 DINLINE float upcast_s(nv_bfloat16 val) {
   return __bfloat162float(val);
 }
@@ -150,6 +154,14 @@ DINLINE O downcast(array_t<float, O::size> val) {
   }
 }
 
+template <typename T, int32_t vlen = 8>
+DINLINE void _downcast(T* out, float* val) {
+#pragma unroll
+  for (int32_t i = 0; i < vlen; i++) {
+    out[i] = downcast_s<T>(val[i]);
+  }
+}
+
 static DINLINE void st_flag_release(FlagType* flag_addr, FlagType flag) {
 #ifdef USE_MUSA
   volatile_store((uint32_t)flag, (uint32_t*)flag_addr);
@@ -176,10 +188,20 @@ static DINLINE FlagType ld_flag_acquire(FlagType* flag_addr) {
 }
 
 static DINLINE void st_flag_volatile(FlagType* flag_addr, FlagType flag) {
+#ifdef USE_MUSA
+  volatile FlagType* volatile_ptr = (volatile FlagType*)flag_addr;
+  *volatile_ptr = flag;
+#else
   asm volatile("st.volatile.global.u32 [%1], %0;" ::"r"(flag), "l"(flag_addr));
+#endif
 }
 
 static DINLINE FlagType ld_flag_volatile(FlagType* flag_addr) {
+#ifdef USE_MUSA
+  volatile FlagType* volatile_ptr = (volatile FlagType*)flag_addr;
+  return *volatile_ptr;
+#endif
+
   FlagType flag;
   asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(flag) : "l"(flag_addr));
   return flag;
@@ -437,6 +459,7 @@ class CustomAllreduce {
   // Stores an map from a pointer to its peer pointters from all ranks.
   std::unordered_map<void*, RankData*> buffers_;
   Signal* self_sg_;
+  FlagType round;
 
   // Stores rank data from all ranks. This is mainly for cuda graph purposes.
   // For cuda graph to work, all kernel arguments must be fixed during graph
@@ -476,7 +499,8 @@ class CustomAllreduce {
         full_nvlink_(full_nvlink),
         self_sg_(signals[rank]),
         d_rank_data_base_(reinterpret_cast<RankData*>(rank_data)),
-        d_rank_data_end_(d_rank_data_base_ + rank_data_sz / sizeof(RankData)) {
+        d_rank_data_end_(d_rank_data_base_ + rank_data_sz / sizeof(RankData)),
+        round(0) {
     for (int i = 0; i < world_size_; i++) {
       sg_.signals[i] = signals[i];
     }
@@ -667,7 +691,18 @@ class CustomAllreduce {
       REDUCE_CASE(2)
       REDUCE_CASE(4)
       REDUCE_CASE(6)
-      REDUCE_CASE(8)
+      case 8:
+        if constexpr (!std::is_same<T, float>::value) {
+          custom_all_reduce_2shot<T, 8>
+              <<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size, ++round);
+        } else {
+          if (bytes < 256 * 1024) {
+            KL(8, cross_device_reduce_1stage);
+          } else {
+            KL(8, cross_device_reduce_2stage);
+          }
+        }
+        break;
       default:
         throw std::runtime_error(
             "custom allreduce only supports num gpus in (2,4,6,8). Actual num "

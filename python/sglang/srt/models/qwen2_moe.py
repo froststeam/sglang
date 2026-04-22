@@ -25,7 +25,11 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
+from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
+from sglang.srt.batch_overlap.two_batch_overlap import (
+    MaybeTboDeepEPDispatcher,
+    model_forward_maybe_tbo,
+)
 from sglang.srt.distributed import (
     get_moe_data_parallel_world_size,
     get_moe_expert_parallel_world_size,
@@ -36,6 +40,7 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -61,6 +66,11 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.token_dispatcher.base import (
+    BaseDispatcher,
+    CombineInput,
+    DispatchOutput,
+)
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
@@ -89,6 +99,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_musa,
     make_layers,
     use_intel_amx_backend,
 )
@@ -97,6 +108,7 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
+_is_musa = is_musa()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
@@ -167,6 +179,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        self.is_nextn = prefix.startswith("mtp")
         if self.tp_size > config.num_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -234,6 +247,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.top_k = config.num_experts_per_tok
         self.is_nextn = is_nextn
 
+        self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
+
     def get_moe_weights(self):
         return [
             x.data
@@ -267,10 +282,29 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
     def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         shared_output = None
+        sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
+        sbo_overlap_dispatch_flag = (
+            sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
+        )
+        sbo_overlap_combine_flag = (
+            sbo_enabled_flag and SboFlags.enable_combine_shared_two_stream_overlap()
+        )
+        sbo_overlap_combine_shared_flag = (
+            sbo_enabled_flag and SboFlags.enable_combine_shared_one_stream_overlap()
+        )
+
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
-            shared_output = self._forward_shared_experts(hidden_states)
+            if not sbo_enabled_flag:
+                if self.alt_stream is not None:
+                    self.alt_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(self.alt_stream):
+                        shared_output = self._forward_shared_experts(hidden_states)
+                        shared_output.record_stream(self.alt_stream)
+                        shared_event = self.alt_stream.record_event()
+                else:
+                    shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -285,6 +319,123 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
+
+        if sbo_overlap_dispatch_flag:
+            shared_output = None
+
+            def _deepep_dispatch_hook(dispatcher: BaseDispatcher):
+                nonlocal shared_output
+                shared_output = self._forward_shared_experts(hidden_states)
+                for handle in deepep_dispatch_hook_handle:
+                    handle.remove()
+
+            def _post_dispatch_hook(
+                dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
+            ):
+                combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
+                    compute_overlap_args(dispatch_output, self.alt_stream)
+                )
+                dispatcher.set_overlap_args(
+                    combine_overlap_args=combine_overlap_args,
+                    meta_overlap_args=meta_overlap_args,
+                )
+                self.experts.set_overlap_args(
+                    down_gemm_overlap_args=down_gemm_overlap_args,
+                    meta_overlap_args=meta_overlap_args,
+                )
+                post_dispatch_hook_handle.remove()
+
+            def _post_combine_hook(
+                dispatcher: BaseDispatcher, hidden_states: torch.Tensor
+            ):
+                dispatcher.clear_overlap_args()
+                self.experts.clear_overlap_args()
+                post_combine_hook_handle.remove()
+
+            assert isinstance(self.experts.dispatcher, MaybeTboDeepEPDispatcher)
+            deepep_dispatch_hook_handle = (
+                self.experts.dispatcher.register_deepep_dispatch_hook(
+                    _deepep_dispatch_hook
+                )
+            )
+            post_dispatch_hook_handle = (
+                self.experts.dispatcher.register_post_dispatch_hook(_post_dispatch_hook)
+            )
+            post_combine_hook_handle = (
+                self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
+            )
+        elif sbo_overlap_combine_shared_flag:
+            shared_output = None
+
+            def _deepep_combine_hook(dispatcher: BaseDispatcher):
+                nonlocal shared_output
+                shared_output = self._forward_shared_experts(hidden_states)
+                for handle in deepep_combine_hook_handle:
+                    handle.remove()
+
+            assert isinstance(self.experts.dispatcher, MaybeTboDeepEPDispatcher)
+            deepep_combine_hook_handle = (
+                self.experts.dispatcher.register_deepep_combine_hook(
+                    _deepep_combine_hook
+                )
+            )
+        elif sbo_overlap_combine_flag:
+            shared_output = None
+
+            def _post_dispatch_hook(
+                dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
+            ):
+
+                combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
+                    compute_overlap_args(dispatch_output, self.alt_stream)
+                )
+                dispatcher.set_overlap_args(
+                    combine_overlap_args=combine_overlap_args,
+                    meta_overlap_args=meta_overlap_args,
+                )
+                self.experts.set_overlap_args(
+                    down_gemm_overlap_args=down_gemm_overlap_args,
+                    meta_overlap_args=meta_overlap_args,
+                )
+
+                post_dispatch_hook_handle.remove()
+
+            def _pre_combine_hook(
+                dispatcher: BaseDispatcher, combine_input: CombineInput
+            ):
+
+                nonlocal shared_output
+
+                if (
+                    e := dispatcher.meta_overlap_args.get("record_event_after_down")
+                ) is not None:
+                    e.record()
+
+                # TODO reduce sm for non-deepgemm
+                with deep_gemm_wrapper.configure_deep_gemm_num_sms(
+                    dispatcher.meta_overlap_args["compute_num_sms"]
+                ):
+                    shared_output = self._forward_shared_experts(hidden_states)
+
+                pre_combine_hook_handle.remove()
+
+            def _post_combine_hook(
+                dispatcher: BaseDispatcher, hidden_states: torch.Tensor
+            ):
+                dispatcher.clear_overlap_args()
+                self.experts.clear_overlap_args()
+                post_combine_hook_handle.remove()
+
+            post_dispatch_hook_handle = (
+                self.experts.dispatcher.register_post_dispatch_hook(_post_dispatch_hook)
+            )
+            pre_combine_hook_handle = self.experts.dispatcher.register_pre_combine_hook(
+                _pre_combine_hook
+            )
+            post_combine_hook_handle = (
+                self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
+            )
+
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,

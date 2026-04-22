@@ -532,7 +532,9 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
         )
-        self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
+        self._fuse_shared_experts_inside_sbo = (
+            SboFlags.fuse_shared_experts_inside_sbo() and self._enable_a2a_moe
+        )
 
     def get_moe_weights(self):
         return [

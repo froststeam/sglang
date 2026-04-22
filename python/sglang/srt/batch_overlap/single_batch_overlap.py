@@ -60,6 +60,10 @@ class SboFlags:
         return is_sbo_enabled() and _is_combine_shared_one_stream
 
     @classmethod
+    def enable_combine_shared_one_stream_overlap(cls):
+        return is_sbo_enabled() and _is_combine_shared_one_stream
+
+    @classmethod
     def enable_dispatch_shared_one_stream_overlap(cls):
         return (
             is_sbo_enabled()
