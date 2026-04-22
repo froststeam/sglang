@@ -18,7 +18,7 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.utils import is_cpu, is_cuda, is_npu
+from sglang.srt.utils import is_cpu, is_cuda, is_musa, is_npu
 from sglang.srt.utils.common import rank0_log
 
 if not is_cpu():
@@ -26,7 +26,7 @@ if not is_cpu():
         CHUNK_SIZE as FLA_CHUNK_SIZE,
     )
 
-if is_cuda():
+if is_cuda() or is_musa():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
         causal_conv1d_fn as causal_conv1d_fn_cuda,
     )
@@ -71,11 +71,16 @@ class GDNKernelDispatcher:
 
             self.decode_kernel = CuteDSLGDNKernel()
         elif decode_backend.is_flashinfer():
-            if not is_cuda():
-                raise ValueError("FlashInfer GDN backend requires CUDA")
-            from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
-                FlashInferGDNKernel,
-            )
+            if is_cuda():
+                from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+                    FlashInferGDNKernel,
+                )
+            elif is_musa():
+                from sglang.srt.hardware_backend.musa.attention.linear.kernels.gdn_flashinfer import (
+                    MusaFlashInferGDNKernel as FlashInferGDNKernel,
+                )
+            else:
+                raise ValueError("FlashInfer GDN backend requires CUDA or MUSA")
 
             flashinfer_kernel = FlashInferGDNKernel()
             self.decode_kernel = flashinfer_kernel
@@ -90,15 +95,20 @@ class GDNKernelDispatcher:
                 "Use --linear-attn-prefill-backend triton instead."
             )
         elif prefill_backend.is_flashinfer():
-            if not is_cuda():
-                raise ValueError("FlashInfer GDN backend requires CUDA")
+            if not (is_cuda() or is_musa()):
+                raise ValueError("FlashInfer GDN backend requires CUDA or MUSA")
             # Reuse the FlashInfer kernel if already created for decode
             if decode_backend.is_flashinfer():
                 self.extend_kernel = flashinfer_kernel
             else:
-                from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
-                    FlashInferGDNKernel,
-                )
+                if is_cuda():
+                    from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+                        FlashInferGDNKernel,
+                    )
+                elif is_musa():
+                    from sglang.srt.hardware_backend.musa.attention.linear.kernels.gdn_flashinfer import (
+                        MusaFlashInferGDNKernel as FlashInferGDNKernel,
+                    )
 
                 flashinfer_kernel = FlashInferGDNKernel()
                 self.extend_kernel = flashinfer_kernel
