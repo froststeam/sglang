@@ -106,6 +106,7 @@ sources = [
     "csrc/gemm/per_token_group_quant_8bit_v2.cu",
     "csrc/memory/weak_ref_tensor.cpp",
     "csrc/mamba/causal_conv1d.cu",
+    "csrc/elementwise/rotary_embedding.cu",
     str(_FLASHINFER_REPO.source_dir / "csrc/norm.cu"),
     str(_FLASHINFER_REPO.source_dir / "csrc/renorm.cu"),
 ]

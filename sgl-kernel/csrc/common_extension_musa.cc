@@ -302,6 +302,15 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "bool silu_activation,"
       "int pad_slot_id) -> ()");
   m.impl("causal_conv1d_fwd", torch::kMUSA, &causal_conv1d_fwd);
+
+  /*
+   * From csrc/elementwise
+   */
+  m.def(
+      "rotary_embedding(Tensor positions, Tensor! query,"
+      "                 Tensor!? key, int head_size,"
+      "                 Tensor cos_sin_cache, bool is_neox) -> ()");
+  m.impl("rotary_embedding", torch::kMUSA, &rotary_embedding);
 }
 
 REGISTER_EXTENSION(common_ops)
