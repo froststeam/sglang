@@ -277,7 +277,6 @@ DINLINE P* get_tmp_buf(Signal* sg) {
   return (P*)(((Signal*)sg) + 1);
 }
 
-#ifdef USE_MUSA
 template <typename T, int32_t nranks, int32_t vlen = 8>
 DINLINE void shfl_reduce(float* res) {
   if constexpr (nranks >= 4) {
@@ -294,11 +293,17 @@ DINLINE void shfl_reduce(float* res) {
 
 template <typename T, int32_t nranks, int32_t vlen = 8>
 __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) custom_all_reduce_2shot(
-    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int32_t local_rank, int32_t size) {
+    RankData* _dp,
+    RankSignals sg,
+    Signal* self_sg,
+    T* __restrict__ result,
+    int32_t local_rank,
+    int32_t size,
+    FlagType round) {
   constexpr int32_t nranks_sft = (nranks >> 1) - (nranks >> 3);  // 8->3, 4->2, 2->1
   constexpr int32_t coalesce_num = 8;
   constexpr int32_t coalesce_sft = 3;                     // 8 threads per rank in group
-  constexpr int32_t group_size = nranks << coalesce_sft;  // tp 8 -> 64 threads, tp 4 -> 32 threads, tp 2 -> 16 threads
+  constexpr int32_t group_size = nranks << coalesce_sft;  // 64 threads per group when 8 ranks
   constexpr int32_t group_stride_sft = nranks_sft + coalesce_sft;
   const int32_t tidx = threadIdx.x;
   const int32_t bidx = blockIdx.x;
@@ -313,6 +318,8 @@ __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) custom_all_reduce_2sho
   typedef int16_t Vec __attribute__((vector_size(16)));
 
   const int32_t stride = gridDim.x * thread_num;
+  // coalesce_id + local_rank * coalesce_num + group_id * nranks * coalesce_num
+  //             + bidx * group_num * nranks * coalesce_num
   int32_t idx_base = bidx * thread_num;
   int32_t idx_in_blk = coalesce_tid + (local_rank << coalesce_sft) + (group_id << group_stride_sft);
 
@@ -321,7 +328,7 @@ __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) custom_all_reduce_2sho
   FlagType* local_barrier = nullptr;
   FlagType flag;
   if (tidx < nranks) {
-    flag = atomicAdd(&(self_sg->self_counter[bidx][tidx]), 1);
+    flag = round << 1;
     target_barrier = &sg.signals[tidx]->peer_counter[flag & 1][bidx][local_rank];
     local_barrier = &self_sg->peer_counter[flag & 1][bidx][tidx];
     atomicExch(target_barrier, flag);
@@ -344,7 +351,7 @@ __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) custom_all_reduce_2sho
       }
     }
     shfl_reduce<T, nranks, vlen>(temp_res);
-    // reduce cross warp, only trigger when tp 8
+    // reduce cross warp
     if constexpr (nranks == 8) {
       __shared__ float smem[kMaxThreadsPerBlock << 1];
       if (lane_idx < coalesce_num) {
@@ -379,7 +386,7 @@ __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) custom_all_reduce_2sho
   buffer_ptr = get_tmp_buf<Vec>(sg.signals[target_rank]);
   // second sync barrier
   if (tidx < nranks) {
-    flag = atomicAdd(&(self_sg->self_counter[bidx][tidx]), 1);
+    flag++;
     target_barrier = &sg.signals[tidx]->peer_counter[flag & 1][bidx][local_rank];
     local_barrier = &self_sg->peer_counter[flag & 1][bidx][tidx];
     atomicExch(target_barrier, flag);
@@ -399,7 +406,6 @@ __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) custom_all_reduce_2sho
     idx_base += stride;
   } while (idx_base < size);
 }
-#endif  // USE_MUSA
 
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) cross_device_reduce_2stage(
@@ -630,63 +636,22 @@ class CustomAllreduce {
     size /= d;
     auto bytes = size * sizeof(typename packed_t<T>::P);
     int blocks = std::min(block_limit, (size + threads - 1) / threads);
-
-    // Check environment variable once
-    const char* env_algo = std::getenv("SGLANG_CUSTOM_ALLREDUCE_ALGO");
-    bool force_1stage = false;
-    bool force_2stage = false;
-    if (env_algo != nullptr) {
-      if (std::strcmp(env_algo, "1stage") == 0 || std::strcmp(env_algo, "oneshot") == 0) {
-        force_1stage = true;
-      } else if (std::strcmp(env_algo, "2stage") == 0 || std::strcmp(env_algo, "twoshot") == 0) {
-        force_2stage = true;
-      } else {
-        throw std::runtime_error(
-            "Invalid SGLANG_CUSTOM_ALLREDUCE_ALGO: " + std::string(env_algo) +
-            ". Valid values: 1stage, oneshot, 2stage, twoshot");
-      }
-    }
-
 #define KL(ngpus, name) name<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
     // TODO(hanzhi713): Threshold is different for A100 and H100.
     // Add per device threshold.
-#ifndef USE_MUSA
-#define REDUCE_CASE(ngpus)                                                             \
-  case ngpus: {                                                                        \
-    if (force_1stage) {                                                                \
-      KL(ngpus, cross_device_reduce_1stage);                                           \
-    } else if (force_2stage) {                                                         \
-      KL(ngpus, cross_device_reduce_2stage);                                           \
-    } else {                                                                           \
-      if (world_size_ == 2) {                                                          \
-        KL(ngpus, cross_device_reduce_1stage);                                         \
-      } else if (full_nvlink_) {                                                       \
-        if ((world_size_ <= kAllReduceGPUSmall && bytes < kAllReduceSmallThreshold) || \
-            (world_size_ <= kAllReduceGPULarge && bytes < kAllReduceLargeThreshold)) { \
-          KL(ngpus, cross_device_reduce_1stage);                                       \
-        } else {                                                                       \
-          KL(ngpus, cross_device_reduce_2stage);                                       \
-        }                                                                              \
-      }                                                                                \
-    }                                                                                  \
-    break;                                                                             \
+#define REDUCE_CASE(ngpus)                                                                        \
+  case ngpus: {                                                                                   \
+    if (world_size_ == 2) {                                                                       \
+      KL(ngpus, cross_device_reduce_1stage);                                                      \
+    } else if (full_nvlink_) {                                                                    \
+      if ((world_size_ <= 4 && bytes < 512 * 1024) || (world_size_ <= 8 && bytes < 256 * 1024)) { \
+        KL(ngpus, cross_device_reduce_1stage);                                                    \
+      } else {                                                                                    \
+        KL(ngpus, cross_device_reduce_2stage);                                                    \
+      }                                                                                           \
+    }                                                                                             \
+    break;                                                                                        \
   }
-#else
-#define REDUCE_CASE(ngpus)                                                                                         \
-  case ngpus: {                                                                                                    \
-    if constexpr (!std::is_same<T, float>::value) {                                                                \
-      custom_all_reduce_2shot<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size); \
-    } else {                                                                                                       \
-      if ((world_size_ <= kAllReduceGPUSmall && bytes < kAllReduceSmallThreshold) ||                               \
-          (world_size_ <= kAllReduceGPULarge && bytes < kAllReduceLargeThreshold)) {                               \
-        KL(ngpus, cross_device_reduce_1stage);                                                                     \
-      } else {                                                                                                     \
-        KL(ngpus, cross_device_reduce_2stage);                                                                     \
-      }                                                                                                            \
-    }                                                                                                              \
-    break;                                                                                                         \
-  }
-#endif
     switch (world_size_) {
       REDUCE_CASE(2)
       REDUCE_CASE(4)
