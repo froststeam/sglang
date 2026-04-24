@@ -281,13 +281,12 @@ class RMSNorm(MultiPlatformOp):
         if not get_global_server_args().disable_piecewise_cuda_graph:
             return self.forward_native(x, residual, post_residual_addition)
 
-        if not x.is_contiguous():
-            x = x.contiguous()
-
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+            fused_add_rmsnorm(
+                x.contiguous(), residual, self.weight.data, self.variance_epsilon
+            )
             return x, residual
 
         out = nn.functional.rms_norm(
