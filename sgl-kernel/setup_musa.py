@@ -83,6 +83,7 @@ sources = [
     "csrc/elementwise/concat_mla.cu",
     "csrc/elementwise/pos_enc.cu",
     "csrc/elementwise/fused_add_rms_norm_kernel.mu",
+    "csrc/elementwise/topk.cu",
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",
     "csrc/moe/moe_align_kernel.cu",
     "csrc/moe/moe_fused_gate_musa.cu",
