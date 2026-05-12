@@ -61,6 +61,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_npu,
     next_power_of_2,
 )
@@ -79,6 +80,7 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
+_is_musa = is_musa()
 _is_fp8_fnuz = is_fp8_fnuz()
 
 
@@ -112,6 +114,27 @@ def _set_kv_buffer_impl(
         )
 
     from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+    if _is_musa and same_kv_dim:
+        # MUSA fast path: k_cache[indices] = k triggers a very slow index_put
+        # kernel for some shapes. index_copy_ accepts non-contiguous sources
+        # and is consistently fast. Avoid .contiguous() here — it would force
+        # a clone on the qkv.split() views and negate the savings.
+        k_flat = k.reshape(-1, row_dim)
+        v_flat = v.reshape(-1, row_dim)
+        k_cache_flat = k_cache.view(-1, row_dim)
+        v_cache_flat = v_cache.view(-1, row_dim)
+        if get_is_capture_mode() and alt_stream is not None:
+            current_stream = device_module.current_stream()
+            alt_stream.wait_stream(current_stream)
+            k_cache_flat.index_copy_(0, indices, k_flat)
+            with device_module.stream(alt_stream):
+                v_cache_flat.index_copy_(0, indices, v_flat)
+            current_stream.wait_stream(alt_stream)
+        else:
+            k_cache_flat.index_copy_(0, indices, k_flat)
+            v_cache_flat.index_copy_(0, indices, v_flat)
+        return
 
     if get_is_capture_mode() and alt_stream is not None:
         current_stream = device_module.current_stream()

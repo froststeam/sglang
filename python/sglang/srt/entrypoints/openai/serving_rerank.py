@@ -85,6 +85,33 @@ def _is_qwen3_vl_model(model_path: str) -> bool:
     return "qwen3-vl" in model_lower or "qwen3vl" in model_lower
 
 
+def _is_qwen3_reranker_model(model_path: str) -> bool:
+    """Check if the model is a Qwen3 text reranker based on model path."""
+    if not model_path:
+        return False
+    model_lower = model_path.lower()
+    return (
+        "qwen3-reranker" in model_lower
+        or "qwen3reranker" in model_lower
+        or "qwen3_embedding" in model_lower
+    )
+
+
+def _is_qwen3_reranker_chat_template(chat_template: str) -> bool:
+    """Detect if the chat template uses Qwen3-Reranker format (query/document roles).
+
+    Qwen3-Reranker chat templates use `selectattr("role", "eq", "query")` and
+    `selectattr("role", "eq", "document")` to extract query/document content,
+    rather than the standard messages list.
+    """
+    if not chat_template:
+        return False
+    t = chat_template.lower()
+    has_query_role = 'selectattr("role", "eq", "query")' in t
+    has_document_role = 'selectattr("role", "eq", "document")' in t
+    return has_query_role and has_document_role
+
+
 def _detect_rerank_backend(
     *,
     request: V1RerankReqInput,
@@ -102,11 +129,14 @@ def _detect_rerank_backend(
     is_vl_model = _is_qwen3_vl_model(model_path)
     is_vl_template = _is_qwen3_vl_reranker_template(chat_template)
     is_text_template = _is_qwen3_reranker_template(chat_template)
+    is_qwen3_reranker = _is_qwen3_reranker_model(model_path)
+    is_qwen3_reranker_chat = _is_qwen3_reranker_chat_template(chat_template)
 
     # Prefer VL when template/model indicates VL, or request is multimodal with reranker template.
     if is_vl_template or is_vl_model or (is_multimodal and is_text_template):
         return "vl_decoder"
-    if is_text_template:
+    # Qwen3 text reranker: detected by chat template (query/document roles) or model path
+    if is_text_template or is_qwen3_reranker or is_qwen3_reranker_chat:
         return "text_decoder"
     return "cross_encoder"
 
@@ -351,6 +381,49 @@ class OpenAIServingRerank(OpenAIServingBase):
 
         return None
 
+    def _build_qwen3_reranker_prompts_batch(
+        self,
+        query: RerankContent,
+        documents: List[RerankContent],
+        instruct: Optional[str],
+    ) -> List[str]:
+        """Batch-build prompts for Qwen3-Reranker using tokenizer.apply_chat_template.
+
+        Uses the batched conversation API to amortize Jinja2 template compilation
+        overhead across all documents in a single request.
+        """
+        tokenizer = self.tokenizer_manager.tokenizer
+        query_text = (
+            query if isinstance(query, str) else _extract_text_from_content(query)
+        )
+        system_text = (
+            instruct
+            or "Given a web search query, retrieve relevant passages that answer the query"
+        )
+
+        messages_list = [
+            [
+                {"role": "system", "content": system_text},
+                {"role": "query", "content": query_text},
+                {
+                    "role": "document",
+                    "content": (
+                        doc if isinstance(doc, str) else _extract_text_from_content(doc)
+                    ),
+                },
+            ]
+            for doc in documents
+        ]
+        prompts = tokenizer.apply_chat_template(
+            messages_list,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        # apply_chat_template returns List[str] when given a list of conversations
+        if isinstance(prompts, str):
+            return [prompts]
+        return list(prompts)
+
     async def _handle_text_reranker_request(
         self,
         *,
@@ -369,23 +442,44 @@ class OpenAIServingRerank(OpenAIServingBase):
             )
 
         try:
-            prompts = [
-                _render_jinja_chat_template(
-                    chat_template,
+            is_qwen3_reranker_fmt = _is_qwen3_reranker_chat_template(chat_template)
+            if is_qwen3_reranker_fmt:
+                # Qwen3-Reranker: batch-build prompts to amortize template overhead
+                prompts = self._build_qwen3_reranker_prompts_batch(
                     query=request.query,
-                    document=doc,
+                    documents=request.documents,
                     instruct=getattr(request, "instruct", None),
                 )
-                for doc in request.documents
-            ]
+            else:
+                # Legacy/generic text reranker: render chat template with standard messages
+                prompts = [
+                    _render_jinja_chat_template(
+                        chat_template,
+                        query=request.query,
+                        document=doc,
+                        instruct=getattr(request, "instruct", None),
+                    )
+                    for doc in request.documents
+                ]
+
+            # Sort prompts by length to minimize padding waste in batch prefill.
+            # Record original indices to restore result order.
+            indexed_prompts = list(enumerate(prompts))
+            indexed_prompts.sort(key=lambda x: len(x[1]))
+            sorted_prompts = [p for _, p in indexed_prompts]
+            orig_indices = [idx for idx, _ in indexed_prompts]
 
             result = await self.tokenizer_manager.score_prompts(
-                prompts,
+                sorted_prompts,
                 label_token_ids=[self._yes_token_id, self._no_token_id],
                 apply_softmax=False,
                 request=raw_request,
             )
-            scores = [_qwen3_rerank_score(s[0], s[1]) for s in result.scores]
+            # Restore scores to original document order
+            sorted_scores = [_qwen3_rerank_score(s[0], s[1]) for s in result.scores]
+            scores = [0.0] * len(sorted_scores)
+            for new_idx, old_idx in enumerate(orig_indices):
+                scores[old_idx] = sorted_scores[new_idx]
         except ValueError as e:
             return self.create_error_response(str(e))
         except Exception as e:

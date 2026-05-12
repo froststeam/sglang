@@ -35,10 +35,10 @@ if is_cuda():
     )
 elif is_musa():
     from sgl_kernel import (
-        top_k_renorm_prob,
-        top_p_renorm_prob,
         min_p_sampling_from_probs,
+        top_k_renorm_prob,
         top_k_top_p_sampling_from_probs,
+        top_p_renorm_prob,
     )
 
 if is_musa():
@@ -679,7 +679,7 @@ def get_token_ids_logprobs_batch_optimized(
     token_lengths = torch.tensor(
         [len(token_ids or []) for token_ids in token_ids_logprobs], device=device
     )
-    total_tokens = int(token_lengths.sum().item())  # 2 + 1 + 3 = 6
+    total_tokens = sum(token_lengths.tolist())  # 2 + 1 + 3 = 6
 
     # Handle edge case where no tokens are requested
     if total_tokens == 0:
@@ -689,9 +689,13 @@ def get_token_ids_logprobs_batch_optimized(
 
     # Step 2: Build flattened indices using torch operations
     # Example: row_indices = [0, 0, 1, 2, 2, 2] (batch indices repeated by their lengths)
-    row_indices = torch.repeat_interleave(
-        torch.arange(batch_size, device=device), token_lengths
-    )
+    # Use explicit loop instead of repeat_interleave to workaround MUSA bug
+    row_indices = torch.empty(total_tokens, dtype=torch.long, device=device)
+    pos = 0
+    for i, length in enumerate(token_lengths.tolist()):
+        if length > 0:
+            row_indices[pos : pos + length] = i
+        pos += length
     # Example: col_indices = [1, 3, 2, 0, 2, 4] (flattened token IDs from all requests)
     col_indices = torch.tensor(
         [

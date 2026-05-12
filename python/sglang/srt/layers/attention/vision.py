@@ -46,10 +46,12 @@ if _is_cuda:
     )
 
 if _is_musa:
+
     def flash_attn_func(*args, ver: int = 3, **kwargs):
         from flash_attn_interface import flash_attn_varlen_func
 
         return flash_attn_varlen_func(*args, **kwargs)
+
 
 if _is_npu:
     import torch_npu
