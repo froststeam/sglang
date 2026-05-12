@@ -654,19 +654,20 @@ class CustomAllreduce {
     break;                                                                             \
   }
 #else
-#define REDUCE_CASE(ngpus)                                                                                         \
-  case ngpus: {                                                                                                    \
-    if constexpr (!std::is_same<T, float>::value) {                                                                \
-      custom_all_reduce_2shot<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size); \
-    } else {                                                                                                       \
-      if ((world_size_ <= kAllReduceGPUSmall && bytes < kAllReduceSmallThreshold) ||                               \
-          (world_size_ <= kAllReduceGPULarge && bytes < kAllReduceLargeThreshold)) {                               \
-        KL(ngpus, cross_device_reduce_1stage);                                                                     \
-      } else {                                                                                                     \
-        KL(ngpus, cross_device_reduce_2stage);                                                                     \
-      }                                                                                                            \
-    }                                                                                                              \
-    break;                                                                                                         \
+#define REDUCE_CASE(ngpus)                                                                     \
+  case ngpus: {                                                                                \
+    if constexpr (!std::is_same<T, float>::value) {                                            \
+      custom_all_reduce_2shot<T, ngpus>                                                        \
+          <<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size, ++round); \
+    } else {                                                                                   \
+      if ((world_size_ <= kAllReduceGPUSmall && bytes < kAllReduceSmallThreshold) ||           \
+          (world_size_ <= kAllReduceGPULarge && bytes < kAllReduceLargeThreshold)) {           \
+        KL(ngpus, cross_device_reduce_1stage);                                                 \
+      } else {                                                                                 \
+        KL(ngpus, cross_device_reduce_2stage);                                                 \
+      }                                                                                        \
+    }                                                                                          \
+    break;                                                                                     \
   }
 #endif
     switch (world_size_) {
