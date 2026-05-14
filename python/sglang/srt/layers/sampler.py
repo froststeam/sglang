@@ -39,6 +39,7 @@ elif is_musa():
         top_k_renorm_prob,
         top_k_top_p_sampling_from_probs,
         top_p_renorm_prob,
+        top_p_sampling_from_probs,
     )
 
 if is_musa():
@@ -222,11 +223,19 @@ class Sampler(nn.Module):
         Handles both simple (direct multinomial) and complex (top-k/top-p/min-p) cases.
         """
         if simple_sampling_case:
-            batch_next_token_ids = sampling_from_probs_torch(
-                probs,
-                sampling_seed=sampling_info.sampling_seed,
-                positions=positions,
-            )
+            if is_musa() and sampling_info.sampling_seed is None:
+                batch_next_token_ids = top_p_sampling_from_probs(
+                    probs.contiguous(),
+                    1.0,
+                    check_nan=self.use_nan_detection,
+                )
+                batch_next_token_ids = batch_next_token_ids.view(-1).to(torch.int32)
+            else:
+                batch_next_token_ids = sampling_from_probs_torch(
+                    probs,
+                    sampling_seed=sampling_info.sampling_seed,
+                    positions=positions,
+                )
         else:
             backend = get_global_server_args().sampling_backend
             if backend == "flashinfer":
@@ -249,15 +258,50 @@ class Sampler(nn.Module):
                     )
             elif backend == "pytorch":
                 # A slower fallback implementation with torch native operations.
-                batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
-                    probs,
-                    sampling_info.top_ks,
-                    sampling_info.top_ps,
-                    sampling_info.min_ps,
-                    sampling_info.need_min_p_sampling,
-                    sampling_info.sampling_seed,
-                    positions,
-                )
+                # torch.multinomial is unstable on MUSA for no-seed sampling, so
+                # use sgl_kernel sampling kernels while keeping seeded sampling
+                # on the torch path for deterministic behavior.
+                if is_musa() and sampling_info.sampling_seed is None:
+                    if sampling_info.need_min_p_sampling:
+                        if sampling_info.need_top_k_sampling:
+                            probs = top_k_renorm_prob(probs, sampling_info.top_ks)
+                        if sampling_info.need_top_p_sampling:
+                            probs = top_p_renorm_prob(probs, sampling_info.top_ps)
+                        batch_next_token_ids = min_p_sampling_from_probs(
+                            probs,
+                            sampling_info.min_ps,
+                            check_nan=self.use_nan_detection,
+                        )
+                    elif sampling_info.need_top_k_sampling:
+                        top_ps = (
+                            sampling_info.top_ps
+                            if sampling_info.need_top_p_sampling
+                            else 1.0
+                        )
+                        batch_next_token_ids = top_k_top_p_sampling_from_probs(
+                            probs.contiguous(),
+                            sampling_info.top_ks,
+                            top_ps,
+                            filter_apply_order="joint",
+                            check_nan=self.use_nan_detection,
+                        )
+                    else:
+                        batch_next_token_ids = top_p_sampling_from_probs(
+                            probs.contiguous(),
+                            sampling_info.top_ps,
+                            check_nan=self.use_nan_detection,
+                        )
+                    batch_next_token_ids = batch_next_token_ids.view(-1).to(torch.int32)
+                else:
+                    batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
+                        probs,
+                        sampling_info.top_ks,
+                        sampling_info.top_ps,
+                        sampling_info.min_ps,
+                        sampling_info.need_min_p_sampling,
+                        sampling_info.sampling_seed,
+                        positions,
+                    )
             else:
                 raise ValueError(f"Invalid sampling backend: {backend}")
         return batch_next_token_ids
