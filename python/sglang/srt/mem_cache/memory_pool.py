@@ -120,6 +120,8 @@ def _set_kv_buffer_impl(
         # kernel for some shapes. index_copy_ accepts non-contiguous sources
         # and is consistently fast. Avoid .contiguous() here — it would force
         # a clone on the qkv.split() views and negate the savings.
+        if indices.dtype != torch.long:
+            indices = indices.to(torch.long)
         k_flat = k.reshape(-1, row_dim)
         v_flat = v.reshape(-1, row_dim)
         k_cache_flat = k_cache.view(-1, row_dim)
