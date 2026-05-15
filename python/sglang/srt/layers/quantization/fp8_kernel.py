@@ -53,7 +53,7 @@ _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if _is_cuda or _is_musa:
+if _is_cuda:
     from sgl_kernel import sgl_per_token_quant_fp8
 
     from sglang.jit_kernel.per_tensor_quant_fp8 import (
@@ -73,6 +73,13 @@ if _is_cuda or _is_musa:
     from sglang.jit_kernel.per_token_group_quant_8bit import (
         per_token_group_quant_8bit as sgl_per_token_group_quant_8bit_jit,
     )
+elif _is_musa:
+    from sgl_kernel import sgl_per_token_quant_fp8
+    from sglang.srt.hardware_backend.musa.kernels.quant import (
+        per_token_group_quant_8bit as sgl_per_token_group_quant_8bit,
+    )
+
+    enable_sgl_per_token_group_quant_8bit = True
 
 if _is_hip:
     _has_vllm = False
