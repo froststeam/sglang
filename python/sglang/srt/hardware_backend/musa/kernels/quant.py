@@ -1,8 +1,8 @@
 from typing import Optional
 
-import torch
 import tilelang
 import tilelang.language as T
+import torch
 
 fp8_dtype = torch.float8_e4m3fn
 _SUPPORTED_GROUP_SIZES = {16, 32, 64, 128}
@@ -55,7 +55,11 @@ def _scale_storage_view(output_s: torch.Tensor, scale_ue8m0: bool) -> torch.Tens
 
 
 def _check_limits(output_dtype: torch.dtype, min_8bit: float, max_8bit: float) -> None:
-    info = torch.iinfo(output_dtype) if output_dtype == torch.int8 else torch.finfo(output_dtype)
+    info = (
+        torch.iinfo(output_dtype)
+        if output_dtype == torch.int8
+        else torch.finfo(output_dtype)
+    )
     assert min_8bit == info.min, f"min_8bit must be {info.min} for {output_dtype}"
     assert max_8bit == info.max, f"max_8bit must be {info.max} for {output_dtype}"
 
@@ -67,7 +71,9 @@ def _flatten_for_kernel(tensor: torch.Tensor) -> torch.Tensor:
 def _scale_storage_metadata(output_s: torch.Tensor, scale_ue8m0: bool):
     scale_storage = _scale_storage_view(output_s, scale_ue8m0)
     scale_element_size = 1 if scale_ue8m0 else output_s.element_size()
-    scale_storage_offset = output_s.storage_offset() * output_s.element_size() // scale_element_size
+    scale_storage_offset = (
+        output_s.storage_offset() * output_s.element_size() // scale_element_size
+    )
     return (
         scale_storage,
         scale_storage_offset,
@@ -150,7 +156,11 @@ def _per_token_group_quant_8bit_kernel(
             secondary_base = group_base + hidden_dim_num_groups * group_size
             if fuse_silu_and_mul:
                 input_base = (
-                    expert_idx * num_tokens_per_expert * hidden_dim_num_groups * group_size * 2
+                    expert_idx
+                    * num_tokens_per_expert
+                    * hidden_dim_num_groups
+                    * group_size
+                    * 2
                     + token_idx * hidden_dim_num_groups * group_size * 2
                     + hidden_group_idx * group_size
                 )
@@ -278,7 +288,9 @@ def _per_token_group_quant_8bit_fast_kernel(
                     local_absmax[0] = T.max(local_absmax[0], T.abs(values[i]))
 
             if threads_per_group >= 32:
-                local_absmax[0] = T.max(local_absmax[0], T.shfl_xor(local_absmax[0], 16))
+                local_absmax[0] = T.max(
+                    local_absmax[0], T.shfl_xor(local_absmax[0], 16)
+                )
             if threads_per_group >= 16:
                 local_absmax[0] = T.max(local_absmax[0], T.shfl_xor(local_absmax[0], 8))
             if threads_per_group >= 8:
@@ -381,7 +393,9 @@ def _per_token_group_quant_8bit_row_kernel(
                     local_absmax[0] = T.max(local_absmax[0], T.abs(values[i]))
 
             if threads_per_group >= 32:
-                local_absmax[0] = T.max(local_absmax[0], T.shfl_xor(local_absmax[0], 16))
+                local_absmax[0] = T.max(
+                    local_absmax[0], T.shfl_xor(local_absmax[0], 16)
+                )
             if threads_per_group >= 16:
                 local_absmax[0] = T.max(local_absmax[0], T.shfl_xor(local_absmax[0], 8))
             if threads_per_group >= 8:
@@ -428,8 +442,12 @@ def per_token_group_quant_8bit(
     assert output_q.is_contiguous(), "output_q must be contiguous"
     assert group_size in _SUPPORTED_GROUP_SIZES, "Unsupported group_size"
     assert input.dtype in _INPUT_DTYPES, "input dtype must be float16 or bfloat16"
-    assert output_q.dtype in _OUTPUT_DTYPES, "output_q dtype must be int8 or float8_e4m3fn"
-    assert input.numel() % group_size == 0, "input.numel() must be divisible by group_size"
+    assert (
+        output_q.dtype in _OUTPUT_DTYPES
+    ), "output_q dtype must be int8 or float8_e4m3fn"
+    assert (
+        input.numel() % group_size == 0
+    ), "input.numel() must be divisible by group_size"
     _check_limits(output_q.dtype, min_8bit, max_8bit)
 
     masked_layout = masked_m is not None
@@ -450,7 +468,9 @@ def per_token_group_quant_8bit(
         assert masked_m.is_contiguous()
         num_experts = output_q.size(0)
         num_tokens_per_expert = output_q.size(-2)
-        total_groups = num_experts * num_tokens_per_expert * (output_q.size(-1) // group_size)
+        total_groups = (
+            num_experts * num_tokens_per_expert * (output_q.size(-1) // group_size)
+        )
         masked_m_arg = masked_m
     else:
         num_experts = 1

@@ -53,6 +53,9 @@ if _is_musa:
         return flash_attn_varlen_func(*args, **kwargs)
 
 
+if _is_musa:
+    from flash_attn_interface import flash_attn_varlen_func
+
 if _is_npu:
     import torch_npu
 

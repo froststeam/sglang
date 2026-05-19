@@ -75,6 +75,7 @@ if _is_cuda:
     )
 elif _is_musa:
     from sgl_kernel import sgl_per_token_quant_fp8
+
     from sglang.srt.hardware_backend.musa.kernels.quant import (
         per_token_group_quant_8bit as sgl_per_token_group_quant_8bit,
     )
