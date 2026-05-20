@@ -34,7 +34,7 @@ _is_xpu = is_xpu()
 _is_musa = is_musa()
 _is_mps = is_mps()
 
-if _is_cuda or _is_musa:
+if _is_cuda:
     from sglang.jit_kernel.rope import apply_rope_with_cos_sin_cache_inplace
 
 if _is_npu:
@@ -83,7 +83,11 @@ class RotaryEmbedding(MultiPlatformOp):
             # TODO: Test on different devices and remove this conditional.
             if _is_cuda:
                 from sglang.jit_kernel.rope import rotary_embedding
-            elif _is_hip or _is_musa:
+            elif _is_musa:
+                from sglang.srt.hardware_backend.musa.kernels.rope import (
+                    rotary_embedding,
+                )
+            elif _is_hip:
                 from sgl_kernel import rotary_embedding
             else:
                 from vllm._custom_ops import rotary_embedding
