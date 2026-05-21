@@ -1,4 +1,4 @@
-"""Standalone MUSA TileLang rotary embedding kernels."""
+"""MUSA TileLang rotary embedding kernels."""
 
 from typing import Optional
 
@@ -6,91 +6,28 @@ import tilelang
 import tilelang.language as T
 import torch
 
-tilelang.set_log_level("WARNING")
+from sglang.srt.hardware_backend.musa.jit_kernel.tilelang.utils import (
+    MUSA_COMMON_PASS_CONFIGS,
+    MUSA_COMPILE_FLAGS,
+    layout_strides,
+    storage_window,
+    tilelang_dtype,
+)
 
-pass_configs = {
-    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-    tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-}
-if hasattr(tilelang.PassConfigKey, "TL_DISABLE_FAST_MATH"):
-    pass_configs[tilelang.PassConfigKey.TL_DISABLE_FAST_MATH] = True
-elif hasattr(tilelang.PassConfigKey, "TL_ENABLE_FAST_MATH"):
-    pass_configs[tilelang.PassConfigKey.TL_ENABLE_FAST_MATH] = False
+_ROPE_PASS_CONFIGS = dict(MUSA_COMMON_PASS_CONFIGS)
 for _key, _value in (
-    ("TL_DISABLE_THREAD_STORAGE_SYNC", True),
-    ("TL_ENABLE_MUSA_BURST", True),
-    ("TL_ENABLE_REDUCE_BURST", True),
-    ("TL_DISABLE_SAFE_MEMORY_ACCESS", True),
     ("TL_DISABLE_SAFE_COPY_PREDICATION", True),
     ("TL_DISABLE_SAFE_ROBUST_COPY_PREDICATION", True),
-    ("TL_DISABLE_INDEX_TYPE_PROMOTION", True),
+    ("TL_CONFIG_INDEX_BITWIDTH", 32),
 ):
     if hasattr(tilelang.PassConfigKey, _key):
-        pass_configs[getattr(tilelang.PassConfigKey, _key)] = _value
-if hasattr(tilelang.PassConfigKey, "TL_CONFIG_INDEX_BITWIDTH"):
-    pass_configs[tilelang.PassConfigKey.TL_CONFIG_INDEX_BITWIDTH] = 32
-
-compile_flags = [
-    "-O3",
-    "-mllvm",
-    "-misched=mtgpu-max-ilp",
-    "-mllvm",
-    "-mtgpu-if-convert=1",
-    "-mllvm",
-    "-mtgpu-tiny-offset-hint=1",
-    "-mllvm",
-    "-misched-recompute-slotindex=1",
-]
-
-if hasattr(torch, "musa") and torch.musa.is_available():
-    tilelang.disable_cache()
-
-
-def _tilelang_dtype(dtype: torch.dtype) -> str:
-    if dtype is torch.float16:
-        return "float16"
-    if dtype is torch.bfloat16:
-        return "bfloat16"
-    if dtype is torch.float32:
-        return "float32"
-    raise TypeError(f"Unsupported dtype for rotary_embedding: {dtype}")
-
-
-def _storage_window(tensor: torch.Tensor) -> torch.Tensor:
-    storage_size = 1
-    for size, stride in zip(tensor.shape, tensor.stride()):
-        if stride < 0:
-            raise ValueError("query and key must not have negative strides")
-        if size == 0:
-            return tensor.reshape(-1)
-        storage_size += (size - 1) * stride
-    return tensor.as_strided((storage_size,), (1,))
-
-
-def _layout_strides(
-    tensor: torch.Tensor,
-    positions_ndim: int,
-    head_size: int,
-) -> tuple[int, int, int, int]:
-    if tensor.dim() not in (positions_ndim + 1, positions_ndim + 2):
-        raise ValueError(
-            "query and key must have shape [..., hidden_size] "
-            "or [..., num_heads, head_size]"
-        )
-
-    batch_stride = tensor.stride(0) if positions_ndim == 2 else 0
-    token_stride = tensor.stride(positions_ndim - 1)
-    if tensor.dim() == positions_ndim + 2:
-        head_stride = tensor.stride(-2)
-        dim_stride = tensor.stride(-1)
-    else:
-        dim_stride = tensor.stride(-1)
-        head_stride = head_size * dim_stride
-    return batch_stride, token_stride, head_stride, dim_stride
-
+        _ROPE_PASS_CONFIGS[getattr(tilelang.PassConfigKey, _key)] = _value
 
 @tilelang.jit(
-    out_idx=[], target="musa", pass_configs=pass_configs, compile_flags=compile_flags
+    out_idx=[],
+    target="musa",
+    pass_configs=_ROPE_PASS_CONFIGS,
+    compile_flags=MUSA_COMPILE_FLAGS,
 )
 def _rotary_embedding_decode_kernel(
     dtype: str,
@@ -119,7 +56,7 @@ def _rotary_embedding_decode_kernel(
     max_head_pairs = max(num_heads, num_kv_heads) * half_rot_dim
 
     @T.prim_func
-    def kernel(
+    def sglang_musa_rotary_embedding_decode_kernel(
         positions: T.Tensor((num_tokens,), "int64"),
         query: T.Tensor((query_storage_size,), dtype),
         key: T.Tensor((key_storage_size,), dtype),
@@ -195,13 +132,13 @@ def _rotary_embedding_decode_kernel(
                     key[k_x_offset] = (k_x * k_cos_f - k_y * k_sin_f).astype(dtype)
                     key[k_y_offset] = (k_y * k_cos_f + k_x * k_sin_f).astype(dtype)
 
-    return kernel
+    return sglang_musa_rotary_embedding_decode_kernel
 
 
 _rotary_embedding_decode_kernel.mode = "lazy"
 
 
-@tilelang.jit(out_idx=[], target="musa", pass_configs=pass_configs)
+@tilelang.jit(out_idx=[], target="musa", pass_configs=_ROPE_PASS_CONFIGS)
 def _rotary_embedding_prefill_kernel(
     dtype: str,
     head_size: int,
@@ -232,7 +169,7 @@ def _rotary_embedding_prefill_kernel(
     cache_blocks = T.ceildiv(rot_dim, block_pairs)
 
     @T.prim_func
-    def kernel(
+    def sglang_musa_rotary_embedding_prefill_kernel(
         positions: T.Tensor((num_tokens,), "int64"),
         query: T.Tensor((query_storage_size,), dtype),
         key: T.Tensor((key_storage_size,), dtype),
@@ -324,7 +261,7 @@ def _rotary_embedding_prefill_kernel(
                                 k_y * k_cos_f + k_x * k_sin_f
                             ).astype(dtype)
 
-    return kernel
+    return sglang_musa_rotary_embedding_prefill_kernel
 
 
 _rotary_embedding_prefill_kernel.mode = "lazy"
@@ -393,14 +330,14 @@ def rotary_embedding(
         query_stride,
         query_head_stride,
         query_dim_stride,
-    ) = _layout_strides(query, positions_ndim, head_size)
+    ) = layout_strides(query, positions_ndim, head_size)
     if key is not None:
         (
             key_batch_stride,
             key_stride,
             key_head_stride,
             key_dim_stride,
-        ) = _layout_strides(key, positions_ndim, head_size)
+        ) = layout_strides(key, positions_ndim, head_size)
     else:
         key_batch_stride = query_batch_stride
         key_stride = query_stride
@@ -408,8 +345,8 @@ def rotary_embedding(
         key_dim_stride = query_dim_stride
 
     seq_len = positions.size(1) if positions_ndim == 2 else 0
-    query_arg = _storage_window(query)
-    key_arg = _storage_window(key) if key is not None else query_arg
+    query_arg = storage_window(query)
+    key_arg = storage_window(key) if key is not None else query_arg
     split_block_pairs = min(512, max(32, num_heads * rot_dim // 2))
     loop_block_pairs = min(512, max(32, num_heads * rot_dim // 2))
     if num_tokens > 16384 and query.is_contiguous() and (
@@ -428,7 +365,7 @@ def rotary_embedding(
 
     if num_tokens <= 128:
         kernel = _rotary_embedding_decode_kernel(
-            _tilelang_dtype(query.dtype),
+            tilelang_dtype(query.dtype),
             int(head_size),
             int(num_heads),
             int(num_kv_heads),
@@ -450,7 +387,7 @@ def rotary_embedding(
         )
     else:
         kernel = _rotary_embedding_prefill_kernel(
-            _tilelang_dtype(query.dtype),
+            tilelang_dtype(query.dtype),
             int(head_size),
             int(num_heads),
             int(num_kv_heads),
