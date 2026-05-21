@@ -84,7 +84,7 @@ class RotaryEmbedding(MultiPlatformOp):
             if _is_cuda:
                 from sglang.jit_kernel.rope import rotary_embedding
             elif _is_musa:
-                from sglang.srt.hardware_backend.musa.kernels.rope import (
+                from sglang.srt.hardware_backend.musa.jit_kernel import (
                     rotary_embedding,
                 )
             elif _is_hip:

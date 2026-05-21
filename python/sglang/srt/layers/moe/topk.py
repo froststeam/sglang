@@ -190,7 +190,10 @@ if _is_musa:
     except ImportError as e:
         raise ImportError("mate is required for the biased grouped topk.")
 
-    from sglang.srt.hardware_backend.musa.kernels.topk import topk_sigmoid, topk_softmax
+    from sglang.srt.hardware_backend.musa.jit_kernel import (
+        topk_sigmoid,
+        topk_softmax,
+    )
 
 # -------------------------------- TopKConfig ---------------------------------------
 

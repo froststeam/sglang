@@ -4,39 +4,21 @@ import tilelang
 import tilelang.language as T
 import torch
 
+from sglang.srt.hardware_backend.musa.jit_kernel.tilelang.utils import (
+    MUSA_COMMON_PASS_CONFIGS,
+    MUSA_COMPILE_FLAGS,
+)
+
 fp8_dtype = torch.float8_e4m3fn
 _SUPPORTED_GROUP_SIZES = {16, 32, 64, 128}
 _INPUT_DTYPES = {torch.float16, torch.bfloat16}
 _OUTPUT_DTYPES = {torch.int8, fp8_dtype}
 _LOG2E = 1.4426950408889634
-_FAST_PASS_CONFIGS = {
-    tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
-    tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-    tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
-    tilelang.PassConfigKey.TL_ENABLE_MUSA_BURST: True,
-    tilelang.PassConfigKey.TL_ENABLE_REDUCE_BURST: True,
-    tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
-    tilelang.PassConfigKey.TL_DISABLE_INDEX_TYPE_PROMOTION: True,
-}
-_FAST_COMPILE_FLAGS = [
-    "-Od3",
-    "-fno-signed-zeros",
-    "-fmusa-flush-denormals-to-zero",
-    "-mllvm",
-    "-mtgpu-if-convert=1",
-    "-mllvm",
-    "-misched=mtgpu-max-ilp",
-    "-mllvm",
-    "-mtgpu-tiny-offset-hint=1",
-    "-mllvm",
-    "-mtgpu-enable-postra-sched=0",
-    "-mllvm",
-    "-misched-recompute-slotindex=1",
-    "-mllvm",
-    "-mtgpu-combine-fop-instr=1",
-]
-
+_QUANT_PASS_CONFIGS = dict(MUSA_COMMON_PASS_CONFIGS)
+if hasattr(tilelang.PassConfigKey, "TL_ENABLE_FAST_MATH"):
+    _QUANT_PASS_CONFIGS[tilelang.PassConfigKey.TL_ENABLE_FAST_MATH] = True
+elif hasattr(tilelang.PassConfigKey, "TL_DISABLE_FAST_MATH"):
+    _QUANT_PASS_CONFIGS[tilelang.PassConfigKey.TL_DISABLE_FAST_MATH] = False
 
 def _flat_storage_view(tensor: torch.Tensor) -> torch.Tensor:
     return torch.as_strided(
@@ -104,7 +86,7 @@ def _per_token_group_quant_8bit_kernel(
     num_threads = max(group_size, 32)
 
     @T.prim_func
-    def per_token_group_quant_8bit_kernel(
+    def sglang_musa_per_token_group_quant_8bit_kernel(
         input: T.Tensor([input_numel], dtype=input_dtype),
         output_q: T.Tensor([output_numel], dtype=output_dtype),
         output_s: T.Tensor([scale_storage_numel], dtype=scale_dtype),
@@ -213,10 +195,10 @@ def _per_token_group_quant_8bit_kernel(
                     )
                     output_s[scale_index] = scale_inv
 
-    return per_token_group_quant_8bit_kernel
+    return sglang_musa_per_token_group_quant_8bit_kernel
 
 
-@tilelang.jit(pass_configs=_FAST_PASS_CONFIGS, compile_flags=_FAST_COMPILE_FLAGS)
+@tilelang.jit(pass_configs=_QUANT_PASS_CONFIGS, compile_flags=MUSA_COMPILE_FLAGS)
 def _per_token_group_quant_8bit_fast_kernel(
     group_size,
     input_dtype,
@@ -233,7 +215,7 @@ def _per_token_group_quant_8bit_fast_kernel(
     num_threads = threads_per_group * groups_per_block
 
     @T.prim_func
-    def per_token_group_quant_8bit_fast_kernel(
+    def sglang_musa_per_token_group_quant_8bit_fast_kernel(
         input: T.Tensor([input_numel], dtype=input_dtype),
         output_q: T.Tensor([output_numel], dtype=output_dtype),
         output_s: T.Tensor([scale_storage_numel], dtype=scale_dtype),
@@ -316,10 +298,10 @@ def _per_token_group_quant_8bit_fast_kernel(
                 )
                 output_s[scale_index] = scale_inv[0]
 
-    return per_token_group_quant_8bit_fast_kernel
+    return sglang_musa_per_token_group_quant_8bit_fast_kernel
 
 
-@tilelang.jit(pass_configs=_FAST_PASS_CONFIGS, compile_flags=_FAST_COMPILE_FLAGS)
+@tilelang.jit(pass_configs=_QUANT_PASS_CONFIGS, compile_flags=MUSA_COMPILE_FLAGS)
 def _per_token_group_quant_8bit_row_kernel(
     group_size,
     input_dtype,
@@ -338,7 +320,7 @@ def _per_token_group_quant_8bit_row_kernel(
     num_threads = threads_per_group * groups_per_block
 
     @T.prim_func
-    def per_token_group_quant_8bit_row_kernel(
+    def sglang_musa_per_token_group_quant_8bit_row_kernel(
         input: T.Tensor([input_numel], dtype=input_dtype),
         output_q: T.Tensor([output_numel], dtype=output_dtype),
         output_s: T.Tensor([scale_storage_numel], dtype=scale_dtype),
@@ -421,7 +403,7 @@ def _per_token_group_quant_8bit_row_kernel(
                 )
                 output_s[scale_index] = scale_inv[0]
 
-    return per_token_group_quant_8bit_row_kernel
+    return sglang_musa_per_token_group_quant_8bit_row_kernel
 
 
 def per_token_group_quant_8bit(
