@@ -159,21 +159,9 @@ class MusaFlashInferGDNKernel(LinearAttnKernelBase):
         **kwargs,
     ) -> tuple:
         # MP31: chunked prefill using FlashInfer GDN prefill kernel.
-        from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
-
         total_seq_len = q.shape[1]
         num_v_heads = v.shape[2]
         head_v_dim = v.shape[3]
-
-        q_fi = l2norm_fwd(q[0].contiguous())
-        k_fi = l2norm_fwd(k[0].contiguous())
-        v_fi = v[0].contiguous()
-
-        # g (alpha) and beta: [1, seq, HV] -> [seq, HV], float32 for FlashInfer
-        alpha_fi = torch.exp(g[0].to(torch.float32))
-        beta_fi = beta[0].to(torch.float32)
-
-        cu_seqlens_fi = query_start_loc.to(torch.int64)
 
         # Remap negative padding indices to sentinel slot
         ssm_cache_indices = torch.where(
@@ -182,20 +170,20 @@ class MusaFlashInferGDNKernel(LinearAttnKernelBase):
             ssm_states.shape[0] - 1,
         ).to(torch.int64)
 
-        # FlashInfer requires float32 initial state, K-last layout [B, HV, V, K]
-        initial_state_fi = ssm_states[ssm_cache_indices].to(torch.float32)
+        initial_state_fi = ssm_states[ssm_cache_indices]
 
         output_fi, output_state_fi = self._prefill_fn(
-            q=q_fi,
-            k=k_fi,
-            v=v_fi,
-            g=alpha_fi,
-            beta=beta_fi,
+            q=q.squeeze(0),
+            k=k.squeeze(0),
+            v=v.squeeze(0),
+            g=g.squeeze(0),
+            beta=beta.squeeze(0),
             scale=None,
             initial_state=initial_state_fi,
             output_final_state=True,
-            cu_seqlens=cu_seqlens_fi,
-            use_qk_l2norm_in_kernel=False,
+            cu_seqlens=query_start_loc,
+            use_qk_l2norm_in_kernel=True,
+            is_log_space=True,
         )
 
         # Write back state to pool
