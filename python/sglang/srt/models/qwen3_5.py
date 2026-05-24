@@ -22,10 +22,6 @@ import torch
 import torch.nn as nn
 import triton
 
-from sglang.jit_kernel.triton.gdn_fused_proj import (
-    fused_qkvzba_split_reshape_cat_contiguous,
-)
-
 # Configs
 from sglang.srt.configs.qwen3_5 import (
     Qwen3_5Config,
@@ -39,7 +35,6 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 
 # Layers - Attention
-from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
@@ -92,11 +87,23 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
     is_hip,
+    is_musa,
     is_npu,
     make_layers,
     set_weight_attrs,
 )
 from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
+
+if is_musa():
+    from sglang.srt.hardware_backend.musa.jit_kernel import RMSNorm as RMSNormGated
+    from sglang.srt.hardware_backend.musa.jit_kernel import (
+        fused_qkvzba_split_reshape_cat_contiguous,
+    )
+else:
+    from sglang.jit_kernel.triton.gdn_fused_proj import (
+        fused_qkvzba_split_reshape_cat_contiguous,
+    )
+    from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()

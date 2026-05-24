@@ -9,9 +9,18 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.utils import is_musa
+
 from .causal_conv1d_triton import PAD_SLOT_ID
-from .causal_conv1d_triton import causal_conv1d_fn as _causal_conv1d_fn_triton
 from .causal_conv1d_triton import causal_conv1d_update as _causal_conv1d_update_triton
+
+_is_musa = is_musa()
+if _is_musa:
+    from sglang.srt.hardware_backend.musa.jit_kernel import (
+        causal_conv1d_fn as _causal_conv1d_fn_triton,
+    )
+else:
+    from .causal_conv1d_triton import causal_conv1d_fn as _causal_conv1d_fn_triton
 
 try:
     from sgl_kernel import causal_conv1d_fwd
