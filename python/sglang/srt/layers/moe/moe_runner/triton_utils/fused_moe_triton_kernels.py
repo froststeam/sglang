@@ -26,6 +26,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_sm90_supported,
 )
 
