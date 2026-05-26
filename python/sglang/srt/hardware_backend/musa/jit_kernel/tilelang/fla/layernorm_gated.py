@@ -107,6 +107,82 @@ def _rms_norm_gated_kernel(
 _rms_norm_gated_kernel.mode = "lazy"
 
 
+@functools.lru_cache(maxsize=32)
+@tilelang.jit(
+    target="musa",
+    pass_configs=_RMSNORM_PASS_CONFIGS,
+    compile_flags=MUSA_COMPILE_FLAGS,
+)
+def _rms_norm_gated_kernel_cta(
+    dtype: str,
+    hidden_size: int,
+    threads: int,
+):
+    m = T.dynamic("m")
+    x_stride_row = T.dynamic("x_stride_row")
+    y_stride_row = T.dynamic("y_stride_row")
+    z_stride_row = T.dynamic("z_stride_row")
+    warps_per_cta = threads // 32
+
+    @T.prim_func
+    def sglang_musa_rms_norm_gated_cta(
+        x: T.StridedTensor((m, hidden_size), (x_stride_row, 1), dtype),
+        y: T.StridedTensor((m, hidden_size), (y_stride_row, 1), dtype),
+        w: T.Tensor((hidden_size,), dtype),
+        z: T.StridedTensor((m, hidden_size), (z_stride_row, 1), dtype),
+        rstd: T.Tensor((m,), "float32"),
+        eps: T.float32,
+    ):
+        with T.Kernel(m, threads=threads) as (row,):
+            tid = T.get_thread_binding()
+            lane = tid % 32
+            warp = tid // 32
+            sum_local = T.alloc_var("float32")
+            inv_rms = T.alloc_var("float32")
+            warp_sum = T.alloc_shared((warps_per_cta,), "float32")
+            inv_rms_shared = T.alloc_shared((1,), "float32")
+
+            sum_local = 0.0
+            for offset_base in T.serial(0, hidden_size, threads):
+                offset = offset_base + tid
+                if offset < hidden_size:
+                    x_val = T.cast(x[row, offset], "float32")
+                    sum_local += x_val * x_val
+
+            sum_local = T.warp_reduce_sum(sum_local)
+            if lane == 0:
+                warp_sum[warp] = sum_local
+            T.sync_threads()
+
+            sum_local = T.if_then_else(tid < warps_per_cta, warp_sum[tid], 0.0)
+            if warp == 0:
+                sum_local = T.warp_reduce_sum(sum_local)
+                if lane == 0:
+                    inv_rms = T.rsqrt(sum_local / hidden_size + eps)
+                    inv_rms_shared[0] = inv_rms
+                    rstd[row] = inv_rms
+            T.sync_threads()
+
+            for offset_base in T.serial(0, hidden_size, threads):
+                offset = offset_base + tid
+                if offset < hidden_size:
+                    x_val = T.cast(x[row, offset], "float32")
+                    z_val = T.cast(z[row, offset], "float32")
+                    y[row, offset] = T.cast(
+                        x_val
+                        * inv_rms_shared[0]
+                        * T.cast(w[offset], "float32")
+                        * z_val
+                        / (1.0 + T.exp2(-z_val * _LOG2E)),
+                        dtype,
+                    )
+
+    return sglang_musa_rms_norm_gated_cta
+
+
+_rms_norm_gated_kernel_cta.mode = "lazy"
+
+
 def _launch_rms_norm_gated(
     x: torch.Tensor,
     out: torch.Tensor,
@@ -116,7 +192,17 @@ def _launch_rms_norm_gated(
     eps: float,
     rows_per_block: int = 8,
     lanes_per_row: int = 16,
+    cta_threads: int | None = None,
 ) -> None:
+    if cta_threads is not None:
+        kernel = _rms_norm_gated_kernel_cta(
+            tilelang_dtype(x.dtype),
+            x.shape[-1],
+            cta_threads,
+        )
+        kernel(x, out, weight, z, rstd, float(eps))
+        return
+
     kernel = _rms_norm_gated_kernel(
         tilelang_dtype(x.dtype),
         x.shape[-1],
@@ -139,9 +225,20 @@ def _rms_norm_gated_custom(
     eps: float,
     rows_per_block: int = 8,
     lanes_per_row: int = 16,
+    cta_threads: int | None = None,
 ) -> None:
     # Keep the TileLang executable launch opaque to Dynamo.
-    _launch_rms_norm_gated(x, out, weight, z, rstd, eps, rows_per_block, lanes_per_row)
+    _launch_rms_norm_gated(
+        x,
+        out,
+        weight,
+        z,
+        rstd,
+        eps,
+        rows_per_block,
+        lanes_per_row,
+        cta_threads,
+    )
 
 
 def _rms_norm_gated_impl(
@@ -152,6 +249,7 @@ def _rms_norm_gated_impl(
     out: torch.Tensor | None = None,
     rows_per_block: int | None = None,
     lanes_per_row: int | None = None,
+    cta_threads: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if x.dim() != 2 or z.dim() != 2:
         raise RuntimeError("rms_norm_gated expects x/z with shape [M, N].")
@@ -173,6 +271,14 @@ def _rms_norm_gated_impl(
         )
 
     hidden_size = x.shape[-1]
+    if cta_threads is None and hidden_size >= 4096:
+        cta_threads = 512
+    if cta_threads is not None:
+        if cta_threads not in (128, 256, 512):
+            raise RuntimeError("cta_threads must be one of 128, 256, 512.")
+        if cta_threads > 1024:
+            raise RuntimeError("invalid cta_threads.")
+
     if lanes_per_row is None:
         lanes_per_row = 32 if hidden_size % 32 == 0 else 16
     if rows_per_block is None:
@@ -194,6 +300,7 @@ def _rms_norm_gated_impl(
         eps,
         rows_per_block,
         lanes_per_row,
+        cta_threads,
     )
     return out, rstd
 

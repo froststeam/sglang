@@ -44,7 +44,6 @@ def _next_power_of_2(value: int) -> int:
 def _causal_conv1d_fwd_kernel(
     dtype: str,
     width: int,
-    max_seq_len: int,
     x_stride_dim: int,
     x_stride_token: int,
     w_stride_dim: int,
@@ -83,6 +82,7 @@ def _causal_conv1d_fwd_kernel(
         has_initial_state: T.Tensor((init_numel,), "bool"),
         query_start_loc: T.Tensor((query_numel,), "int32"),
         out: T.Tensor((out_numel,), dtype),
+        max_seq_len: T.int32,
         dim: T.int32,
         num_cache_lines: T.int32,
         pad_slot_id: T.int32,
@@ -334,7 +334,6 @@ _causal_conv1d_fwd_kernel.mode = "lazy"
 )
 def _causal_conv1d_fwd_width4_vec_kernel(
     dtype: str,
-    max_seq_len: int,
     x_stride_token: int,
     w_stride_dim: int,
     state_stride_seq: int,
@@ -372,6 +371,7 @@ def _causal_conv1d_fwd_width4_vec_kernel(
         has_initial_state: T.Tensor((init_numel,), "bool"),
         query_start_loc: T.Tensor((query_numel,), "int32"),
         out: T.Tensor((out_numel,), dtype),
+        max_seq_len: T.int32,
         dim: T.int32,
         num_cache_lines: T.int32,
         pad_slot_id: T.int32,
@@ -550,7 +550,6 @@ _causal_conv1d_fwd_width4_vec_kernel.mode = "lazy"
 )
 def _causal_conv1d_prefill_width4_kernel(
     dtype: str,
-    max_seq_len: int,
     x_stride_token: int,
     w_stride_dim: int,
     state_stride_seq: int,
@@ -584,6 +583,7 @@ def _causal_conv1d_prefill_width4_kernel(
         has_initial_state: T.Tensor((init_numel,), "bool"),
         query_start_loc: T.Tensor((query_numel,), "int32"),
         out: T.Tensor((out_numel,), dtype),
+        max_seq_len: T.int32,
         dim: T.int32,
         num_cache_lines: T.int32,
         pad_slot_id: T.int32,
@@ -755,7 +755,6 @@ _causal_conv1d_prefill_width4_kernel.mode = "lazy"
 )
 def _causal_conv1d_prefill_width4_body_kernel(
     dtype: str,
-    max_seq_len: int,
     x_stride_token: int,
     w_stride_dim: int,
     o_stride_token: int,
@@ -781,6 +780,7 @@ def _causal_conv1d_prefill_width4_body_kernel(
         cache_indices: T.Tensor((cache_numel,), "int32"),
         query_start_loc: T.Tensor((query_numel,), "int32"),
         out: T.Tensor((out_numel,), dtype),
+        max_seq_len: T.int32,
         dim: T.int32,
         num_cache_lines: T.int32,
         pad_slot_id: T.int32,
@@ -1190,7 +1190,6 @@ def _causal_conv1d_fwd_impl(
     ):
         _causal_conv1d_prefill_width4_kernel(
             dtype,
-            int(block_m),
             int(x.stride(1)),
             int(weight.stride(0)),
             int(state_stride_seq),
@@ -1213,6 +1212,7 @@ def _causal_conv1d_fwd_impl(
             has_initial_state_arg,
             query_start_loc,
             out_arg,
+            int(block_m),
             int(dim),
             int(num_cache_lines),
             int(pad_slot_id if pad_slot_id is not None else PAD_SLOT_ID),
@@ -1220,7 +1220,6 @@ def _causal_conv1d_fwd_impl(
         if max_seq_len > block_m:
             _causal_conv1d_prefill_width4_body_kernel(
                 dtype,
-                int(max_seq_len),
                 int(x.stride(1)),
                 int(weight.stride(0)),
                 int(out.stride(1)),
@@ -1237,6 +1236,7 @@ def _causal_conv1d_fwd_impl(
                 cache_indices_arg,
                 query_start_loc,
                 out_arg,
+                int(max_seq_len),
                 int(dim),
                 int(num_cache_lines),
                 int(pad_slot_id if pad_slot_id is not None else PAD_SLOT_ID),
@@ -1256,7 +1256,6 @@ def _causal_conv1d_fwd_impl(
         vec_elems = 1
         _causal_conv1d_fwd_width4_vec_kernel(
             dtype,
-            int(max_seq_len),
             int(x.stride(1)),
             int(weight.stride(0)),
             int(state_stride_seq),
@@ -1281,6 +1280,7 @@ def _causal_conv1d_fwd_impl(
             has_initial_state_arg,
             query_start_loc,
             out_arg,
+            int(max_seq_len),
             int(dim),
             int(num_cache_lines),
             int(pad_slot_id if pad_slot_id is not None else PAD_SLOT_ID),
@@ -1290,7 +1290,6 @@ def _causal_conv1d_fwd_impl(
     _causal_conv1d_fwd_kernel(
         dtype,
         int(width),
-        int(max_seq_len),
         int(x.stride(0)),
         int(x.stride(1)),
         int(weight.stride(0)),
@@ -1317,6 +1316,7 @@ def _causal_conv1d_fwd_impl(
         has_initial_state_arg,
         query_start_loc,
         out_arg,
+        int(max_seq_len),
         int(dim),
         int(num_cache_lines),
         int(pad_slot_id if pad_slot_id is not None else PAD_SLOT_ID),
