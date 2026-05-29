@@ -12,43 +12,12 @@
 #include <tvm/ffi/extra/musa/device_guard.h>
 #include <tvm/ffi/function.h>
 
-namespace ffi = tvm::ffi;
-
-constexpr DLDataType dl_float16{kDLFloat, 16, 1};
-constexpr DLDataType dl_float32{kDLFloat, 32, 1};
-constexpr DLDataType dl_bfloat16{kDLBfloat, 16, 1};
-constexpr DLDataType dl_int32{kDLInt, 32, 1};
+#include "../common.h"
+#include "../device_utils.h"
 
 constexpr float kFloatMinimum = -10000.0f;
-constexpr float kLog2E = 1.4426950408889634f;
 constexpr int kWarpSize = 32;
 constexpr int kWarpsPerCta = 4;
-
-#define MIN_CONST(a, b) ((a) < (b) ? (a) : (b))
-#define MAX_CONST(a, b) ((a) > (b) ? (a) : (b))
-
-inline bool dtype_equal(DLDataType lhs, DLDataType rhs) {
-  return lhs.code == rhs.code && lhs.bits == rhs.bits && lhs.lanes == rhs.lanes;
-}
-
-inline musaStream_t get_stream(DLDevice device) {
-  return static_cast<musaStream_t>(TVMFFIEnvGetStream(device.device_type, device.device_id));
-}
-
-#define CHECK_MUSA_CONTIGUOUS(x)                         \
-  TVM_FFI_ICHECK_EQ((x).device().device_type, kDLExtDev); \
-  TVM_FFI_ICHECK((x).IsContiguous())
-
-template <typename T>
-__device__ __forceinline__ float to_float(T x) {
-  if constexpr (std::is_same_v<T, half>) {
-    return __half2float(x);
-  } else if constexpr (std::is_same_v<T, __mt_bfloat16>) {
-    return __bfloat162float(x);
-  } else {
-    return static_cast<float>(x);
-  }
-}
 
 __device__ __forceinline__ float stable_sigmoid(float x) {
   const bool positive = x >= 0.0f;
@@ -57,7 +26,7 @@ __device__ __forceinline__ float stable_sigmoid(float x) {
   return positive ? inv : z * inv;
 }
 
-__device__ __forceinline__ void warp_argmax(float& val, int& idx) {
+__device__ __forceinline__ void warp_argmax(float &val, int &idx) {
 #pragma unroll
   for (int mask = kWarpSize / 2; mask > 0; mask >>= 1) {
     const float other_val = __shfl_xor_sync(0xffffffff, val, mask);
@@ -91,339 +60,12 @@ __device__ __forceinline__ int lane_id() {
   return lane;
 }
 
-template <typename T, int N, int Alignment = sizeof(T) * N>
-struct alignas(Alignment) AlignedArray {
-  T data[N];
-};
-
-namespace detail {
-template <typename T, int NumExperts, int BytesPerLoad>
-struct TopkVecConstants {
-  static constexpr int ElementsPerLoad = BytesPerLoad / sizeof(T);
-  static constexpr int VecsPerThread = MAX_CONST(1, NumExperts / (ElementsPerLoad * kWarpSize));
-  static constexpr int ValuesPerThread = VecsPerThread * ElementsPerLoad;
-  static constexpr int ThreadsPerRow = NumExperts / ValuesPerThread;
-  static constexpr int RowsPerWarp = kWarpSize / ThreadsPerRow;
-};
-}  // namespace detail
-
-template <typename T, int NumExperts, int ValuesPerThread, int WarpsPerCta, int BytesPerLoad, bool IsSoftmax>
-__global__ __launch_bounds__(WarpsPerCta * kWarpSize) void topk_vec_gating_kernel(
-    const T* __restrict__ gating_output,
-    float* __restrict__ topk_weights,
-    int32_t* __restrict__ topk_ids,
-    const float* __restrict__ correction_bias,
-    int num_tokens,
-    int topk,
-    bool renormalize,
-    float moe_softcapping,
-    bool has_correction_bias) {
-  static_assert(NumExperts == (NumExperts & -NumExperts), "NumExperts must be a power of 2");
-  static_assert(BytesPerLoad <= 16, "BytesPerLoad must be at most 16");
-  static_assert(BytesPerLoad == (BytesPerLoad & -BytesPerLoad), "BytesPerLoad must be a power of 2");
-  static constexpr int ElementsPerLoad = BytesPerLoad / sizeof(T);
-  static constexpr int ThreadsPerRow = NumExperts / ValuesPerThread;
-  static constexpr int LoadsPerThread = ValuesPerThread / ElementsPerLoad;
-  static constexpr int RowsPerWarp = kWarpSize / ThreadsPerRow;
-  static constexpr int RowsPerCta = WarpsPerCta * RowsPerWarp;
-  static constexpr int ColsPerGroupLoad = ElementsPerLoad * ThreadsPerRow;
-
-  static_assert(ValuesPerThread % ElementsPerLoad == 0, "ValuesPerThread must be divisible by ElementsPerLoad");
-  static_assert(kWarpSize % ThreadsPerRow == 0, "ThreadsPerRow must divide warp size");
-  static_assert(ThreadsPerRow <= kWarpSize, "ThreadsPerRow must be at most warp size");
-  static_assert(ThreadsPerRow == (ThreadsPerRow & -ThreadsPerRow), "ThreadsPerRow must be a power of 2");
-
-  const int lane = threadIdx.x;
-  const int warp_id = threadIdx.y;
-  const int cta_base_row = blockIdx.x * RowsPerCta;
-  const int warp_base_row = cta_base_row + warp_id * RowsPerWarp;
-  const int row_in_warp = lane / ThreadsPerRow;
-  const int thread_row = warp_base_row + row_in_warp;
-  if (thread_row >= num_tokens) {
-    return;
-  }
-
-  const int thread_group_idx = lane % ThreadsPerRow;
-  const int first_col = thread_group_idx * ElementsPerLoad;
-  const T* thread_read_ptr = gating_output + thread_row * NumExperts + first_col;
-
-  using AccessType = AlignedArray<T, ElementsPerLoad>;
-  T row_chunk_raw[ValuesPerThread];
-  AccessType* row_chunk_vec = reinterpret_cast<AccessType*>(row_chunk_raw);
-  const AccessType* read_vec = reinterpret_cast<const AccessType*>(thread_read_ptr);
-#pragma unroll
-  for (int i = 0; i < LoadsPerThread; ++i) {
-    row_chunk_vec[i] = read_vec[i * ThreadsPerRow];
-  }
-
-  float row_chunk[ValuesPerThread];
-  float thread_max = kFloatMinimum;
-#pragma unroll
-  for (int i = 0; i < ValuesPerThread; ++i) {
-    float val = to_float(row_chunk_raw[i]);
-    if constexpr (IsSoftmax) {
-      if (has_correction_bias) {
-        const int group_id = i / ElementsPerLoad;
-        const int local_id = i % ElementsPerLoad;
-        const int expert = first_col + group_id * ColsPerGroupLoad + local_id;
-        val += correction_bias[expert];
-      }
-      if (moe_softcapping > 0.0f) {
-        val = tanhf(val / moe_softcapping) * moe_softcapping;
-      }
-      thread_max = fmaxf(thread_max, val);
-      row_chunk[i] = val;
-    } else {
-      val = stable_sigmoid(val);
-      if (has_correction_bias) {
-        const int group_id = i / ElementsPerLoad;
-        const int local_id = i % ElementsPerLoad;
-        const int expert = first_col + group_id * ColsPerGroupLoad + local_id;
-        val += correction_bias[expert];
-      }
-      row_chunk[i] = val;
-    }
-  }
-
-  if constexpr (IsSoftmax) {
-#pragma unroll
-    for (int mask = ThreadsPerRow / 2; mask > 0; mask >>= 1) {
-      thread_max = fmaxf(thread_max, __shfl_xor_sync(0xffffffff, thread_max, mask, ThreadsPerRow));
-    }
-
-    float row_sum = 0.0f;
-#pragma unroll
-    for (int i = 0; i < ValuesPerThread; ++i) {
-      row_chunk[i] = __expf(row_chunk[i] - thread_max);
-      row_sum += row_chunk[i];
-    }
-#pragma unroll
-    for (int mask = ThreadsPerRow / 2; mask > 0; mask >>= 1) {
-      row_sum += __shfl_xor_sync(0xffffffff, row_sum, mask, ThreadsPerRow);
-    }
-    const float inv_row_sum = 1.0f / row_sum;
-#pragma unroll
-    for (int i = 0; i < ValuesPerThread; ++i) {
-      row_chunk[i] *= inv_row_sum;
-    }
-  }
-
-  float selected_sum = 0.0f;
-  for (int k_idx = 0; k_idx < topk; ++k_idx) {
-    float max_val = row_chunk[0];
-    int max_idx = first_col;
-#pragma unroll
-    for (int ldg = 0, col = first_col; ldg < LoadsPerThread; ++ldg, col += ColsPerGroupLoad) {
-#pragma unroll
-      for (int i = 0; i < ElementsPerLoad; ++i) {
-        const float val = row_chunk[ldg * ElementsPerLoad + i];
-        const int expert = col + i;
-        if (val > max_val || (val == max_val && expert < max_idx)) {
-          max_val = val;
-          max_idx = expert;
-        }
-      }
-    }
-
-#pragma unroll
-    for (int mask = ThreadsPerRow / 2; mask > 0; mask >>= 1) {
-      const float other_val = __shfl_xor_sync(0xffffffff, max_val, mask, ThreadsPerRow);
-      const int other_idx = __shfl_xor_sync(0xffffffff, max_idx, mask, ThreadsPerRow);
-      if (other_val > max_val || (other_val == max_val && other_idx < max_idx)) {
-        max_val = other_val;
-        max_idx = other_idx;
-      }
-    }
-
-    float selected_prob = max_val;
-    if constexpr (!IsSoftmax) {
-      if (has_correction_bias) {
-        selected_prob -= correction_bias[max_idx];
-      }
-    }
-    if (thread_group_idx == 0) {
-      const int out_idx = thread_row * topk + k_idx;
-      topk_weights[out_idx] = selected_prob;
-      topk_ids[out_idx] = max_idx;
-      selected_sum += selected_prob;
-    }
-
-    if (k_idx + 1 < topk) {
-      const int load_group = max_idx / ColsPerGroupLoad;
-      const int thread_to_clear = (max_idx / ElementsPerLoad) % ThreadsPerRow;
-      if (thread_group_idx == thread_to_clear) {
-        const int offset = max_idx % ElementsPerLoad;
-        row_chunk[load_group * ElementsPerLoad + offset] = kFloatMinimum;
-      }
-    }
-  }
-
-  if (renormalize && thread_group_idx == 0) {
-    const float inv_selected_sum = 1.0f / selected_sum;
-    for (int k_idx = 0; k_idx < topk; ++k_idx) {
-      const int out_idx = thread_row * topk + k_idx;
-      topk_weights[out_idx] *= inv_selected_sum;
-    }
-  }
-}
-
-template <typename T, int NumExperts, bool IsSoftmax>
-void launch_topk_vec_gating(
-    const T* input_ptr,
-    float* weights_ptr,
-    int32_t* ids_ptr,
-    const float* bias_ptr,
-    int num_tokens,
-    int topk,
-    bool renormalize,
-    float moe_softcapping,
-    bool has_correction_bias,
-    musaStream_t stream) {
-  constexpr int bytes_per_load = MIN_CONST(16, static_cast<int>(sizeof(T)) * NumExperts);
-  using Constants = detail::TopkVecConstants<T, NumExperts, bytes_per_load>;
-  constexpr int values_per_thread = Constants::ValuesPerThread;
-  constexpr int rows_per_warp = Constants::RowsPerWarp;
-  const int num_warps = (num_tokens + rows_per_warp - 1) / rows_per_warp;
-  const int blocks = (num_warps + kWarpsPerCta - 1) / kWarpsPerCta;
-  dim3 block_dim(kWarpSize, kWarpsPerCta);
-  topk_vec_gating_kernel<T, NumExperts, values_per_thread, kWarpsPerCta, bytes_per_load, IsSoftmax>
-      <<<blocks, block_dim, 0, stream>>>(
-          input_ptr,
-          weights_ptr,
-          ids_ptr,
-          bias_ptr,
-          num_tokens,
-          topk,
-          renormalize,
-          moe_softcapping,
-          has_correction_bias);
-}
-
-template <typename T, int NumExperts, int ValuesPerThread, bool IsSoftmax>
-__global__ __launch_bounds__(kWarpsPerCta * kWarpSize, 1) void topk_warp_kernel(
-    const T* __restrict__ gating_output,
-    float* __restrict__ topk_weights,
-    int32_t* __restrict__ topk_ids,
-    const float* __restrict__ correction_bias,
-    int num_tokens,
-    int topk,
-    bool renormalize,
-    float moe_softcapping,
-    bool has_correction_bias) {
-  const int tid = threadIdx.x;
-  const int warp_id = tid / kWarpSize;
-  const int lane = lane_id();
-  const int row = blockIdx.x * kWarpsPerCta + warp_id;
-  if (row >= num_tokens) {
-    return;
-  }
-  if (row >= num_tokens) {
-    return;
-  }
-
-  float probs[ValuesPerThread];
-  float choice[ValuesPerThread];
-  float thread_max = kFloatMinimum;
-
-#pragma unroll
-  for (int i = 0; i < ValuesPerThread; ++i) {
-    const int expert = lane + i * kWarpSize;
-    float val = kFloatMinimum;
-    val = to_float(gating_output[row * NumExperts + expert]);
-    if constexpr (IsSoftmax) {
-      if (has_correction_bias) {
-        val += correction_bias[expert];
-      }
-      if (moe_softcapping > 0.0f) {
-        val = tanhf(val / moe_softcapping) * moe_softcapping;
-      }
-      thread_max = fmaxf(thread_max, val);
-    } else {
-      val = stable_sigmoid(val);
-    }
-    probs[i] = val;
-    choice[i] = val;
-  }
-
-  if constexpr (IsSoftmax) {
-    const float row_max = warp_max(thread_max);
-    float thread_sum = 0.0f;
-#pragma unroll
-    for (int i = 0; i < ValuesPerThread; ++i) {
-      probs[i] = __expf(probs[i] - row_max);
-      thread_sum += probs[i];
-    }
-    const float inv_sum = 1.0f / warp_sum(thread_sum);
-#pragma unroll
-    for (int i = 0; i < ValuesPerThread; ++i) {
-      probs[i] *= inv_sum;
-      choice[i] = probs[i];
-    }
-  } else if (has_correction_bias) {
-#pragma unroll
-    for (int i = 0; i < ValuesPerThread; ++i) {
-      const int expert = lane + i * kWarpSize;
-      choice[i] = probs[i] + correction_bias[expert];
-    }
-  }
-
-  float selected_sum = 0.0f;
-  for (int k_idx = 0; k_idx < topk; ++k_idx) {
-    float max_val = choice[0];
-    int max_idx = lane;
-#pragma unroll
-    for (int i = 1; i < ValuesPerThread; ++i) {
-      const int expert = lane + i * kWarpSize;
-      const float val = choice[i];
-      if (val > max_val) {
-        max_val = val;
-        max_idx = expert;
-      }
-    }
-    warp_argmax(max_val, max_idx);
-
-    float selected_prob;
-    if constexpr (IsSoftmax) {
-      selected_prob = max_val;
-    } else {
-      selected_prob = __shfl_sync(0xffffffff, probs[max_idx / kWarpSize], max_idx % kWarpSize);
-    }
-
-    if (lane == 0) {
-      const int out_idx = row * topk + k_idx;
-      topk_weights[out_idx] = selected_prob;
-      topk_ids[out_idx] = max_idx;
-      selected_sum += selected_prob;
-    }
-
-#pragma unroll
-    for (int i = 0; i < ValuesPerThread; ++i) {
-      const int expert = lane + i * kWarpSize;
-      if (expert == max_idx) {
-        choice[i] = kFloatMinimum;
-      }
-    }
-  }
-
-  if (renormalize && lane == 0) {
-    const float inv_selected_sum = 1.0f / selected_sum;
-    for (int k_idx = 0; k_idx < topk; ++k_idx) {
-      const int out_idx = row * topk + k_idx;
-      topk_weights[out_idx] *= inv_selected_sum;
-    }
-  }
-}
-
 template <typename T, int NumExperts, int ValuesPerThread>
-__global__ __launch_bounds__(kWarpsPerCta * kWarpSize, 1) void topk_softmax_warp_kernel(
-    const T* __restrict__ gating_output,
-    float* __restrict__ topk_weights,
-    int32_t* __restrict__ topk_ids,
-    const float* __restrict__ correction_bias,
-    int num_tokens,
-    int topk,
-    bool renormalize,
-    float moe_softcapping,
+__global__
+__launch_bounds__(kWarpsPerCta *kWarpSize, 1) void topk_softmax_warp_kernel(
+    const T *__restrict__ gating_output, float *__restrict__ topk_weights,
+    int32_t *__restrict__ topk_ids, const float *__restrict__ correction_bias,
+    int num_tokens, int topk, bool renormalize, float moe_softcapping,
     bool has_correction_bias) {
   const int tid = threadIdx.x;
   const int warp_id = tid / kWarpSize;
@@ -505,15 +147,11 @@ __global__ __launch_bounds__(kWarpsPerCta * kWarpSize, 1) void topk_softmax_warp
 }
 
 template <typename T, int NumExperts, int ValuesPerThread>
-__global__ __launch_bounds__(kWarpsPerCta * kWarpSize, 1) void topk_sigmoid_warp_kernel(
-    const T* __restrict__ gating_output,
-    float* __restrict__ topk_weights,
-    int32_t* __restrict__ topk_ids,
-    const float* __restrict__ correction_bias,
-    int num_tokens,
-    int topk,
-    bool renormalize,
-    bool has_correction_bias) {
+__global__
+__launch_bounds__(kWarpsPerCta *kWarpSize, 1) void topk_sigmoid_warp_kernel(
+    const T *__restrict__ gating_output, float *__restrict__ topk_weights,
+    int32_t *__restrict__ topk_ids, const float *__restrict__ correction_bias,
+    int num_tokens, int topk, bool renormalize, bool has_correction_bias) {
   const int tid = threadIdx.x;
   const int warp_id = tid / kWarpSize;
   const int lane = lane_id();
@@ -550,7 +188,8 @@ __global__ __launch_bounds__(kWarpsPerCta * kWarpSize, 1) void topk_sigmoid_warp
     }
     warp_argmax(max_val, max_idx);
 
-    const float selected_prob = has_correction_bias ? max_val - correction_bias[max_idx] : max_val;
+    const float selected_prob =
+        has_correction_bias ? max_val - correction_bias[max_idx] : max_val;
     if (lane == 0) {
       const int out_idx = row * topk + k_idx;
       topk_weights[out_idx] = selected_prob;
@@ -577,13 +216,14 @@ __global__ __launch_bounds__(kWarpsPerCta * kWarpSize, 1) void topk_sigmoid_warp
 }
 
 template <typename T, int NumExperts, int ValuesPerThread>
-__global__ __launch_bounds__(kWarpsPerCta * kWarpSize, 1) void topk_sigmoid_no_bias_warp_kernel(
-    const T* __restrict__ gating_output,
-    float* __restrict__ topk_weights,
-    int32_t* __restrict__ topk_ids,
-    int num_tokens,
-    int topk,
-    bool renormalize) {
+__global__ __launch_bounds__(
+    kWarpsPerCta *kWarpSize,
+    1) void topk_sigmoid_no_bias_warp_kernel(const T
+                                                 *__restrict__ gating_output,
+                                             float *__restrict__ topk_weights,
+                                             int32_t *__restrict__ topk_ids,
+                                             int num_tokens, int topk,
+                                             bool renormalize) {
   const int tid = threadIdx.x;
   const int warp_id = tid / kWarpSize;
   const int lane = lane_id();
@@ -642,99 +282,16 @@ __global__ __launch_bounds__(kWarpsPerCta * kWarpSize, 1) void topk_sigmoid_no_b
 }
 
 template <typename T, int NumExperts, int ValuesPerThread, int TopK>
-__global__ __launch_bounds__(kWarpsPerCta * kWarpSize, 1) void topk_softmax_warp_kernel_fixed_k(
-    const T* __restrict__ gating_output,
-    float* __restrict__ topk_weights,
-    int32_t* __restrict__ topk_ids,
-    const float* __restrict__ correction_bias,
-    int num_tokens,
-    bool renormalize,
-    float moe_softcapping,
-    bool has_correction_bias) {
-  const int tid = threadIdx.x;
-  const int warp_id = tid / kWarpSize;
-  const int lane = lane_id();
-  const int row = blockIdx.x * kWarpsPerCta + warp_id;
-  if (row >= num_tokens) {
-    return;
-  }
-
-  float logits[ValuesPerThread];
-  float thread_max = kFloatMinimum;
-
-#pragma unroll
-  for (int i = 0; i < ValuesPerThread; ++i) {
-    const int expert = lane + i * kWarpSize;
-    float val = kFloatMinimum;
-    val = to_float(gating_output[row * NumExperts + expert]);
-    if (has_correction_bias) {
-      val += correction_bias[expert];
-    }
-    if (moe_softcapping > 0.0f) {
-      val = tanhf(val / moe_softcapping) * moe_softcapping;
-    }
-    logits[i] = val;
-    thread_max = fmaxf(thread_max, val);
-  }
-
-  const float row_max = warp_max(thread_max);
-  float thread_sum = 0.0f;
-#pragma unroll
-  for (int i = 0; i < ValuesPerThread; ++i) {
-    thread_sum += __expf(logits[i] - row_max);
-  }
-  const float inv_row_sum = 1.0f / warp_sum(thread_sum);
-
-  float selected_sum = 0.0f;
-#pragma unroll
-  for (int k_idx = 0; k_idx < TopK; ++k_idx) {
-    float max_val = logits[0];
-    int max_idx = lane;
-#pragma unroll
-    for (int i = 1; i < ValuesPerThread; ++i) {
-      const int expert = lane + i * kWarpSize;
-      const float val = logits[i];
-      if (val > max_val) {
-        max_val = val;
-        max_idx = expert;
-      }
-    }
-    warp_argmax(max_val, max_idx);
-
-    const float selected_prob = __expf(max_val - row_max) * inv_row_sum;
-    if (lane == 0) {
-      const int out_idx = row * TopK + k_idx;
-      topk_weights[out_idx] = selected_prob;
-      topk_ids[out_idx] = max_idx;
-      selected_sum += selected_prob;
-    }
-
-#pragma unroll
-    for (int i = 0; i < ValuesPerThread; ++i) {
-      const int expert = lane + i * kWarpSize;
-      if (expert == max_idx) {
-        logits[i] = kFloatMinimum;
-      }
-    }
-  }
-
-  if (renormalize && lane == 0) {
-    const float inv_selected_sum = 1.0f / selected_sum;
-#pragma unroll
-    for (int k_idx = 0; k_idx < TopK; ++k_idx) {
-      const int out_idx = row * TopK + k_idx;
-      topk_weights[out_idx] *= inv_selected_sum;
-    }
-  }
-}
-
-template <typename T, int NumExperts, int ValuesPerThread, int TopK>
-__global__ __launch_bounds__(kWarpsPerCta * kWarpSize, 1) void topk_softmax_no_bias_warp_kernel_fixed_k(
-    const T* __restrict__ gating_output,
-    float* __restrict__ topk_weights,
-    int32_t* __restrict__ topk_ids,
-    int num_tokens,
-    bool renormalize) {
+__global__ __launch_bounds__(
+    kWarpsPerCta *kWarpSize,
+    1) void topk_softmax_no_bias_warp_kernel_fixed_k(const T
+                                                         *__restrict__ gating_output,
+                                                     float
+                                                         *__restrict__ topk_weights,
+                                                     int32_t
+                                                         *__restrict__ topk_ids,
+                                                     int num_tokens,
+                                                     bool renormalize) {
   const int tid = threadIdx.x;
   const int warp_id = tid / kWarpSize;
   const int lane = lane_id();
@@ -810,11 +367,10 @@ __global__ __launch_bounds__(kWarpsPerCta * kWarpSize, 1) void topk_softmax_no_b
 }
 
 template <typename T, int NumExperts, int ValuesPerThread, int TopK>
-__global__ __launch_bounds__(kWarpsPerCta * kWarpSize, 1) void topk_softmax_no_bias_renorm_warp_kernel_fixed_k(
-    const T* __restrict__ gating_output,
-    float* __restrict__ topk_weights,
-    int32_t* __restrict__ topk_ids,
-    int num_tokens) {
+__global__
+__launch_bounds__(kWarpsPerCta *kWarpSize, 1) void topk_softmax_no_bias_renorm_warp_kernel_fixed_k(
+    const T *__restrict__ gating_output, float *__restrict__ topk_weights,
+    int32_t *__restrict__ topk_ids, int num_tokens) {
   const int tid = threadIdx.x;
   const int warp_id = tid / kWarpSize;
   const int lane = lane_id();
@@ -884,11 +440,10 @@ __global__ __launch_bounds__(kWarpsPerCta * kWarpSize, 1) void topk_softmax_no_b
 }
 
 template <typename T, int NumExperts, int TopK>
-__global__ __launch_bounds__(kWarpsPerCta * kWarpSize, 1) void topk_softmax_no_bias_renorm_halfwarp_kernel_fixed_k(
-    const T* __restrict__ gating_output,
-    float* __restrict__ topk_weights,
-    int32_t* __restrict__ topk_ids,
-    int num_tokens) {
+__global__
+__launch_bounds__(kWarpsPerCta *kWarpSize, 1) void topk_softmax_no_bias_renorm_halfwarp_kernel_fixed_k(
+    const T *__restrict__ gating_output, float *__restrict__ topk_weights,
+    int32_t *__restrict__ topk_ids, int num_tokens) {
   constexpr int ThreadsPerRow = 16;
   constexpr int ValuesPerThread = NumExperts / ThreadsPerRow;
   constexpr int RowsPerWarp = kWarpSize / ThreadsPerRow;
@@ -932,9 +487,12 @@ __global__ __launch_bounds__(kWarpsPerCta * kWarpSize, 1) void topk_softmax_no_b
 
 #pragma unroll
     for (int mask = ThreadsPerRow / 2; mask > 0; mask >>= 1) {
-      const float other_val = __shfl_xor_sync(0xffffffff, max_val, mask, ThreadsPerRow);
-      const int other_idx = __shfl_xor_sync(0xffffffff, max_idx, mask, ThreadsPerRow);
-      if (other_val > max_val || (other_val == max_val && other_idx < max_idx)) {
+      const float other_val =
+          __shfl_xor_sync(0xffffffff, max_val, mask, ThreadsPerRow);
+      const int other_idx =
+          __shfl_xor_sync(0xffffffff, max_idx, mask, ThreadsPerRow);
+      if (other_val > max_val ||
+          (other_val == max_val && other_idx < max_idx)) {
         max_val = other_val;
         max_idx = other_idx;
       }
@@ -974,11 +532,10 @@ __global__ __launch_bounds__(kWarpsPerCta * kWarpSize, 1) void topk_softmax_no_b
 }
 
 template <int TopK>
-__global__ __launch_bounds__(kWarpsPerCta * kWarpSize, 1) void topk_softmax_half_e1024_no_bias_renorm_warp_kernel_fixed_k(
-    const half* __restrict__ gating_output,
-    float* __restrict__ topk_weights,
-    int32_t* __restrict__ topk_ids,
-    int num_tokens) {
+__global__
+__launch_bounds__(kWarpsPerCta *kWarpSize, 1) void topk_softmax_half_e1024_no_bias_renorm_warp_kernel_fixed_k(
+    const half *__restrict__ gating_output, float *__restrict__ topk_weights,
+    int32_t *__restrict__ topk_ids, int num_tokens) {
   constexpr int NumExperts = 1024;
   constexpr int ValuesPerThread = 32;
   constexpr int Half2PerThread = ValuesPerThread / 2;
@@ -992,7 +549,8 @@ __global__ __launch_bounds__(kWarpsPerCta * kWarpSize, 1) void topk_softmax_half
   }
 
   float logits[ValuesPerThread];
-  const __half2* row_ptr = reinterpret_cast<const __half2*>(gating_output + row * NumExperts);
+  const __half2 *row_ptr =
+      reinterpret_cast<const __half2 *>(gating_output + row * NumExperts);
 
 #pragma unroll
   for (int i = 0; i < Half2PerThread; ++i) {
@@ -1057,12 +615,16 @@ __global__ __launch_bounds__(kWarpsPerCta * kWarpSize, 1) void topk_softmax_half
 }
 
 template <typename T, int NumExperts, int ValuesPerThread, int TopK>
-__global__ __launch_bounds__(kWarpsPerCta * kWarpSize, 1) void topk_sigmoid_no_bias_warp_kernel_fixed_k(
-    const T* __restrict__ gating_output,
-    float* __restrict__ topk_weights,
-    int32_t* __restrict__ topk_ids,
-    int num_tokens,
-    bool renormalize) {
+__global__ __launch_bounds__(
+    kWarpsPerCta *kWarpSize,
+    1) void topk_sigmoid_no_bias_warp_kernel_fixed_k(const T
+                                                         *__restrict__ gating_output,
+                                                     float
+                                                         *__restrict__ topk_weights,
+                                                     int32_t
+                                                         *__restrict__ topk_ids,
+                                                     int num_tokens,
+                                                     bool renormalize) {
   const int tid = threadIdx.x;
   const int warp_id = tid / kWarpSize;
   const int lane = lane_id();
@@ -1124,23 +686,16 @@ __global__ __launch_bounds__(kWarpsPerCta * kWarpSize, 1) void topk_sigmoid_no_b
 
 template <typename T, bool IsSoftmax>
 __global__ void topk_block_kernel(
-    const T* __restrict__ gating_output,
-    float* __restrict__ topk_weights,
-    int32_t* __restrict__ topk_ids,
-    const float* __restrict__ correction_bias,
-    int num_tokens,
-    int num_experts,
-    int topk,
-    int block_width,
-    bool renormalize,
-    float moe_softcapping,
-    bool has_correction_bias) {
+    const T *__restrict__ gating_output, float *__restrict__ topk_weights,
+    int32_t *__restrict__ topk_ids, const float *__restrict__ correction_bias,
+    int num_tokens, int num_experts, int topk, int block_width,
+    bool renormalize, float moe_softcapping, bool has_correction_bias) {
   extern __shared__ unsigned char smem[];
-  float* logits_or_probs = reinterpret_cast<float*>(smem);
-  float* choice = logits_or_probs + block_width;
-  float* reduce_vals = choice + block_width;
-  int32_t* reduce_idxs = reinterpret_cast<int32_t*>(reduce_vals + block_width);
-  float* selected_sum = reinterpret_cast<float*>(reduce_idxs + block_width);
+  float *logits_or_probs = reinterpret_cast<float *>(smem);
+  float *choice = logits_or_probs + block_width;
+  float *reduce_vals = choice + block_width;
+  int32_t *reduce_idxs = reinterpret_cast<int32_t *>(reduce_vals + block_width);
+  float *selected_sum = reinterpret_cast<float *>(reduce_idxs + block_width);
 
   const int tid = threadIdx.x;
   const int row = blockIdx.x;
@@ -1217,7 +772,8 @@ __global__ void topk_block_kernel(
       if (tid < stride) {
         const float rhs_val = reduce_vals[tid + stride];
         const int rhs_idx = reduce_idxs[tid + stride];
-        if (rhs_val > reduce_vals[tid] || (rhs_val == reduce_vals[tid] && rhs_idx < reduce_idxs[tid])) {
+        if (rhs_val > reduce_vals[tid] ||
+            (rhs_val == reduce_vals[tid] && rhs_idx < reduce_idxs[tid])) {
           reduce_vals[tid] = rhs_val;
           reduce_idxs[tid] = rhs_idx;
         }
@@ -1252,24 +808,23 @@ int next_power_of_2(int value) {
 }
 
 template <typename T, bool IsSoftmax>
-void launch_topk(
-    ffi::TensorView topk_weights,
-    ffi::TensorView topk_ids,
-    ffi::TensorView gating_output,
-    bool renormalize,
-    float moe_softcapping,
-    ffi::TensorView correction_bias,
-    bool has_correction_bias) {
+void launch_topk(ffi::TensorView topk_weights, ffi::TensorView topk_ids,
+                 ffi::TensorView gating_output, bool renormalize,
+                 float moe_softcapping, ffi::TensorView correction_bias,
+                 bool has_correction_bias) {
   const int num_tokens = static_cast<int>(gating_output.size(0));
   const int num_experts = static_cast<int>(gating_output.size(1));
   const int topk = static_cast<int>(topk_weights.size(1));
   if (num_tokens == 0 || topk == 0) {
     return;
   }
-  const float* bias_ptr = has_correction_bias ? static_cast<const float*>(correction_bias.data_ptr()) : nullptr;
-  const T* input_ptr = static_cast<const T*>(gating_output.data_ptr());
-  float* weights_ptr = static_cast<float*>(topk_weights.data_ptr());
-  int32_t* ids_ptr = static_cast<int32_t*>(topk_ids.data_ptr());
+  const float *bias_ptr =
+      has_correction_bias
+          ? static_cast<const float *>(correction_bias.data_ptr())
+          : nullptr;
+  const T *input_ptr = static_cast<const T *>(gating_output.data_ptr());
+  float *weights_ptr = static_cast<float *>(topk_weights.data_ptr());
+  int32_t *ids_ptr = static_cast<int32_t *>(topk_ids.data_ptr());
 
   ffi::MUSADeviceGuard device_guard(gating_output.device().device_id);
   musaStream_t stream = get_stream(gating_output.device());
@@ -1281,23 +836,31 @@ void launch_topk(
       if (topk == 8 && !has_correction_bias && moe_softcapping <= 0.0f) {
         if (renormalize) {
           const int halfwarp_rows_per_cta = kWarpsPerCta * 2;
-          const int halfwarp_blocks = (num_tokens + halfwarp_rows_per_cta - 1) / halfwarp_rows_per_cta;
+          const int halfwarp_blocks =
+              (num_tokens + halfwarp_rows_per_cta - 1) / halfwarp_rows_per_cta;
           topk_softmax_no_bias_renorm_halfwarp_kernel_fixed_k<T, 256, 8>
-              <<<halfwarp_blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(input_ptr, weights_ptr, ids_ptr, num_tokens);
+              <<<halfwarp_blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                  input_ptr, weights_ptr, ids_ptr, num_tokens);
         } else {
           topk_softmax_no_bias_warp_kernel_fixed_k<T, 256, values_per_thread, 8>
-              <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(input_ptr, weights_ptr, ids_ptr, num_tokens, renormalize);
+              <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                  input_ptr, weights_ptr, ids_ptr, num_tokens, renormalize);
         }
       } else {
-        topk_softmax_warp_kernel<T, 256, values_per_thread><<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
-            input_ptr, weights_ptr, ids_ptr, bias_ptr, num_tokens, topk, renormalize, moe_softcapping, has_correction_bias);
+        topk_softmax_warp_kernel<T, 256, values_per_thread>
+            <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                input_ptr, weights_ptr, ids_ptr, bias_ptr, num_tokens, topk,
+                renormalize, moe_softcapping, has_correction_bias);
       }
     } else if (!has_correction_bias) {
-        topk_sigmoid_no_bias_warp_kernel<T, 256, values_per_thread><<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
-            input_ptr, weights_ptr, ids_ptr, num_tokens, topk, renormalize);
+      topk_sigmoid_no_bias_warp_kernel<T, 256, values_per_thread>
+          <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+              input_ptr, weights_ptr, ids_ptr, num_tokens, topk, renormalize);
     } else {
-        topk_sigmoid_warp_kernel<T, 256, values_per_thread><<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
-            input_ptr, weights_ptr, ids_ptr, bias_ptr, num_tokens, topk, renormalize, has_correction_bias);
+      topk_sigmoid_warp_kernel<T, 256, values_per_thread>
+          <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+              input_ptr, weights_ptr, ids_ptr, bias_ptr, num_tokens, topk,
+              renormalize, has_correction_bias);
     }
   } else if (num_experts == 512) {
     constexpr int values_per_thread = 16;
@@ -1306,23 +869,31 @@ void launch_topk(
       if (topk == 8 && !has_correction_bias && moe_softcapping <= 0.0f) {
         if (renormalize) {
           const int halfwarp_rows_per_cta = kWarpsPerCta * 2;
-          const int halfwarp_blocks = (num_tokens + halfwarp_rows_per_cta - 1) / halfwarp_rows_per_cta;
+          const int halfwarp_blocks =
+              (num_tokens + halfwarp_rows_per_cta - 1) / halfwarp_rows_per_cta;
           topk_softmax_no_bias_renorm_halfwarp_kernel_fixed_k<T, 512, 8>
-              <<<halfwarp_blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(input_ptr, weights_ptr, ids_ptr, num_tokens);
+              <<<halfwarp_blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                  input_ptr, weights_ptr, ids_ptr, num_tokens);
         } else {
           topk_softmax_no_bias_warp_kernel_fixed_k<T, 512, values_per_thread, 8>
-              <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(input_ptr, weights_ptr, ids_ptr, num_tokens, renormalize);
+              <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                  input_ptr, weights_ptr, ids_ptr, num_tokens, renormalize);
         }
       } else {
-        topk_softmax_warp_kernel<T, 512, values_per_thread><<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
-            input_ptr, weights_ptr, ids_ptr, bias_ptr, num_tokens, topk, renormalize, moe_softcapping, has_correction_bias);
+        topk_softmax_warp_kernel<T, 512, values_per_thread>
+            <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                input_ptr, weights_ptr, ids_ptr, bias_ptr, num_tokens, topk,
+                renormalize, moe_softcapping, has_correction_bias);
       }
     } else if (!has_correction_bias) {
-      topk_sigmoid_no_bias_warp_kernel<T, 512, values_per_thread><<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
-          input_ptr, weights_ptr, ids_ptr, num_tokens, topk, renormalize);
+      topk_sigmoid_no_bias_warp_kernel<T, 512, values_per_thread>
+          <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+              input_ptr, weights_ptr, ids_ptr, num_tokens, topk, renormalize);
     } else {
-      topk_sigmoid_warp_kernel<T, 512, values_per_thread><<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
-          input_ptr, weights_ptr, ids_ptr, bias_ptr, num_tokens, topk, renormalize, has_correction_bias);
+      topk_sigmoid_warp_kernel<T, 512, values_per_thread>
+          <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+              input_ptr, weights_ptr, ids_ptr, bias_ptr, num_tokens, topk,
+              renormalize, has_correction_bias);
     }
   } else if (num_experts == 1024) {
     constexpr int values_per_thread = 32;
@@ -1332,63 +903,69 @@ void launch_topk(
         if (renormalize) {
           if constexpr (std::is_same_v<T, half>) {
             topk_softmax_half_e1024_no_bias_renorm_warp_kernel_fixed_k<8>
-                <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(input_ptr, weights_ptr, ids_ptr, num_tokens);
+                <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                    input_ptr, weights_ptr, ids_ptr, num_tokens);
           } else {
-            topk_softmax_no_bias_renorm_warp_kernel_fixed_k<T, 1024, values_per_thread, 8>
-                <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(input_ptr, weights_ptr, ids_ptr, num_tokens);
+            topk_softmax_no_bias_renorm_warp_kernel_fixed_k<
+                T, 1024, values_per_thread, 8>
+                <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                    input_ptr, weights_ptr, ids_ptr, num_tokens);
           }
         } else {
-          topk_softmax_no_bias_warp_kernel_fixed_k<T, 1024, values_per_thread, 8>
-              <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(input_ptr, weights_ptr, ids_ptr, num_tokens, renormalize);
+          topk_softmax_no_bias_warp_kernel_fixed_k<T, 1024, values_per_thread,
+                                                   8>
+              <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                  input_ptr, weights_ptr, ids_ptr, num_tokens, renormalize);
         }
       } else {
-        topk_softmax_warp_kernel<T, 1024, values_per_thread><<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
-            input_ptr, weights_ptr, ids_ptr, bias_ptr, num_tokens, topk, renormalize, moe_softcapping, has_correction_bias);
+        topk_softmax_warp_kernel<T, 1024, values_per_thread>
+            <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                input_ptr, weights_ptr, ids_ptr, bias_ptr, num_tokens, topk,
+                renormalize, moe_softcapping, has_correction_bias);
       }
     } else if (!has_correction_bias) {
       if (topk == 8 && num_tokens <= 512) {
         topk_sigmoid_no_bias_warp_kernel_fixed_k<T, 1024, values_per_thread, 8>
-            <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(input_ptr, weights_ptr, ids_ptr, num_tokens, renormalize);
+            <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                input_ptr, weights_ptr, ids_ptr, num_tokens, renormalize);
       } else {
-        topk_sigmoid_no_bias_warp_kernel<T, 1024, values_per_thread><<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
-            input_ptr, weights_ptr, ids_ptr, num_tokens, topk, renormalize);
+        topk_sigmoid_no_bias_warp_kernel<T, 1024, values_per_thread>
+            <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                input_ptr, weights_ptr, ids_ptr, num_tokens, topk, renormalize);
       }
     } else {
-      topk_sigmoid_warp_kernel<T, 1024, values_per_thread><<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
-          input_ptr, weights_ptr, ids_ptr, bias_ptr, num_tokens, topk, renormalize, has_correction_bias);
+      topk_sigmoid_warp_kernel<T, 1024, values_per_thread>
+          <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+              input_ptr, weights_ptr, ids_ptr, bias_ptr, num_tokens, topk,
+              renormalize, has_correction_bias);
     }
   } else {
     const int block_width = next_power_of_2(num_experts);
-    const size_t smem_bytes = 3 * block_width * sizeof(float) + block_width * sizeof(int32_t) + sizeof(float);
-    topk_block_kernel<T, IsSoftmax><<<num_tokens, block_width, smem_bytes, stream>>>(
-        input_ptr,
-        weights_ptr,
-        ids_ptr,
-        bias_ptr,
-        num_tokens,
-        num_experts,
-        topk,
-        block_width,
-        renormalize,
-        moe_softcapping,
-        has_correction_bias);
+    const size_t smem_bytes = 3 * block_width * sizeof(float) +
+                              block_width * sizeof(int32_t) + sizeof(float);
+    topk_block_kernel<T, IsSoftmax>
+        <<<num_tokens, block_width, smem_bytes, stream>>>(
+            input_ptr, weights_ptr, ids_ptr, bias_ptr, num_tokens, num_experts,
+            topk, block_width, renormalize, moe_softcapping,
+            has_correction_bias);
   }
 
   const musaError_t err = musaGetLastError();
-  TVM_FFI_ICHECK_EQ(err, musaSuccess) << "MUSA topk kernel failed: " << musaGetErrorString(err);
+  TVM_FFI_ICHECK_EQ(err, musaSuccess)
+      << "MUSA topk kernel failed: " << musaGetErrorString(err);
 }
 
-void check_topk_inputs(
-    ffi::TensorView topk_weights,
-    ffi::TensorView topk_ids,
-    ffi::TensorView gating_output,
-    ffi::TensorView correction_bias,
-    bool has_correction_bias) {
+void check_topk_inputs(ffi::TensorView topk_weights, ffi::TensorView topk_ids,
+                       ffi::TensorView gating_output,
+                       ffi::TensorView correction_bias,
+                       bool has_correction_bias) {
   CHECK_MUSA_CONTIGUOUS(topk_weights);
   CHECK_MUSA_CONTIGUOUS(topk_ids);
   CHECK_MUSA_CONTIGUOUS(gating_output);
-  TVM_FFI_ICHECK_EQ(topk_weights.device().device_id, gating_output.device().device_id);
-  TVM_FFI_ICHECK_EQ(topk_ids.device().device_id, gating_output.device().device_id);
+  TVM_FFI_ICHECK_EQ(topk_weights.device().device_id,
+                    gating_output.device().device_id);
+  TVM_FFI_ICHECK_EQ(topk_ids.device().device_id,
+                    gating_output.device().device_id);
   TVM_FFI_ICHECK_EQ(gating_output.ndim(), 2);
   TVM_FFI_ICHECK_EQ(topk_weights.ndim(), 2);
   TVM_FFI_ICHECK_EQ(topk_ids.ndim(), 2);
@@ -1401,7 +978,8 @@ void check_topk_inputs(
   TVM_FFI_ICHECK(dtype_equal(topk_ids.dtype(), dl_int32));
   if (has_correction_bias) {
     CHECK_MUSA_CONTIGUOUS(correction_bias);
-    TVM_FFI_ICHECK_EQ(correction_bias.device().device_id, gating_output.device().device_id);
+    TVM_FFI_ICHECK_EQ(correction_bias.device().device_id,
+                      gating_output.device().device_id);
     TVM_FFI_ICHECK_EQ(correction_bias.ndim(), 1);
     TVM_FFI_ICHECK_EQ(correction_bias.size(0), gating_output.size(1));
     TVM_FFI_ICHECK(dtype_equal(correction_bias.dtype(), dl_float32));
@@ -1409,57 +987,49 @@ void check_topk_inputs(
 }
 
 template <bool IsSoftmax>
-void dispatch_topk(
-    ffi::TensorView topk_weights,
-    ffi::TensorView topk_ids,
-    ffi::TensorView gating_output,
-    bool renormalize,
-    float moe_softcapping,
-    ffi::TensorView correction_bias,
-    bool has_correction_bias) {
+void dispatch_topk(ffi::TensorView topk_weights, ffi::TensorView topk_ids,
+                   ffi::TensorView gating_output, bool renormalize,
+                   float moe_softcapping, ffi::TensorView correction_bias,
+                   bool has_correction_bias) {
   if (dtype_equal(gating_output.dtype(), dl_float32)) {
-    launch_topk<float, IsSoftmax>(
-        topk_weights, topk_ids, gating_output, renormalize, moe_softcapping, correction_bias, has_correction_bias);
+    launch_topk<float, IsSoftmax>(topk_weights, topk_ids, gating_output,
+                                  renormalize, moe_softcapping, correction_bias,
+                                  has_correction_bias);
   } else if (dtype_equal(gating_output.dtype(), dl_float16)) {
-    launch_topk<half, IsSoftmax>(
-        topk_weights, topk_ids, gating_output, renormalize, moe_softcapping, correction_bias, has_correction_bias);
+    launch_topk<half, IsSoftmax>(topk_weights, topk_ids, gating_output,
+                                 renormalize, moe_softcapping, correction_bias,
+                                 has_correction_bias);
   } else if (dtype_equal(gating_output.dtype(), dl_bfloat16)) {
-    launch_topk<__mt_bfloat16, IsSoftmax>(
-        topk_weights, topk_ids, gating_output, renormalize, moe_softcapping, correction_bias, has_correction_bias);
+    launch_topk<__mt_bfloat16, IsSoftmax>(topk_weights, topk_ids, gating_output,
+                                          renormalize, moe_softcapping,
+                                          correction_bias, has_correction_bias);
   } else {
     TVM_FFI_THROW(ValueError) << "Unsupported gating_output dtype";
   }
 }
 
-void sgl_musa_topk_softmax(
-    ffi::TensorView topk_weights,
-    ffi::TensorView topk_ids,
-    ffi::TensorView gating_output,
-    bool renormalize,
-    double moe_softcapping,
-    ffi::TensorView correction_bias,
-    bool has_correction_bias) {
-  check_topk_inputs(topk_weights, topk_ids, gating_output, correction_bias, has_correction_bias);
-  dispatch_topk<true>(
-      topk_weights,
-      topk_ids,
-      gating_output,
-      renormalize,
-      static_cast<float>(moe_softcapping),
-      correction_bias,
-      has_correction_bias);
+void sgl_musa_topk_softmax(ffi::TensorView topk_weights,
+                           ffi::TensorView topk_ids,
+                           ffi::TensorView gating_output, bool renormalize,
+                           double moe_softcapping,
+                           ffi::TensorView correction_bias,
+                           bool has_correction_bias) {
+  check_topk_inputs(topk_weights, topk_ids, gating_output, correction_bias,
+                    has_correction_bias);
+  dispatch_topk<true>(topk_weights, topk_ids, gating_output, renormalize,
+                      static_cast<float>(moe_softcapping), correction_bias,
+                      has_correction_bias);
 }
 
-void sgl_musa_topk_sigmoid(
-    ffi::TensorView topk_weights,
-    ffi::TensorView topk_ids,
-    ffi::TensorView gating_output,
-    bool renormalize,
-    ffi::TensorView correction_bias,
-    bool has_correction_bias) {
-  check_topk_inputs(topk_weights, topk_ids, gating_output, correction_bias, has_correction_bias);
-  dispatch_topk<false>(
-      topk_weights, topk_ids, gating_output, renormalize, 0.0f, correction_bias, has_correction_bias);
+void sgl_musa_topk_sigmoid(ffi::TensorView topk_weights,
+                           ffi::TensorView topk_ids,
+                           ffi::TensorView gating_output, bool renormalize,
+                           ffi::TensorView correction_bias,
+                           bool has_correction_bias) {
+  check_topk_inputs(topk_weights, topk_ids, gating_output, correction_bias,
+                    has_correction_bias);
+  dispatch_topk<false>(topk_weights, topk_ids, gating_output, renormalize, 0.0f,
+                       correction_bias, has_correction_bias);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sgl_musa_topk_softmax, sgl_musa_topk_softmax);
