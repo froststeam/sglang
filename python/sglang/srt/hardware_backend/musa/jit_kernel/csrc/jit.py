@@ -13,9 +13,10 @@ import tvm_ffi.cpp.extension as tvm_ffi_ext
 from tvm_ffi.libinfo import find_dlpack_include_path, find_include_path, find_libtvm_ffi
 from tvm_ffi.utils import FileLock
 
-
 _CSRC_DIR = Path(__file__).resolve().parent
-_CACHE_DIR = Path(os.getenv("SGLANG_MUSA_JIT_CACHE_DIR", Path.home() / ".cache" / "sglang_musa_jit"))
+_CACHE_DIR = Path(
+    os.getenv("SGLANG_MUSA_JIT_CACHE_DIR", Path.home() / ".cache" / "sglang_musa_jit")
+)
 
 
 def _parse_env_flags(name: str) -> list[str]:
@@ -50,8 +51,7 @@ def _musa_arch_flags() -> list[str]:
     )
     if arch_list:
         return [
-            f"--offload-arch={_normalize_musa_arch(arch)}"
-            for arch in arch_list.split()
+            f"--offload-arch={_normalize_musa_arch(arch)}" for arch in arch_list.split()
         ]
     try:
         import torch_musa
@@ -151,7 +151,12 @@ def _ninja_content(
         rule = "compile_musa" if source.suffix in {".mu", ".cu"} else "compile"
         lines.append(f"build {objects[-1]}: {rule} {_escape(source)}")
     output_so = _escape(build_dir / f"{name}.so")
-    lines += ["", f"build {output_so}: link {' '.join(objects)}", f"default {output_so}", ""]
+    lines += [
+        "",
+        f"build {output_so}: link {' '.join(objects)}",
+        f"default {output_so}",
+        "",
+    ]
     return "\n".join(lines)
 
 

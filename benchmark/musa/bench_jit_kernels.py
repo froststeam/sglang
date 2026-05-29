@@ -6,8 +6,17 @@ import argparse
 import os
 
 import torch
-
 from mate.testing.utils import bench_kineto
+
+from sglang.jit_kernel.triton.gdn_fused_proj import (
+    fused_qkvzba_split_reshape_cat_contiguous as triton_gdn,
+)
+from sglang.srt.hardware_backend.musa.jit_kernel.csrc import (
+    per_token_group_quant_8bit,
+    rotary_embedding,
+    topk_sigmoid,
+    topk_softmax,
+)
 from sglang.srt.hardware_backend.musa.jit_kernel.tilelang.causal_conv1d import (
     causal_conv1d_fwd as tilelang_causal_conv1d_fwd,
 )
@@ -17,20 +26,11 @@ from sglang.srt.hardware_backend.musa.jit_kernel.tilelang.fla.gdn_fused_proj imp
 from sglang.srt.hardware_backend.musa.jit_kernel.tilelang.fla.layernorm_gated import (
     rms_norm_gated as tilelang_rms_norm_gated,
 )
-from sglang.srt.hardware_backend.musa.jit_kernel.csrc import (
-    per_token_group_quant_8bit,
-    rotary_embedding,
-    topk_sigmoid,
-    topk_softmax,
-)
-from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-    causal_conv1d_fn as triton_causal_conv1d_fwd,
-)
 from sglang.srt.layers.attention.fla.layernorm_gated import (
     rms_norm_gated as triton_rms_norm_gated,
 )
-from sglang.jit_kernel.triton.gdn_fused_proj import (
-    fused_qkvzba_split_reshape_cat_contiguous as triton_gdn,
+from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    causal_conv1d_fn as triton_causal_conv1d_fwd,
 )
 
 
@@ -221,8 +221,7 @@ def bench_gdn_qkvzba(num_tests: int) -> None:
         )
         torch.musa.synchronize()
         max_diff = max(
-            float((x - y).abs().max().item())
-            for x, y in zip(out_tilelang, out_triton)
+            float((x - y).abs().max().item()) for x, y in zip(out_tilelang, out_triton)
         )
 
         def run_tilelang() -> None:

@@ -1,5 +1,11 @@
 """Public MUSA JIT kernel entry points."""
 
+from sglang.srt.hardware_backend.musa.jit_kernel.csrc import (
+    per_token_group_quant_8bit,
+    rotary_embedding,
+    topk_sigmoid,
+    topk_softmax,
+)
 from sglang.srt.hardware_backend.musa.jit_kernel.tilelang import (
     RMSNorm,
     causal_conv1d_fn,
@@ -7,12 +13,6 @@ from sglang.srt.hardware_backend.musa.jit_kernel.tilelang import (
     fused_qkvzba_split_reshape_cat_contiguous,
     layernorm_fn,
     rms_norm_gated,
-)
-from sglang.srt.hardware_backend.musa.jit_kernel.csrc import (
-    per_token_group_quant_8bit,
-    rotary_embedding,
-    topk_sigmoid,
-    topk_softmax,
 )
 
 __all__ = [
