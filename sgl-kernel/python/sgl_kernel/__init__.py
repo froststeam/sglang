@@ -135,6 +135,7 @@ else:
             musa_fused_mul_add,
             musa_rotary_embedding_contiguous,
             top_k_top_p_sampling_from_probs,
+            top_p_sampling_from_probs,
         )
 
     _DEBUG_EXPORT_NAMES = [

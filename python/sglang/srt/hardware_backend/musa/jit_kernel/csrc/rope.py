@@ -82,7 +82,9 @@ def _rotary_embedding_kernel(
     is_neox: bool,
     has_key: bool,
 ) -> None:
-    _rope_module(_musa_arch_tag(), _store_hint(int(num_tokens), int(rot_dim))).sgl_rotary_embedding(
+    _rope_module(
+        _musa_arch_tag(), _store_hint(int(num_tokens), int(rot_dim))
+    ).sgl_rotary_embedding(
         positions,
         query,
         key,

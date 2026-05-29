@@ -679,18 +679,14 @@ def _causal_conv1d_prefill_width4_kernel(
                                     state_base + state_stride_token
                                 ]
                                 conv_states[state_base + state_stride_token] = (
-                                    conv_states[
-                                        state_base + 2 * state_stride_token
-                                    ]
+                                    conv_states[state_base + 2 * state_stride_token]
                                 )
                             else:
                                 conv_states[state_base] = T.Cast(dtype, 0.0)
                                 conv_states[state_base + state_stride_token] = T.Cast(
                                     dtype, 0.0
                                 )
-                            conv_states[state_base + 2 * state_stride_token] = x[
-                                x_base
-                            ]
+                            conv_states[state_base + 2 * state_stride_token] = x[x_base]
                         else:
                             if load_init:
                                 conv_states[state_base] = conv_states[

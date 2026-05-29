@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from typing import Union
 
 import torch
-
 from mate.testing.utils import bench_kineto
+
 from sglang.srt.hardware_backend.musa.jit_kernel.tilelang.causal_conv1d import (
     causal_conv1d_fwd as tilelang_causal_conv1d_fwd,
 )
@@ -81,12 +81,16 @@ def _make_inputs(case: Case, dtype: torch.dtype, width: int):
         dtype=torch.int32,
         device=device,
     )
-    x = torch.randn(
-        total_tokens,
-        case.dim,
-        dtype=dtype,
-        device=device,
-    ).contiguous().t()
+    x = (
+        torch.randn(
+            total_tokens,
+            case.dim,
+            dtype=dtype,
+            device=device,
+        )
+        .contiguous()
+        .t()
+    )
     weight = torch.randn((case.dim, width), dtype=dtype, device=device)
     bias = torch.randn((case.dim,), dtype=dtype, device=device)
     conv_states = torch.randn(
@@ -124,7 +128,9 @@ def _lower_bound_bytes(case: Case, dtype: torch.dtype, width: int) -> int:
     out_bytes = token_elems * elem_size
     weight_bytes = chunk_elems * width * elem_size
     bias_bytes = chunk_elems * elem_size
-    prior_x_bytes = case.batch * max(chunks_per_seq - 1, 0) * case.dim * state_len * elem_size
+    prior_x_bytes = (
+        case.batch * max(chunks_per_seq - 1, 0) * case.dim * state_len * elem_size
+    )
     state_bytes = case.batch * case.dim * state_len * elem_size * 2
     index_bytes = case.batch * (4 + 1)
     return (

@@ -310,15 +310,25 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.draft_attn_backend, AiterMultiStepDraftBackend
             )
 
-        supports_cuda_draft_extend_graph = (_is_cuda or _is_musa) and (
+        supports_cuda_draft_extend_graph = _is_cuda and (
             isinstance(self.draft_extend_attn_backend, TritonAttnBackend)
             or isinstance(self.draft_extend_attn_backend, TRTLLMMLABackend)
         )
+        supports_musa_draft_extend_graph = False
+        if _is_musa:
+            from sglang.srt.hardware_backend.musa.attention.flashattention_backend import (
+                MusaFlashAttentionBackend,
+            )
+
+            supports_musa_draft_extend_graph = isinstance(
+                self.draft_extend_attn_backend, TritonAttnBackend
+            ) or isinstance(self.draft_extend_attn_backend, MusaFlashAttentionBackend)
         # Capture extend
         # TODO: support draft extend cuda graph for more attention backends
         if self.draft_extend_attn_backend and (
             _is_npu
             or supports_cuda_draft_extend_graph
+            or supports_musa_draft_extend_graph
             or supports_hip_aiter_draft_extend_graph
         ):
             tic = time.perf_counter()

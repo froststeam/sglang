@@ -3,7 +3,6 @@ from importlib import import_module
 import pytest
 import torch
 
-
 pytestmark = pytest.mark.skipif(
     not (hasattr(torch, "musa") and torch.musa.is_available()),
     reason="MUSA device is not available.",
