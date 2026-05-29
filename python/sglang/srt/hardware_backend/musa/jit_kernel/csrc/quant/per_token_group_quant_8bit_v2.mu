@@ -1,6 +1,5 @@
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
 #include <sstream>
 #include <type_traits>
 
@@ -15,84 +14,8 @@
 #include <tvm/ffi/extra/musa/device_guard.h>
 #include <tvm/ffi/function.h>
 
-namespace ffi = tvm::ffi;
-
-constexpr DLDataType dl_float16{kDLFloat, 16, 1};
-constexpr DLDataType dl_float32{kDLFloat, 32, 1};
-constexpr DLDataType dl_bfloat16{kDLBfloat, 16, 1};
-constexpr DLDataType dl_int8{kDLInt, 8, 1};
-constexpr DLDataType dl_float8_e4m3fn{kDLFloat8_e4m3fn, 8, 1};
-
-inline bool dtype_equal(DLDataType lhs, DLDataType rhs) {
-  return lhs.code == rhs.code && lhs.bits == rhs.bits && lhs.lanes == rhs.lanes;
-}
-
-inline int64_t tensor_numel(ffi::TensorView tensor) {
-  int64_t numel = 1;
-  for (int i = 0; i < tensor.ndim(); ++i) {
-    numel *= tensor.size(i);
-  }
-  return numel;
-}
-
-inline musaStream_t get_stream(DLDevice device) {
-  return static_cast<musaStream_t>(TVMFFIEnvGetStream(device.device_type, device.device_id));
-}
-
-#define TORCH_CHECK(cond, ...) TVM_FFI_ICHECK(cond)
-#define CHECK_EQ(a, b) TVM_FFI_ICHECK_EQ((a), (b))
-#define CHECK_INPUT(x)                                      \
-  TVM_FFI_ICHECK_EQ((x).device().device_type, kDLExtDev);   \
-  TVM_FFI_ICHECK((x).IsContiguous())
-
-template <int THREADS_PER_SUBWARP>
-__device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
-  static_assert(
-      (THREADS_PER_SUBWARP & (THREADS_PER_SUBWARP - 1)) == 0 && THREADS_PER_SUBWARP <= 32 && THREADS_PER_SUBWARP >= 1,
-      "THREADS_PER_SUBWARP must be 1, 2, 4, 8, 16, or 32");
-
-  constexpr unsigned subwarp_mask_bits =
-      THREADS_PER_SUBWARP == 32 ? 0xffffffffu : ((1u << THREADS_PER_SUBWARP) - 1u);
-  const unsigned mask = subwarp_mask_bits << (threadIdx.x - tid);
-
-  if constexpr (THREADS_PER_SUBWARP >= 32) {
-    val = fmaxf(val, __shfl_xor_sync(mask, val, 16));
-  }
-  if constexpr (THREADS_PER_SUBWARP >= 16) {
-    val = fmaxf(val, __shfl_xor_sync(mask, val, 8));
-  }
-  if constexpr (THREADS_PER_SUBWARP >= 8) {
-    val = fmaxf(val, __shfl_xor_sync(mask, val, 4));
-  }
-  if constexpr (THREADS_PER_SUBWARP >= 4) {
-    val = fmaxf(val, __shfl_xor_sync(mask, val, 2));
-  }
-  if constexpr (THREADS_PER_SUBWARP >= 2) {
-    val = fmaxf(val, __shfl_xor_sync(mask, val, 1));
-  }
-  return val;
-}
-
-__device__ __forceinline__ float silu(const float& val) {
-#if defined(__MUSA_ARCH__) && (__MUSA_ARCH__ >= 1000)
-  float half = 0.5f * val;
-  float t = __tanhf(half);
-  return half * (1.0f + t);
-#else
-  return val / (1.0f + __expf(-val));
-#endif
-}
-
-__device__ float2 fmul2_rn(float2 a, float2 b) {
-#if defined(__MUSA_ARCH__) && (__MUSA_ARCH__ >= 1000)
-  return __fmul2_rn(a, b);
-#else
-  float2 result;
-  result.x = a.x * b.x;
-  result.y = a.y * b.y;
-  return result;
-#endif
-}
+#include "../common.h"
+#include "../device_utils.h"
 
 // Copied and modified from DeepEP
 __forceinline__ __device__ float fast_pow2(int x) {
@@ -133,26 +56,6 @@ __forceinline__ __device__ OUT_DTYPE_T extract_required_scale_format(float value
   }
 }
 
-__device__ __forceinline__ void st_global(const int4* ptr, const int4& value) {
-  int4* p = const_cast<int4*>(ptr);
-  *p = value;
-}
-
-__device__ __forceinline__ int4 ld_global_nc(const int4* ptr) {
-  return *ptr;
-}
-
-__device__ __forceinline__ void st_global_b64_slc_new(uint64_t* ptr, const uint64_t value) {
-#if defined(__MUSA_ARCH__) && (__MUSA_ARCH__ == 310)
-  asm volatile(
-      "LSU.ST.B64 %1, %0, _, 8, 1, 1, inner_persist=4, outer_persist=2, chrnt=l2_l3, slc=new, persist=0, stride_add_first=0"
-      :
-      : "R"(ptr), "R"(value));
-#else
-  *ptr = value;
-#endif
-}
-
 template <typename T>
 struct DtypeInfo;
 
@@ -183,65 +86,7 @@ __device__ __forceinline__ int compute_input_group_start_offset(
 constexpr float LOCAL_ABSMAX_ABS = 1e-10;
 constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
 constexpr uint32_t FP8_FAST_VEC_ELEMS = 4;
-
-struct NaiveScheduler {
-  static void compute_exec_config(
-      int threads_per_subwarp,
-      int num_local_experts,
-      int hidden_dim_num_groups,
-      int num_groups,
-      int& subwarps_per_block,
-      dim3& grid,
-      dim3& block) {
-    subwarps_per_block = ([=]() -> int {
-      if (num_groups % 16 == 0) {
-        return 16;
-      } else if (num_groups % 8 == 0) {
-        return 8;
-      } else if (num_groups % 4 == 0) {
-        return 4;
-      } else if (num_groups % 2 == 0) {
-        return 2;
-      }
-      return 1;
-    })();
-    grid = dim3(num_groups / subwarps_per_block);
-    block = dim3(subwarps_per_block * threads_per_subwarp);
-  }
-
-  template <bool FUSE_SILU_AND_MUL, int GROUP_SIZE, int THREADS_PER_SUBWARP, typename FUNC>
-  __device__ __forceinline__ static void execute(
-      const int subwarps_per_block,
-      const int hidden_dim_num_groups,
-      const int32_t* masked_m,
-      const int num_tokens_per_expert,
-      FUNC fn) {
-    constexpr int expert_idx = 0;
-
-    const int64_t subwarp_id = threadIdx.x / THREADS_PER_SUBWARP;
-    const int lane_id = threadIdx.x % THREADS_PER_SUBWARP;
-
-    const int64_t block_group_id = blockIdx.x * subwarps_per_block;
-    const int64_t group_id = block_group_id + subwarp_id;
-
-    int64_t input_group_start_offset;
-    if constexpr (!FUSE_SILU_AND_MUL) {
-      input_group_start_offset = group_id * GROUP_SIZE;
-    }
-
-    const int token_idx = group_id / hidden_dim_num_groups;
-    // At the hidden_size dimension, we are handling idx-th group
-    const int hidden_dim_group_idx = group_id % hidden_dim_num_groups;
-
-    if constexpr (FUSE_SILU_AND_MUL) {
-      const int hidden_size = hidden_dim_num_groups * GROUP_SIZE;
-      input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
-          expert_idx, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert, GROUP_SIZE);
-    }
-
-    fn(expert_idx, token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
-  }
-};
+constexpr int BF16_FP8_G128_THREADS_PER_GROUP = 16;
 
 struct RowScheduler {
   static void compute_exec_config(
@@ -360,7 +205,6 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int num_tokens_per_expert) {
   using dst_dtype_info = DtypeInfo<DST_DTYPE>;
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
-  static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
   SCHEDULER::template execute<FUSE_SILU_AND_MUL, GROUP_SIZE, THREADS_PER_SUBWARP>(
       subwarps_per_block,
@@ -380,11 +224,9 @@ __global__ void per_token_group_quant_8bit_kernel(
 
         int4 input_primary_int4[INPUT_PRIMARY_INT4_SIZE];
         T* input_primary_vec = reinterpret_cast<T*>(input_primary_int4);
-        static_assert(sizeof(input_primary_vec[0]) * INPUT_PRIMARY_VEC_SIZE == sizeof(input_primary_int4));
 
         int4 input_secondary_int4[INPUT_PRIMARY_INT4_SIZE];
         T* input_secondary_vec = reinterpret_cast<T*>(input_secondary_int4);
-        static_assert(sizeof(input_secondary_vec[0]) * INPUT_PRIMARY_VEC_SIZE == sizeof(input_secondary_int4));
 
 #pragma unroll
         for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
@@ -414,7 +256,6 @@ __global__ void per_token_group_quant_8bit_kernel(
                           hidden_idx_packed * scale_hidden_stride * num_elems_per_pack +
                           token_idx * scale_token_stride * num_elems_per_pack + pack_idx);
         } else {
-          static_assert(!SCALE_UE8M0);
           scale_output = output_s + offset_num_groups;
         }
 
@@ -450,19 +291,14 @@ __global__ void per_token_group_quant_8bit_kernel(
 
         float y_scale, y_scale_inv;
         calculate_fp8_scales<SCALE_UE8M0, dst_dtype_info>(local_absmax, y_scale, y_scale_inv);
-        float2 y_scale_repeated = {y_scale, y_scale};
-
         if (lane_id == 0) {
           *scale_output = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
         }
 
         int4 output_buf;
-        static_assert(sizeof(output_buf) == INPUT_PRIMARY_VEC_SIZE * sizeof(DST_DTYPE));
 
         if constexpr (std::is_same_v<DST_DTYPE, __mt_fp8_e4m3>) {
           const auto output_buf_ptr = reinterpret_cast<__mt_fp8x4_storage_t*>(&output_buf);
-          static_assert(sizeof(output_buf) == INPUT_PRIMARY_VEC_SIZE / 4 * sizeof(__mt_fp8x4_storage_t));
-          static_assert(INPUT_PRIMARY_VEC_SIZE % 4 == 0);
 
 #pragma unroll
           for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; j += 4) {
@@ -490,18 +326,35 @@ __global__ void per_token_group_quant_8bit_kernel(
       });
 }
 
-template <int GROUP_SIZE, int THREADS_PER_GROUP, bool IS_COLUMN_MAJOR = false, bool FUSE_SILU_AND_MUL = false>
-__global__ void per_token_group_quant_8bit_fp8_fast_kernel(
+template <typename DST_DTYPE>
+__device__ __forceinline__ uint32_t pack_quant4(const float values[FP8_FAST_VEC_ELEMS], const float y_scale) {
+  if constexpr (std::is_same_v<DST_DTYPE, __mt_fp8_e4m3>) {
+    float4 outputx4 = {values[0] * y_scale, values[1] * y_scale, values[2] * y_scale, values[3] * y_scale};
+    return __musa_cvt_float4_to_fp8x4(outputx4, __MT_SATFINITE, __MT_E4M3);
+  } else {
+    DST_DTYPE packed[FP8_FAST_VEC_ELEMS];
+#pragma unroll
+    for (uint32_t j = 0; j < FP8_FAST_VEC_ELEMS; ++j) {
+      const float q_val = fminf(fmaxf(values[j] * y_scale, DtypeInfo<DST_DTYPE>::MIN), DtypeInfo<DST_DTYPE>::MAX);
+      packed[j] = DST_DTYPE(q_val);
+    }
+    return *reinterpret_cast<uint32_t*>(packed);
+  }
+}
+
+template <
+    int GROUP_SIZE,
+    int THREADS_PER_GROUP,
+    typename DST_DTYPE,
+    bool IS_COLUMN_MAJOR = false,
+    bool FUSE_SILU_AND_MUL = false>
+__global__ void per_token_group_quant_8bit_fast_kernel(
     const half* __restrict__ input,
-    __mt_fp8_e4m3* __restrict__ output_q,
+    DST_DTYPE* __restrict__ output_q,
     float* __restrict__ output_s,
     const int hidden_dim_num_groups,
     const int scale_hidden_stride,
     const int num_tokens_per_expert) {
-  static_assert(GROUP_SIZE == THREADS_PER_GROUP * FP8_FAST_VEC_ELEMS);
-  static_assert(FP8_FAST_VEC_ELEMS * sizeof(half) == sizeof(uint64_t));
-  static_assert(FP8_FAST_VEC_ELEMS * sizeof(__mt_fp8_e4m3) == sizeof(uint32_t));
-
   const int subwarp_id = threadIdx.x / THREADS_PER_GROUP;
   const int lane_id = threadIdx.x - subwarp_id * THREADS_PER_GROUP;
   const int subwarps_per_block = blockDim.x / THREADS_PER_GROUP;
@@ -540,8 +393,8 @@ __global__ void per_token_group_quant_8bit_fp8_fast_kernel(
   }
 
   local_absmax = GroupReduceMax<THREADS_PER_GROUP>(local_absmax, lane_id);
-  const float y_scale_inv = local_absmax * (1.0f / DtypeInfo<__mt_fp8_e4m3>::MAX);
-  const float y_scale = DtypeInfo<__mt_fp8_e4m3>::MAX / local_absmax;
+  const float y_scale_inv = local_absmax * (1.0f / DtypeInfo<DST_DTYPE>::MAX);
+  const float y_scale = DtypeInfo<DST_DTYPE>::MAX / local_absmax;
 
   if (lane_id == 0) {
     if constexpr (IS_COLUMN_MAJOR) {
@@ -552,12 +405,7 @@ __global__ void per_token_group_quant_8bit_fp8_fast_kernel(
   }
 
   const int output_offset = (token_idx * hidden_dim_num_groups + hidden_dim_group_idx) * GROUP_SIZE + elem_offset;
-  uint32_t output_buf;
-  auto output_buf_ptr = reinterpret_cast<__mt_fp8x4_storage_t*>(&output_buf);
-
-  float4 outputx4 = {values[0] * y_scale, values[1] * y_scale, values[2] * y_scale, values[3] * y_scale};
-  output_buf_ptr[0] = __musa_cvt_float4_to_fp8x4(outputx4, __MT_SATFINITE, __MT_E4M3);
-
+  const uint32_t output_buf = pack_quant4<DST_DTYPE>(values, y_scale);
   *reinterpret_cast<uint32_t*>(output_q + output_offset) = output_buf;
 }
 
@@ -569,10 +417,6 @@ __global__ void per_token_group_quant_8bit_fp8_col_tiled_kernel(
     const int hidden_dim_num_groups,
     const int scale_hidden_stride,
     const int num_tokens_per_expert) {
-  static_assert(GROUP_SIZE == THREADS_PER_GROUP * FP8_FAST_VEC_ELEMS);
-  static_assert(FP8_FAST_VEC_ELEMS * sizeof(half) == sizeof(uint64_t));
-  static_assert(FP8_FAST_VEC_ELEMS * sizeof(__mt_fp8_e4m3) == sizeof(uint32_t));
-
   const int subwarp_id = threadIdx.x / THREADS_PER_GROUP;
   const int lane_id = threadIdx.x - subwarp_id * THREADS_PER_GROUP;
   const int token_tile_idx = subwarp_id / HIDDEN_GROUPS_PER_BLOCK;
@@ -619,23 +463,18 @@ __global__ void per_token_group_quant_8bit_fp8_col_tiled_kernel(
 }
 
 template <int THREADS_PER_GROUP>
-__global__ void per_token_group_quant_8bit_bf16_fp8_g128_row_kernel(
+__device__ __forceinline__ void quantize_bf16_fp8_g128_group(
     const __mt_bfloat16* __restrict__ input,
     __mt_fp8_e4m3* __restrict__ output_q,
     float* __restrict__ output_s,
-    const int hidden_dim_num_groups) {
+    const int hidden_dim_num_groups,
+    const int token_idx,
+    const int hidden_dim_group_idx) {
   constexpr int GROUP_SIZE = 128;
   constexpr int ELEMS_PER_THREAD = GROUP_SIZE / THREADS_PER_GROUP;
-  static_assert(THREADS_PER_GROUP == 8 || THREADS_PER_GROUP == 16 || THREADS_PER_GROUP == 32);
-  static_assert(ELEMS_PER_THREAD % 4 == 0);
 
-  const int subwarp_id = threadIdx.x / THREADS_PER_GROUP;
-  const int lane_id = threadIdx.x - subwarp_id * THREADS_PER_GROUP;
-  const int subwarps_per_block = blockDim.x / THREADS_PER_GROUP;
-
-  const int token_idx = blockIdx.y;
-  const int hidden_dim_group_idx = blockIdx.x * subwarps_per_block + subwarp_id;
   const int hidden_size = hidden_dim_num_groups * GROUP_SIZE;
+  const int lane_id = threadIdx.x % THREADS_PER_GROUP;
   const int elem_offset = lane_id * ELEMS_PER_THREAD;
   const int input_offset = token_idx * hidden_size + hidden_dim_group_idx * GROUP_SIZE + elem_offset;
 
@@ -702,71 +541,39 @@ __global__ void per_token_group_quant_8bit_bf16_fp8_g128_row_kernel(
   }
 }
 
-template <int GROUP_SIZE, int THREADS_PER_GROUP, bool FUSE_SILU_AND_MUL = false>
-__global__ void per_token_group_quant_8bit_i8_fast_kernel(
-    const half* __restrict__ input,
-    int8_t* __restrict__ output_q,
+template <int THREADS_PER_GROUP>
+__global__ void per_token_group_quant_8bit_bf16_fp8_g128_row_kernel(
+    const __mt_bfloat16* __restrict__ input,
+    __mt_fp8_e4m3* __restrict__ output_q,
+    float* __restrict__ output_s,
+    const int hidden_dim_num_groups) {
+  const int subwarp_id = threadIdx.x / THREADS_PER_GROUP;
+  const int subwarps_per_block = blockDim.x / THREADS_PER_GROUP;
+  const int token_idx = blockIdx.y;
+  const int hidden_dim_group_idx = blockIdx.x * subwarps_per_block + subwarp_id;
+  quantize_bf16_fp8_g128_group<THREADS_PER_GROUP>(
+      input, output_q, output_s, hidden_dim_num_groups, token_idx, hidden_dim_group_idx);
+}
+
+template <int THREADS_PER_GROUP, int HIDDEN_GROUPS_PER_BLOCK, int TOKEN_GROUPS_PER_BLOCK>
+__global__ void per_token_group_quant_8bit_bf16_fp8_g128_row_tiled_kernel(
+    const __mt_bfloat16* __restrict__ input,
+    __mt_fp8_e4m3* __restrict__ output_q,
     float* __restrict__ output_s,
     const int hidden_dim_num_groups,
     const int num_tokens_per_expert) {
-  static_assert(GROUP_SIZE == THREADS_PER_GROUP * FP8_FAST_VEC_ELEMS);
-  static_assert(FP8_FAST_VEC_ELEMS * sizeof(half) == sizeof(uint64_t));
-  static_assert(FP8_FAST_VEC_ELEMS * sizeof(int8_t) == sizeof(uint32_t));
-
   const int subwarp_id = threadIdx.x / THREADS_PER_GROUP;
-  const int lane_id = threadIdx.x - subwarp_id * THREADS_PER_GROUP;
-  const int subwarps_per_block = blockDim.x / THREADS_PER_GROUP;
+  const int token_tile_idx = subwarp_id / HIDDEN_GROUPS_PER_BLOCK;
+  const int hidden_tile_idx = subwarp_id - token_tile_idx * HIDDEN_GROUPS_PER_BLOCK;
 
-  const int token_idx = blockIdx.y;
-  const int hidden_dim_group_idx = blockIdx.x * subwarps_per_block + subwarp_id;
-  const int hidden_size = hidden_dim_num_groups * GROUP_SIZE;
-  const int input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
-      0, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert, GROUP_SIZE);
-  const int elem_offset = lane_id * FP8_FAST_VEC_ELEMS;
-
-  uint64_t input_primary_u64 = *reinterpret_cast<const uint64_t*>(input + input_group_start_offset + elem_offset);
-  half* input_primary_vec = reinterpret_cast<half*>(&input_primary_u64);
-
-  uint64_t input_secondary_u64;
-  half* input_secondary_vec = reinterpret_cast<half*>(&input_secondary_u64);
-  if constexpr (FUSE_SILU_AND_MUL) {
-    input_secondary_u64 = *reinterpret_cast<const uint64_t*>(input + input_group_start_offset + hidden_size + elem_offset);
+  const int token_idx = blockIdx.y * TOKEN_GROUPS_PER_BLOCK + token_tile_idx;
+  const int hidden_dim_group_idx = blockIdx.x * HIDDEN_GROUPS_PER_BLOCK + hidden_tile_idx;
+  if (token_idx >= num_tokens_per_expert || hidden_dim_group_idx >= hidden_dim_num_groups) {
+    return;
   }
 
-  float values[FP8_FAST_VEC_ELEMS];
-  float local_absmax = LOCAL_ABSMAX_ABS;
-
-#pragma unroll
-  for (uint32_t j = 0; j < FP8_FAST_VEC_ELEMS; ++j) {
-    float val;
-    if constexpr (FUSE_SILU_AND_MUL) {
-      half val_lowprec = static_cast<half>(silu(static_cast<float>(input_primary_vec[j]))) * input_secondary_vec[j];
-      val = static_cast<float>(val_lowprec);
-      values[j] = val;
-    } else {
-      val = static_cast<float>(input_primary_vec[j]);
-      values[j] = val;
-    }
-    local_absmax = fmaxf(local_absmax, fabsf(val));
-  }
-
-  local_absmax = GroupReduceMax<THREADS_PER_GROUP>(local_absmax, lane_id);
-  const float y_scale_inv = local_absmax * (1.0f / DtypeInfo<int8_t>::MAX);
-  const float y_scale = DtypeInfo<int8_t>::MAX / local_absmax;
-
-  if (lane_id == 0) {
-    output_s[token_idx * hidden_dim_num_groups + hidden_dim_group_idx] = y_scale_inv;
-  }
-
-  int8_t packed[FP8_FAST_VEC_ELEMS];
-#pragma unroll
-  for (uint32_t j = 0; j < FP8_FAST_VEC_ELEMS; ++j) {
-    const float q_val = fminf(fmaxf(values[j] * y_scale, DtypeInfo<int8_t>::MIN), DtypeInfo<int8_t>::MAX);
-    packed[j] = int8_t(q_val);
-  }
-
-  const int output_offset = (token_idx * hidden_dim_num_groups + hidden_dim_group_idx) * GROUP_SIZE + elem_offset;
-  *reinterpret_cast<uint32_t*>(output_q + output_offset) = *reinterpret_cast<uint32_t*>(packed);
+  quantize_bf16_fp8_g128_group<THREADS_PER_GROUP>(
+      input, output_q, output_s, hidden_dim_num_groups, token_idx, hidden_dim_group_idx);
 }
 
 inline int choose_subwarps_per_block(const int hidden_dim_num_groups) {
@@ -818,14 +625,18 @@ void launch_fp8_fast_kernel(
   const int subwarps_per_block = choose_subwarps_per_block(hidden_dim_num_groups);
   dim3 grid(hidden_dim_num_groups / subwarps_per_block, num_tokens_per_expert);
   dim3 block(subwarps_per_block * THREADS_PER_GROUP);
-  per_token_group_quant_8bit_fp8_fast_kernel<GROUP_SIZE, THREADS_PER_GROUP, IS_COLUMN_MAJOR, FUSE_SILU_AND_MUL>
-      <<<grid, block, 0, stream>>>(
-          static_cast<half*>(input.data_ptr()),
-          static_cast<__mt_fp8_e4m3*>(output_q.data_ptr()),
-          static_cast<float*>(output_s.data_ptr()),
-          hidden_dim_num_groups,
-          scale_hidden_stride,
-          num_tokens_per_expert);
+  per_token_group_quant_8bit_fast_kernel<
+      GROUP_SIZE,
+      THREADS_PER_GROUP,
+      __mt_fp8_e4m3,
+      IS_COLUMN_MAJOR,
+      FUSE_SILU_AND_MUL><<<grid, block, 0, stream>>>(
+      static_cast<half*>(input.data_ptr()),
+      static_cast<__mt_fp8_e4m3*>(output_q.data_ptr()),
+      static_cast<float*>(output_s.data_ptr()),
+      hidden_dim_num_groups,
+      scale_hidden_stride,
+      num_tokens_per_expert);
 }
 
 template <bool IS_COLUMN_MAJOR, bool FUSE_SILU_AND_MUL>
@@ -918,13 +729,6 @@ void launch_bf16_fp8_g128_row_kernel(
   if constexpr (THREADS_PER_GROUP == 32) {
     subwarps_per_block = subwarps_per_block > 8 ? 8 : subwarps_per_block;
   }
-  const char* spb_env = std::getenv("SGLANG_MUSA_QUANT_BF16_FP8_G128_SPB");
-  if (spb_env != nullptr) {
-    const int spb = std::atoi(spb_env);
-    if (spb > 0 && spb <= subwarps_per_block && hidden_dim_num_groups % spb == 0) {
-      subwarps_per_block = spb;
-    }
-  }
   dim3 grid(hidden_dim_num_groups / subwarps_per_block, num_tokens_per_expert);
   dim3 block(subwarps_per_block * THREADS_PER_GROUP);
   per_token_group_quant_8bit_bf16_fp8_g128_row_kernel<THREADS_PER_GROUP><<<grid, block, 0, stream>>>(
@@ -934,6 +738,68 @@ void launch_bf16_fp8_g128_row_kernel(
       hidden_dim_num_groups);
 }
 
+template <int THREADS_PER_GROUP, int HIDDEN_GROUPS_PER_BLOCK, int TOKEN_GROUPS_PER_BLOCK>
+void launch_bf16_fp8_g128_row_tiled_kernel(
+    ffi::TensorView input,
+    ffi::TensorView output_q,
+    ffi::TensorView output_s,
+    int hidden_dim_num_groups,
+    int num_tokens_per_expert,
+    musaStream_t stream) {
+  dim3 grid(
+      (hidden_dim_num_groups + HIDDEN_GROUPS_PER_BLOCK - 1) / HIDDEN_GROUPS_PER_BLOCK,
+      (num_tokens_per_expert + TOKEN_GROUPS_PER_BLOCK - 1) / TOKEN_GROUPS_PER_BLOCK);
+  dim3 block(THREADS_PER_GROUP * HIDDEN_GROUPS_PER_BLOCK * TOKEN_GROUPS_PER_BLOCK);
+  per_token_group_quant_8bit_bf16_fp8_g128_row_tiled_kernel<
+      THREADS_PER_GROUP,
+      HIDDEN_GROUPS_PER_BLOCK,
+      TOKEN_GROUPS_PER_BLOCK><<<grid, block, 0, stream>>>(
+      static_cast<__mt_bfloat16*>(input.data_ptr()),
+      static_cast<__mt_fp8_e4m3*>(output_q.data_ptr()),
+      static_cast<float*>(output_s.data_ptr()),
+      hidden_dim_num_groups,
+      num_tokens_per_expert);
+}
+
+template <int THREADS_PER_GROUP>
+bool try_launch_bf16_fp8_g128_row_tiled_kernel(
+    ffi::TensorView input,
+    ffi::TensorView output_q,
+    ffi::TensorView output_s,
+    int hidden_dim_num_groups,
+    int num_tokens_per_expert,
+    musaStream_t stream) {
+  if (num_tokens_per_expert < 16 || hidden_dim_num_groups > 32) {
+    return false;
+  }
+
+  if (hidden_dim_num_groups <= 1) {
+    launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, 1, 8>(
+        input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+  } else if (hidden_dim_num_groups <= 2) {
+    launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, 2, 4>(
+        input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+  } else if (hidden_dim_num_groups <= 4) {
+    launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, 4, 4>(
+        input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+  } else if (hidden_dim_num_groups <= 8) {
+    launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, 8, 2>(
+        input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+  } else if (hidden_dim_num_groups <= 16) {
+    launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, 16, 1>(
+        input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+  } else if (hidden_dim_num_groups % 4 == 0) {
+    return false;
+  } else if (hidden_dim_num_groups <= 24) {
+    launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, 8, 2>(
+        input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+  } else {
+    launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, 16, 1>(
+        input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+  }
+  return true;
+}
+
 void dispatch_bf16_fp8_g128_row_kernel(
     ffi::TensorView input,
     ffi::TensorView output_q,
@@ -941,18 +807,13 @@ void dispatch_bf16_fp8_g128_row_kernel(
     int hidden_dim_num_groups,
     int num_tokens_per_expert,
     musaStream_t stream) {
-  const char* tpg_env = std::getenv("SGLANG_MUSA_QUANT_BF16_FP8_G128_TPG");
-  const int tpg = tpg_env == nullptr ? 16 : std::atoi(tpg_env);
-  if (tpg == 8) {
-    launch_bf16_fp8_g128_row_kernel<8>(
-        input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
-  } else if (tpg == 16) {
-    launch_bf16_fp8_g128_row_kernel<16>(
-        input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
-  } else {
-    launch_bf16_fp8_g128_row_kernel<32>(
-        input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+  constexpr int THREADS_PER_GROUP = BF16_FP8_G128_THREADS_PER_GROUP;
+  if (try_launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP>(
+          input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream)) {
+    return;
   }
+  launch_bf16_fp8_g128_row_kernel<THREADS_PER_GROUP>(
+      input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
 }
 
 template <int GROUP_SIZE, bool FUSE_SILU_AND_MUL>
@@ -967,12 +828,13 @@ void launch_i8_fast_kernel(
   const int subwarps_per_block = choose_subwarps_per_block(hidden_dim_num_groups);
   dim3 grid(hidden_dim_num_groups / subwarps_per_block, num_tokens_per_expert);
   dim3 block(subwarps_per_block * THREADS_PER_GROUP);
-  per_token_group_quant_8bit_i8_fast_kernel<GROUP_SIZE, THREADS_PER_GROUP, FUSE_SILU_AND_MUL>
+  per_token_group_quant_8bit_fast_kernel<GROUP_SIZE, THREADS_PER_GROUP, int8_t, false, FUSE_SILU_AND_MUL>
       <<<grid, block, 0, stream>>>(
           static_cast<half*>(input.data_ptr()),
           static_cast<int8_t*>(output_q.data_ptr()),
           static_cast<float*>(output_s.data_ptr()),
           hidden_dim_num_groups,
+          0,
           num_tokens_per_expert);
 }
 

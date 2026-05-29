@@ -1,5 +1,11 @@
 """MUSA TVM-FFI/C++ JIT kernels."""
 
+from sglang.srt.hardware_backend.musa.jit_kernel.csrc.norm import (
+    fused_add_rmsnorm,
+    gemma_fused_add_rmsnorm,
+    gemma_rmsnorm,
+    rmsnorm,
+)
 from sglang.srt.hardware_backend.musa.jit_kernel.csrc.quant import (
     per_token_group_quant_8bit,
 )
@@ -10,7 +16,11 @@ from sglang.srt.hardware_backend.musa.jit_kernel.csrc.topk import (
 )
 
 __all__ = [
+    "fused_add_rmsnorm",
+    "gemma_fused_add_rmsnorm",
+    "gemma_rmsnorm",
     "per_token_group_quant_8bit",
+    "rmsnorm",
     "rotary_embedding",
     "topk_sigmoid",
     "topk_softmax",

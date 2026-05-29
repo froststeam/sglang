@@ -50,7 +50,7 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _flashinfer_layernorm_available = False
 
-if _is_cuda or _is_xpu or _is_musa:
+if _is_cuda or _is_xpu:
     if _is_flashinfer_available:
         try:
             from flashinfer.norm import layernorm
@@ -67,6 +67,14 @@ if _is_cuda or _is_xpu or _is_musa:
         gemma_rmsnorm,
         rmsnorm,
     )
+elif _is_musa:
+    from sglang.srt.hardware_backend.musa.jit_kernel.csrc.norm import (
+        fused_add_rmsnorm,
+        gemma_fused_add_rmsnorm,
+        gemma_rmsnorm,
+        rmsnorm,
+    )
+
 _has_aiter_layer_norm = False
 _has_vllm_rms_norm = False
 if _use_aiter:
@@ -336,29 +344,6 @@ class RMSNorm(MultiPlatformOp):
             return out, residual_out
         out = torch.empty_like(x)
         rms_norm(out, x, self.weight.data, self.variance_epsilon)
-        return out
-
-    def forward_musa(
-        self,
-        x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-        post_residual_addition: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if not get_global_server_args().disable_piecewise_cuda_graph:
-            return self.forward_native(x, residual, post_residual_addition)
-
-        if not x.is_contiguous():
-            x = x.contiguous()
-
-        if residual is not None:
-            if post_residual_addition is not None:
-                residual = residual + post_residual_addition
-            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
-            return x, residual
-
-        out = nn.functional.rms_norm(
-            x, (self.hidden_size,), self.weight.data, self.variance_epsilon
-        )
         return out
 
     def forward_native(

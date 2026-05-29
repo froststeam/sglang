@@ -335,7 +335,7 @@ def bench_rms_norm_gated(num_tests: int) -> None:
 
     tilelang_s = bench_kineto(
         run_tilelang,
-        "sglang_musa_rms_norm_gated_kernel",
+        "sglang_musa_rms_norm_gated_cta",
         num_tests=num_tests,
         suppress_kineto_output=True,
         flush_l2=True,
