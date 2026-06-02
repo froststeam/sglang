@@ -1,33 +1,46 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
 
 import torch
 from flash_attn_interface import flash_attn_varlen_func
 from flash_attn_interface import flash_attn_with_kvcache as mate_flash_attn_with_kvcache
 from flash_attn_interface import get_scheduler_metadata
 
-from sglang.srt.distributed import get_pp_group, get_pp_indices
+from sglang.srt.distributed import (
+    get_attn_context_model_parallel_rank,
+    get_pp_group,
+    get_pp_indices,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashattention_backend import (
     FlashAttentionBackend,
     FlashAttentionMultiStepBackend,
     merge_state_v2_wrapper,
 )
-from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.utils.cp_utils import (
+    can_cp_split,
     cp_allgather_and_save_kv_cache,
     cp_attn_forward_extend,
+    prepare_context_parallel_metadata,
 )
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 MATE_MLA_WORKSPACE_SIZE_BYTES = 128 * 1024 * 1024
+
+
+@dataclass
+class _CudaGraphSchedulerMetadataState:
+    tensors: Dict[str, torch.Tensor]
+    static_fields: Dict[str, object]
 
 
 def flash_attn_with_kvcache(
@@ -77,9 +90,6 @@ def flash_attn_with_kvcache(
             "score_mod and aux_tensors are not supported by the MUSA FA3 backend."
         )
 
-    # MATE FA3 requires scheduler metadata for paged KV-cache attention.
-    # Letting this fall back to None can select an unsafe scheduling path and
-    # produce numerical mismatches, so fail at the wrapper boundary.
     assert (
         scheduler_metadata is not None
     ), "MUSA MATE FA3 flash_attn_with_kvcache requires scheduler_metadata."
@@ -126,20 +136,20 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
             raise ValueError("MUSA flash attention backend only supports FA3.")
 
         super().__init__(model_runner, **kwargs)
-
         self.flash_attn_varlen_func = flash_attn_varlen_func
         self.flash_attn_with_kvcache = flash_attn_with_kvcache
         self.num_hidden_layers = model_runner.model_config.num_hidden_layers
         self.first_k_dense_replace = model_runner.model_config.first_k_dense_replace
         self.full_attention_interval = model_runner.model_config.full_attention_interval
-        self.head_dim = model_runner.model_config.head_dim
-        self.v_head_dim = model_runner.model_config.v_head_dim
-        self.num_attention_heads = model_runner.model_config.get_num_attention_heads(
-            model_runner.tp_size
-        )
-        self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            model_runner.tp_size
-        )
+        (
+            self._full_attention_layout,
+            self._swa_attention_layout,
+            self._swa_window_size,
+            self._has_full_attention_layer,
+            self._has_local_attention_layer,
+            self._has_cross_attention_layer,
+            self._has_swa_local_attention_layer,
+        ) = self._get_layer_attention_layouts(model_runner)
         _softcapping = getattr(
             model_runner.model_config.hf_text_config, "attn_logit_softcapping", None
         )
@@ -153,13 +163,142 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
             if self.use_mla
             else None
         )
+        self._cuda_graph_scheduler_metadata: Dict[
+            tuple, _CudaGraphSchedulerMetadataState
+        ] = {}
         # Disable default scheduler metadata for fa3
         self._get_scheduler_metadata = None
 
     @staticmethod
-    def _has_extend_prefix(forward_batch: ForwardBatch) -> bool:
-        extend_prefix_lens_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
-        return extend_prefix_lens_cpu is not None and any(extend_prefix_lens_cpu)
+    def _seq_lens_cpu_list(seq_lens_cpu) -> Optional[list]:
+        if seq_lens_cpu is None:
+            return None
+        if isinstance(seq_lens_cpu, torch.Tensor):
+            if seq_lens_cpu.device.type != "cpu" and get_is_capture_mode():
+                return None
+            return seq_lens_cpu.detach().cpu().tolist()
+        return list(seq_lens_cpu)
+
+    def _prepare_attn_cp_metadata_for_init(
+        self,
+        forward_batch,
+        *,
+        input_token_count: Optional[int],
+        seq_lens_cpu=None,
+    ):
+        """Prepare Qwen3-MoE style CP metadata before attention metadata init.
+
+        Qwen3-MoE also prepares `attn_cp_metadata` inside `model.forward()`, but
+        that happens after the attention backend init hook. Preparing it here
+        lets CP scheduler metadata be generated once during prepare/capture/replay
+        instead of being repaired in the first attention layer.
+        """
+        if input_token_count is None:
+            forward_batch.attn_cp_metadata = None
+            return
+
+        if not can_cp_split(input_token_count, self.attn_cp_size, forward_batch):
+            if forward_batch.forward_mode.is_context_parallel_extend():
+                forward_batch.attn_cp_metadata = None
+            return
+
+        seq_lens_cpu_list = self._seq_lens_cpu_list(seq_lens_cpu)
+        if seq_lens_cpu_list is None:
+            seq_lens_cpu_list = self._seq_lens_cpu_list(
+                getattr(forward_batch, "seq_lens_cpu", None)
+            )
+        forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+            input_token_count,
+            get_attn_context_model_parallel_rank(),
+            self.attn_cp_size,
+            seq_lens_cpu_list,
+        )
+
+    @staticmethod
+    def _layer_attention_layout(module: RadixAttention):
+        return (
+            module.tp_q_head_num,
+            module.tp_k_head_num,
+            module.qk_head_dim,
+            module.v_head_dim,
+        )
+
+    @classmethod
+    def _get_layer_attention_layouts(cls, model_runner: ModelRunner):
+        # MATE scheduler metadata is built from a single attention layout per
+        # call. A model may have different full-attention and SWA structures,
+        # but each family must be internally uniform:
+        # all full-attention layers share one layout, and all SWA layers share
+        # one layout.
+        #
+        # The booleans returned here are model-structure flags, not per-batch
+        # state. They let `_init_no_mla_scheduler_metadata` avoid building
+        # metadata for layer families that cannot be reached by this model.
+        # Cross-attention layers are tracked separately because they use encoder
+        # KV lengths and do not participate in the self-attention layout check.
+        full_layouts = set()
+        swa_layouts = set()
+        swa_window_sizes = set()
+        has_full_attention_layer = False
+        has_local_attention_layer = False
+        has_cross_attention_layer = False
+        has_swa_local_attention_layer = False
+        for module in model_runner.model.modules():
+            if not isinstance(module, RadixAttention):
+                continue
+
+            if getattr(module, "is_cross_attention", False):
+                has_cross_attention_layer = True
+                continue
+
+            if (
+                module.sliding_window_size is not None
+                and module.sliding_window_size > -1
+            ):
+                swa_layouts.add(cls._layer_attention_layout(module))
+                swa_window_sizes.add(module.sliding_window_size)
+                has_swa_local_attention_layer |= bool(
+                    getattr(module, "use_irope", False)
+                )
+            else:
+                full_layouts.add(cls._layer_attention_layout(module))
+                has_full_attention_layer = True
+
+            has_local_attention_layer |= bool(getattr(module, "use_irope", False))
+
+        full_layouts = sorted(full_layouts)
+        swa_layouts = sorted(swa_layouts)
+        if len(full_layouts) > 1 or len(swa_layouts) > 1:
+            raise ValueError(
+                "MUSA FA3 no-MLA scheduler metadata assumes one uniform "
+                "self-attention layout for all full-attention layers and one "
+                "uniform self-attention layout for all SWA layers; full and "
+                f"SWA layouts may differ. Got full={full_layouts} "
+                f"and swa={swa_layouts}."
+            )
+
+        swa_window_sizes = sorted(swa_window_sizes)
+        if len(swa_window_sizes) > 1:
+            raise ValueError(
+                "MUSA FA3 no-MLA scheduler metadata assumes one uniform SWA "
+                f"window size. Got {swa_window_sizes}."
+            )
+
+        full_layout = full_layouts[0] if full_layouts else None
+        swa_layout = swa_layouts[0] if swa_layouts else full_layout
+        full_layout = full_layout if full_layout is not None else swa_layout
+        swa_window_size = (
+            (swa_window_sizes[0], 0) if len(swa_window_sizes) == 1 else None
+        )
+        return (
+            full_layout,
+            swa_layout,
+            swa_window_size,
+            has_full_attention_layer,
+            has_local_attention_layer,
+            has_cross_attention_layer,
+            has_swa_local_attention_layer,
+        )
 
     def _needs_no_mla_kvcache_scheduler_metadata(
         self, forward_batch: ForwardBatch
@@ -168,63 +307,57 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         return (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend()
-            or self._has_extend_prefix(forward_batch)
+            or forward_mode.is_extend_or_draft_extend_or_mixed(
+                include_draft_extend_v2=True
+            )
         )
 
-    # Scheduler metadata decision table.
+    def _is_context_parallel_extend(self, forward_batch: ForwardBatch) -> bool:
+        return (
+            forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+            and self.attn_cp_size > 1
+        )
+
+    # Scheduler metadata contract for MUSA FA3.
     #
-    # MATE FA3 kvcache attention requires scheduler_metadata. Varlen attention
-    # does not use it. For no-MLA, precompute metadata only for paths that can
-    # later call flash_attn_with_kvcache, while keeping separate metadata
-    # objects for calls whose shape/page-table parameters differ. For MLA, do
-    # not precompute at init time because the metadata tuple's skip_update flag
-    # depends on the current layer.
+    # `flash_attn_with_kvcache` always requires scheduler metadata. The no-MLA
+    # extend/decode call flow intentionally follows `FlashAttentionBackend`;
+    # MUSA only adds the precomputed scheduler metadata argument.
     #
-    # no-MLA paths:
-    # | Forward path | Runtime call | Metadata |
-    # |---|---|---|
-    # | decode / idle | kvcache | `metadata.scheduler_metadata` |
-    # | target verify | kvcache + expand | base + expand metadata |
-    # | draft extend | kvcache | `metadata.scheduler_metadata` |
-    # | extend with prefix | kvcache | `metadata.scheduler_metadata` |
-    # | plain extend without prefix | varlen | clear base metadata |
-    # | local attention on kvcache path | kvcache | local metadata |
-    # | cross attention on kvcache path | kvcache | encoder metadata |
-    # | context-parallel extend | CP kvcache | CP prev + CP next metadata |
-    # | context-parallel local/SWA | CP kvcache | recompute at call site |
+    # no-MLA base paths:
+    # - EXTEND, DRAFT_EXTEND, TARGET_VERIFY: kvcache extend; uses
+    #   `metadata.scheduler_metadata`.
+    # - DECODE/IDLE: kvcache decode; uses `metadata.scheduler_metadata`.
+    # - Cross attention: kvcache over encoder KV; uses
+    #   `metadata.encoder_scheduler_metadata`, with `causal=False`.
+    # - Local attention: kvcache over local block table; uses
+    #   `metadata.local_attn_metadata.scheduler_metadata`.
     #
-    # Notes:
-    # - base metadata: `metadata.scheduler_metadata`
-    # - expand metadata: `forward_metadata_spec_decode_expand.scheduler_metadata`
-    # - local metadata: `local_attn_metadata.scheduler_metadata`
-    # - encoder metadata: `metadata.encoder_scheduler_metadata`
-    # - CP prev/next: `metadata.cp_scheduler_metadata_prev/next`
-    # - CP local/SWA recomputes at the call site because cu_seqlens, window, or
-    #   page parameters differ from the precomputed base/CP metadata.
+    # no-MLA variants:
+    # - SWA layers use `metadata.swa_scheduler_metadata`, generated from the
+    #   same cache/page/q lengths as the base path but with the uniform SWA
+    #   layer window size. Runtime calls pass
+    #   `window_size=(layer.sliding_window_size, 0)`.
+    # - Speculative cascade has two kvcache calls. The first call uses base/SWA
+    #   metadata for the prefix part. The second call uses
+    #   `forward_metadata_spec_decode_expand`, and SWA layers must select its
+    #   `swa_scheduler_metadata` instead of the full-attention metadata.
+    # - Context-parallel extend has prev/next kvcache calls. Full-attention CP
+    #   uses `cp_scheduler_metadata_prev/next`; SWA CP uses
+    #   `cp_swa_scheduler_metadata_prev/next`; local CP uses
+    #   `cp_local_scheduler_metadata_prev/next`.
     #
     # MLA paths:
-    # | Forward path | Runtime call | Metadata |
-    # |---|---|---|
-    # | decode / idle | MLA kvcache | call-site workspace tuple |
-    # | target verify | MLA kvcache + expand | call-site workspace tuple |
-    # | draft extend / draft extend v2 | MLA kvcache | call-site workspace tuple |
-    # | normal MLA extend | MLA kvcache | call-site workspace tuple |
-    # | prefix-cache varlen path | varlen | clear stale base metadata |
-    #
-    # MLA call-site workspace tuple means:
-    # `(self._mate_mla_workspace_buffer, skip_update)`.
-    #
-    # Only the first effective MLA layer should update the MATE scheduler
-    # metadata. Later layers pass skip_update=True, avoiding expensive repeated
-    # metadata updates in both eager execution and cuda graph replay. The first
-    # effective layer accounts for PP rank, TBO, first_k_dense_replace, and
-    # full_attention_interval; SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA overrides
-    # the skip decision for debugging.
-    #
-    # _init_mla_scheduler_metadata only clears stale metadata fields. Actual
-    # MLA scheduler metadata is built at the kvcache call site, because
-    # skip_update depends on layer_id.
+    # - All MLA kvcache calls pass `(self._mate_mla_workspace_buffer,
+    #   skip_update)` as scheduler metadata.
+    # - `_init_mla_scheduler_metadata` only clears stale no-MLA fields. The MLA
+    #   tuple is built at each kvcache call because `skip_update` depends on the
+    #   current layer. Only the first effective MLA layer updates MATE metadata;
+    #   later layers skip repeated updates. PP rank, TBO,
+    #   `first_k_dense_replace`, and `full_attention_interval` are included in
+    #   that first-layer decision. `SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA`
+    #   disables the skip for debugging.
     def _compute_no_mla_scheduler_metadata(
         self,
         *,
@@ -236,18 +369,22 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         causal: bool,
         window_size: Tuple[int, int],
         page_size: int,
+        attention_layout: Optional[Tuple[int, int, int, int]] = None,
     ) -> Optional[torch.Tensor]:
         assert not self.use_mla
         if cache_seqlens is None or cu_seqlens_q is None:
             return None
+        num_heads_q, num_heads_kv, head_dim, v_head_dim = (
+            attention_layout or self._full_attention_layout
+        )
         return get_scheduler_metadata(
             batch_size=cu_seqlens_q.shape[-1] - 1,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max(max_seqlen_k, 1),
-            num_heads_q=self.num_attention_heads,
-            num_heads_kv=self.num_kv_heads,
-            headdim=self.head_dim,
-            headdim_v=self.v_head_dim,
+            num_heads_q=num_heads_q,
+            num_heads_kv=num_heads_kv,
+            headdim=head_dim,
+            headdim_v=v_head_dim,
             cache_seqlens=cache_seqlens,
             qkv_dtype=self.kv_cache_dtype,
             cu_seqlens_q=cu_seqlens_q,
@@ -308,49 +445,387 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         if metadata_expand is not None:
             setattr(metadata_expand, "scheduler_metadata", None)
 
-    @staticmethod
-    def _set_scheduler_metadata(owner, attr: str, new_metadata):
+    def _set_scheduler_metadata(self, owner, attr: str, new_metadata):
+        if envs.SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA.get():
+            # Override mode: consume the metadata freshly returned by MATE for
+            # this prepare/replay step. CUDA/MUSA graph replay still copies the
+            # fresh tensor into the captured tensor because the graph itself can
+            # only see capture-time addresses.
+            setattr(owner, attr, new_metadata)
+            return
+
         old_metadata = getattr(owner, attr, None)
+        # CUDA graph replay reuses metadata owners. Preserve tensor objects when
+        # the shape is stable so captured graphs keep valid addresses; replace
+        # only when the shape changes or the old value was not a tensor.
         if isinstance(old_metadata, torch.Tensor) and isinstance(
             new_metadata, torch.Tensor
         ):
-            old_metadata.copy_(new_metadata)
+            if old_metadata.shape == new_metadata.shape:
+                old_metadata.copy_(new_metadata)
+            else:
+                setattr(owner, attr, new_metadata)
         else:
             setattr(owner, attr, new_metadata)
+
+    def _cuda_graph_metadata_key(self, bs: int, forward_mode, spec_info):
+        if forward_mode.is_target_verify():
+            return ("target_verify", bs, self.topk, self.speculative_num_draft_tokens)
+        if forward_mode.is_decode_or_idle() and spec_info is not None:
+            return ("decode_spec", bs, self.topk, self.speculative_step_id)
+        return ("decode", bs)
+
+    @staticmethod
+    def _scheduler_metadata_tensor_paths(metadata, prefix: str = ""):
+        if metadata is None:
+            return
+
+        for attr in ("scheduler_metadata", "swa_scheduler_metadata"):
+            value = getattr(metadata, attr, None)
+            if isinstance(value, torch.Tensor):
+                yield f"{prefix}{attr}", value
+
+        value = getattr(metadata, "encoder_scheduler_metadata", None)
+        if isinstance(value, torch.Tensor):
+            yield f"{prefix}encoder_scheduler_metadata", value
+
+        local_metadata = getattr(metadata, "local_attn_metadata", None)
+        if local_metadata is not None:
+            value = getattr(local_metadata, "scheduler_metadata", None)
+            if isinstance(value, torch.Tensor):
+                yield f"{prefix}local_attn_metadata.scheduler_metadata", value
+
+    def _capture_cuda_graph_scheduler_metadata(self, bs: int, forward_mode, spec_info):
+        key = self._cuda_graph_metadata_key(bs, forward_mode, spec_info)
+        tensors = dict(self._scheduler_metadata_tensor_paths(self.forward_metadata))
+        tensors.update(
+            self._scheduler_metadata_tensor_paths(
+                self.forward_metadata_spec_decode_expand, prefix="spec_expand."
+            )
+        )
+        self._cuda_graph_scheduler_metadata[key] = _CudaGraphSchedulerMetadataState(
+            tensors=tensors,
+            static_fields={
+                "max_seq_len_q": getattr(self.forward_metadata, "max_seq_len_q", None),
+                "max_seq_len_k": getattr(self.forward_metadata, "max_seq_len_k", None),
+                "spec_expand.max_seq_len_q": getattr(
+                    self.forward_metadata_spec_decode_expand, "max_seq_len_q", None
+                ),
+                "spec_expand.max_seq_len_k": getattr(
+                    self.forward_metadata_spec_decode_expand, "max_seq_len_k", None
+                ),
+            },
+        )
+
+    def _restore_cuda_graph_scheduler_static_fields(
+        self, bs: int, forward_mode, spec_info
+    ):
+        key = self._cuda_graph_metadata_key(bs, forward_mode, spec_info)
+        state = self._cuda_graph_scheduler_metadata.get(key)
+        if state is None:
+            return
+
+        metadata = self.forward_metadata
+        metadata_expand = self.forward_metadata_spec_decode_expand
+        for attr in ("max_seq_len_q", "max_seq_len_k"):
+            value = state.static_fields.get(attr)
+            if metadata is not None and value is not None:
+                setattr(metadata, attr, value)
+        if metadata_expand is not None:
+            for attr in ("max_seq_len_q", "max_seq_len_k"):
+                value = state.static_fields.get(f"spec_expand.{attr}")
+                if value is not None:
+                    setattr(metadata_expand, attr, value)
+
+    @staticmethod
+    def _scheduler_metadata_owner_and_attr(metadata, spec_expand_metadata, path: str):
+        owner = metadata
+        attr = path
+        if path.startswith("spec_expand."):
+            owner = spec_expand_metadata
+            attr = path[len("spec_expand.") :]
+        if owner is None:
+            return None, attr
+        if attr == "local_attn_metadata.scheduler_metadata":
+            local_metadata = getattr(owner, "local_attn_metadata", None)
+            return local_metadata, "scheduler_metadata"
+        return owner, attr
+
+    def _sync_cuda_graph_scheduler_metadata(self, bs: int, forward_mode, spec_info):
+        key = self._cuda_graph_metadata_key(bs, forward_mode, spec_info)
+        state = self._cuda_graph_scheduler_metadata.get(key)
+        if state is None:
+            return False
+
+        for path, captured_tensor in state.tensors.items():
+            owner, attr = self._scheduler_metadata_owner_and_attr(
+                self.forward_metadata,
+                self.forward_metadata_spec_decode_expand,
+                path,
+            )
+            replay_tensor = getattr(owner, attr, None) if owner is not None else None
+            assert isinstance(replay_tensor, torch.Tensor), (
+                "MUSA FA3 CUDA graph replay did not regenerate scheduler "
+                f"metadata for captured path {path}."
+            )
+            assert captured_tensor.shape == replay_tensor.shape, (
+                "MUSA FA3 CUDA graph scheduler metadata shape changed for "
+                f"{path}: capture={tuple(captured_tensor.shape)} "
+                f"replay={tuple(replay_tensor.shape)}."
+            )
+            captured_tensor.copy_(replay_tensor)
+            setattr(owner, attr, captured_tensor)
+        return True
 
     @staticmethod
     def _max_seqlen_from_metadata(
         max_seqlen_k: int, cache_seqlens: torch.Tensor
     ) -> int:
+        # Prefer the static max length prepared by the base FA metadata path.
+        # The fallback reads `cache_seqlens.max().item()`, which synchronizes a
+        # device tensor to host and is not safe while graph capture is active.
+        # During capture, this fallback is only a shape placeholder for owners
+        # that do not carry a static max length; replay refreshes the captured
+        # scheduler tensor contents before graph launch.
         if max_seqlen_k and max_seqlen_k > 0:
             return max_seqlen_k
+        if get_is_capture_mode():
+            return 1
         return int(cache_seqlens.max().item())
 
-    def _init_no_mla_scheduler_metadata(self, forward_batch: ForwardBatch):
+    def _init_swa_scheduler_metadata(
+        self,
+        owner,
+        attr: str,
+        *,
+        max_seqlen_k: int,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k_new: Optional[torch.Tensor],
+        max_seqlen_q: int,
+        causal: bool,
+        page_size: int,
+    ):
+        if not (self.has_swa and self._swa_window_size is not None):
+            setattr(owner, attr, None)
+            return
+
+        # SWA scheduler metadata must be generated with the same window that the
+        # kernel will see at runtime. The model scan above enforces one uniform
+        # SWA window, so callers do not need to thread layer objects through
+        # metadata initialization.
+        self._set_scheduler_metadata(
+            owner,
+            attr,
+            self._compute_no_mla_scheduler_metadata(
+                max_seqlen_k=max_seqlen_k,
+                cache_seqlens=cache_seqlens,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k_new=cu_seqlens_k_new,
+                max_seqlen_q=max_seqlen_q,
+                causal=causal,
+                window_size=self._swa_window_size,
+                page_size=page_size,
+                attention_layout=self._swa_attention_layout,
+            ),
+        )
+
+    def _clear_cp_scheduler_metadata(self, metadata):
+        for side in ("prev", "next"):
+            for prefix in (
+                "cp",
+                "cp_swa",
+                "cp_local",
+                "cp_local_swa",
+            ):
+                setattr(metadata, f"{prefix}_scheduler_metadata_{side}", None)
+            setattr(metadata, f"cp_cu_seqlens_k_new_{side}", None)
+
+    @staticmethod
+    def _cp_side_lengths(cp_meta, side: str):
+        if side == "prev":
+            return (
+                cp_meta.actual_seq_q_prev,
+                int(cp_meta.kv_len_prev),
+                cp_meta.kv_len_prev_tensor,
+            )
+        if side == "next":
+            return (
+                cp_meta.actual_seq_q_next,
+                int(cp_meta.kv_len_next),
+                cp_meta.kv_len_next_tensor,
+            )
+        raise ValueError(f"unknown CP side: {side}")
+
+    def _init_cp_self_scheduler_metadata(
+        self,
+        metadata,
+        side: str,
+        *,
+        q_len: int,
+        k_len: int,
+        k_len_tensor: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k_new: torch.Tensor,
+    ):
+        full_attr = f"cp_scheduler_metadata_{side}"
+        swa_attr = f"cp_swa_scheduler_metadata_{side}"
+        if self._has_full_attention_layer:
+            self._set_scheduler_metadata(
+                metadata,
+                full_attr,
+                self._compute_no_mla_scheduler_metadata(
+                    max_seqlen_k=k_len,
+                    cache_seqlens=k_len_tensor,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k_new=cu_seqlens_k_new,
+                    max_seqlen_q=q_len,
+                    causal=True,
+                    window_size=(-1, -1),
+                    page_size=self.page_size,
+                ),
+            )
+        else:
+            setattr(metadata, full_attr, None)
+
+        self._init_swa_scheduler_metadata(
+            metadata,
+            swa_attr,
+            max_seqlen_k=k_len,
+            cache_seqlens=k_len_tensor,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k_new=cu_seqlens_k_new,
+            max_seqlen_q=q_len,
+            causal=True,
+            page_size=self.page_size,
+        )
+
+    def _init_cp_local_scheduler_metadata(
+        self,
+        metadata,
+        local_metadata,
+        side: str,
+        *,
+        q_len: int,
+        k_len: int,
+        k_len_tensor: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+    ):
+        local_attr = f"cp_local_scheduler_metadata_{side}"
+        local_swa_attr = f"cp_local_swa_scheduler_metadata_{side}"
+        # Local attention has separate block tables. Its scheduler metadata uses
+        # the same CP q/cache lengths, but no `cu_seqlens_k_new` because the local
+        # path does not append newly gathered KV through the normal paged-cache
+        # table in the callback.
+        if local_metadata is not None and self._has_local_attention_layer:
+            self._set_scheduler_metadata(
+                metadata,
+                local_attr,
+                self._compute_no_mla_scheduler_metadata(
+                    max_seqlen_k=k_len,
+                    cache_seqlens=k_len_tensor,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k_new=None,
+                    max_seqlen_q=q_len,
+                    causal=True,
+                    window_size=(-1, -1),
+                    page_size=self.page_size,
+                ),
+            )
+        else:
+            setattr(metadata, local_attr, None)
+
+        if local_metadata is not None and self._has_swa_local_attention_layer:
+            self._init_swa_scheduler_metadata(
+                metadata,
+                local_swa_attr,
+                max_seqlen_k=k_len,
+                cache_seqlens=k_len_tensor,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k_new=None,
+                max_seqlen_q=q_len,
+                causal=True,
+                page_size=self.page_size,
+            )
+        else:
+            setattr(metadata, local_swa_attr, None)
+
+    def _init_cp_side_scheduler_metadata(
+        self,
+        metadata,
+        local_metadata,
+        cp_meta,
+        side: str,
+        device: torch.device,
+    ):
+        # CP extend is split into two single-sequence kvcache calls by
+        # `cp_attn_forward_extend`: prev and next. Each side has its own q length
+        # and visible KV length, so the MATE scheduler metadata must be generated
+        # with matching CP-local cu_seqlens instead of the full extend cu_seqlens.
+        q_len, k_len, k_len_tensor = self._cp_side_lengths(cp_meta, side)
+        cu_seqlens_q = torch.tensor([0, q_len], device=device, dtype=torch.int32)
+        cu_seqlens_k_new = torch.tensor([0, k_len], device=device, dtype=torch.int32)
+        setattr(metadata, f"cp_cu_seqlens_k_new_{side}", cu_seqlens_k_new)
+        self._init_cp_self_scheduler_metadata(
+            metadata,
+            side,
+            q_len=q_len,
+            k_len=k_len,
+            k_len_tensor=k_len_tensor,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k_new=cu_seqlens_k_new,
+        )
+        self._init_cp_local_scheduler_metadata(
+            metadata,
+            local_metadata,
+            side,
+            q_len=q_len,
+            k_len=k_len,
+            k_len_tensor=k_len_tensor,
+            cu_seqlens_q=cu_seqlens_q,
+        )
+
+    def _init_cp_scheduler_metadata(self, forward_batch: ForwardBatch, local_metadata):
         metadata = self.forward_metadata
         if metadata is None:
             return
 
-        is_decode = forward_batch.forward_mode.is_decode_or_idle()
-        use_cascade = self.topk > 1 and (
-            (is_decode and forward_batch.spec_info is not None)
-            or forward_batch.forward_mode.is_target_verify()
+        if not self._is_context_parallel_extend(forward_batch):
+            self._clear_cp_scheduler_metadata(metadata)
+            return
+
+        cp_meta = forward_batch.attn_cp_metadata
+        device = metadata.cache_seqlens_int32.device
+        self._init_cp_side_scheduler_metadata(
+            metadata, local_metadata, cp_meta, "prev", device
         )
-        needs_kvcache_metadata = self._needs_no_mla_kvcache_scheduler_metadata(
-            forward_batch
+        self._init_cp_side_scheduler_metadata(
+            metadata, local_metadata, cp_meta, "next", device
         )
-        if needs_kvcache_metadata:
-            cu_seqlens_k_new = None if is_decode else metadata.cu_seqlens_k
+
+    def _init_full_self_scheduler_metadata(
+        self,
+        metadata,
+        *,
+        needs_kvcache_metadata: bool,
+        cu_seqlens_k_new: Optional[torch.Tensor],
+        max_seqlen_k: int,
+        causal: bool,
+    ):
+        # Base self-attention metadata is only useful for full-attention layers.
+        # In all-SWA models this would never be consumed, so keep the attr clear
+        # and let accidental full-layer use fail at `_scheduler_metadata_for_kvcache`.
+        if needs_kvcache_metadata and self._has_full_attention_layer:
             self._set_scheduler_metadata(
                 metadata,
                 "scheduler_metadata",
                 self._compute_no_mla_scheduler_metadata(
-                    max_seqlen_k=metadata.max_seq_len_k,
+                    max_seqlen_k=max_seqlen_k,
                     cache_seqlens=metadata.cache_seqlens_int32,
                     cu_seqlens_q=metadata.cu_seqlens_q,
                     cu_seqlens_k_new=cu_seqlens_k_new,
                     max_seqlen_q=metadata.max_seq_len_q,
-                    causal=not use_cascade,
+                    causal=causal,
                     window_size=(-1, -1),
                     page_size=self.page_size,
                 ),
@@ -358,8 +833,49 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         else:
             setattr(metadata, "scheduler_metadata", None)
 
-        local_metadata = getattr(metadata, "local_attn_metadata", None)
-        if needs_kvcache_metadata and local_metadata is not None:
+    def _init_self_scheduler_metadata(
+        self,
+        metadata,
+        *,
+        needs_kvcache_metadata: bool,
+        cu_seqlens_k_new: Optional[torch.Tensor],
+        max_seqlen_k: int,
+        causal: bool,
+    ):
+        # SWA metadata mirrors the base cache/page/q shape, but the scheduler is
+        # built with the SWA window. `_init_swa_scheduler_metadata` clears the
+        # attr when the model has no SWA layers.
+        if needs_kvcache_metadata:
+            self._init_swa_scheduler_metadata(
+                metadata,
+                "swa_scheduler_metadata",
+                max_seqlen_k=self._max_seqlen_from_metadata(
+                    max_seqlen_k,
+                    metadata.cache_seqlens_int32,
+                ),
+                cache_seqlens=metadata.cache_seqlens_int32,
+                cu_seqlens_q=metadata.cu_seqlens_q,
+                cu_seqlens_k_new=cu_seqlens_k_new,
+                max_seqlen_q=metadata.max_seq_len_q,
+                causal=causal,
+                page_size=self.page_size,
+            )
+        else:
+            setattr(metadata, "swa_scheduler_metadata", None)
+
+    def _init_local_scheduler_metadata(
+        self,
+        local_metadata,
+        *,
+        needs_kvcache_metadata: bool,
+    ):
+        # Local attention owns a different page table and KV length tensor from
+        # the normal paged-cache path, so it cannot reuse base/SWA metadata.
+        # Only build it when local metadata exists for this batch.
+        if local_metadata is None:
+            return
+
+        if needs_kvcache_metadata:
             self._set_scheduler_metadata(
                 local_metadata,
                 "scheduler_metadata",
@@ -374,65 +890,23 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     page_size=self.page_size,
                 ),
             )
-        elif local_metadata is not None:
+        else:
             setattr(local_metadata, "scheduler_metadata", None)
 
+    def _init_encoder_scheduler_metadata(
+        self,
+        metadata,
+        *,
+        needs_kvcache_metadata: bool,
+        is_decode: bool,
+    ):
+        # Encoder/cross-attention has separate cache lengths and is always
+        # non-causal. Avoid building it for decoder-only models.
         if (
-            forward_batch.forward_mode.is_context_parallel_extend()
-            and forward_batch.attn_cp_metadata is not None
-            and self.attn_cp_size > 1
+            needs_kvcache_metadata
+            and self._has_cross_attention_layer
+            and metadata.encoder_lens_int32 is not None
         ):
-            cp_meta = forward_batch.attn_cp_metadata
-            device = metadata.cache_seqlens_int32.device
-            cu_seqlens_q_prev = torch.tensor(
-                [0, cp_meta.actual_seq_q_prev], device=device, dtype=torch.int32
-            )
-            cu_seqlens_q_next = torch.tensor(
-                [0, cp_meta.actual_seq_q_next], device=device, dtype=torch.int32
-            )
-
-            def _cp_scheduler_metadata(
-                max_seqlen_k, cache_seqlens, cu_seqlens_q, max_seqlen_q, window_size
-            ):
-                return self._compute_no_mla_scheduler_metadata(
-                    max_seqlen_k=max_seqlen_k,
-                    cache_seqlens=cache_seqlens,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k_new=metadata.cu_seqlens_k,
-                    max_seqlen_q=max_seqlen_q,
-                    causal=True,
-                    window_size=window_size,
-                    page_size=self.page_size,
-                )
-
-            self._set_scheduler_metadata(
-                metadata,
-                "cp_scheduler_metadata_prev",
-                _cp_scheduler_metadata(
-                    int(cp_meta.kv_len_prev),
-                    cp_meta.kv_len_prev_tensor,
-                    cu_seqlens_q_prev,
-                    cp_meta.actual_seq_q_prev,
-                    (-1, -1),
-                ),
-            )
-            self._set_scheduler_metadata(
-                metadata,
-                "cp_scheduler_metadata_next",
-                _cp_scheduler_metadata(
-                    int(cp_meta.kv_len_next),
-                    cp_meta.kv_len_next_tensor,
-                    cu_seqlens_q_next,
-                    cp_meta.actual_seq_q_next,
-                    (-1, -1),
-                ),
-            )
-        else:
-            setattr(metadata, "cp_scheduler_metadata_prev", None)
-            setattr(metadata, "cp_scheduler_metadata_next", None)
-
-        if needs_kvcache_metadata and metadata.encoder_lens_int32 is not None:
-            encoder_max_seqlen_q = 1 if is_decode else metadata.max_seq_len_q
             self._set_scheduler_metadata(
                 metadata,
                 "encoder_scheduler_metadata",
@@ -441,7 +915,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     cache_seqlens=metadata.encoder_lens_int32,
                     cu_seqlens_q=metadata.cu_seqlens_q,
                     cu_seqlens_k_new=metadata.encoder_cu_seqlens_k,
-                    max_seqlen_q=encoder_max_seqlen_q,
+                    max_seqlen_q=1 if is_decode else metadata.max_seq_len_q,
                     causal=False,
                     window_size=(-1, -1),
                     page_size=self.page_size,
@@ -450,34 +924,170 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         else:
             setattr(metadata, "encoder_scheduler_metadata", None)
 
-        metadata_expand = (
-            self.forward_metadata_spec_decode_expand if use_cascade else None
-        )
-        if metadata_expand is not None:
-            expand_page_size = (
-                1 if forward_batch.forward_mode.is_target_verify() else self.page_size
-            )
-            self._set_scheduler_metadata(
-                metadata_expand,
-                "scheduler_metadata",
-                self._compute_no_mla_scheduler_metadata(
-                    max_seqlen_k=self._max_seqlen_from_metadata(
-                        metadata_expand.max_seq_len_k,
-                        metadata_expand.cache_seqlens_int32,
-                    ),
-                    cache_seqlens=metadata_expand.cache_seqlens_int32,
-                    cu_seqlens_q=metadata_expand.cu_seqlens_q,
-                    cu_seqlens_k_new=metadata_expand.cu_seqlens_k,
-                    max_seqlen_q=metadata_expand.max_seq_len_q,
-                    causal=False,
-                    window_size=(-1, -1),
-                    page_size=expand_page_size,
+    def _spec_decode_expand_metadata(self, forward_batch: ForwardBatch, use_cascade):
+        if not use_cascade:
+            return None
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and not self._has_full_attention_layer
+        ):
+            return None
+        return self.forward_metadata_spec_decode_expand
+
+    def _init_full_spec_decode_expand_scheduler_metadata(
+        self,
+        metadata_expand,
+        *,
+        page_size: int,
+    ):
+        if not self._has_full_attention_layer:
+            setattr(metadata_expand, "scheduler_metadata", None)
+            return
+
+        self._set_scheduler_metadata(
+            metadata_expand,
+            "scheduler_metadata",
+            self._compute_no_mla_scheduler_metadata(
+                max_seqlen_k=self._max_seqlen_from_metadata(
+                    metadata_expand.max_seq_len_k,
+                    metadata_expand.cache_seqlens_int32,
                 ),
-            )
-        elif self.forward_metadata_spec_decode_expand is not None:
-            setattr(
-                self.forward_metadata_spec_decode_expand, "scheduler_metadata", None
-            )
+                cache_seqlens=metadata_expand.cache_seqlens_int32,
+                cu_seqlens_q=metadata_expand.cu_seqlens_q,
+                cu_seqlens_k_new=metadata_expand.cu_seqlens_k,
+                max_seqlen_q=metadata_expand.max_seq_len_q,
+                causal=False,
+                window_size=(-1, -1),
+                page_size=page_size,
+            ),
+        )
+
+    def _init_swa_spec_decode_expand_scheduler_metadata(
+        self,
+        metadata,
+        metadata_expand,
+        *,
+        page_size: int,
+    ):
+        self._init_swa_scheduler_metadata(
+            metadata_expand,
+            "swa_scheduler_metadata",
+            max_seqlen_k=self._max_seqlen_from_metadata(
+                metadata_expand.max_seq_len_k,
+                metadata_expand.cache_seqlens_int32,
+            ),
+            cache_seqlens=metadata_expand.cache_seqlens_int32,
+            cu_seqlens_q=metadata_expand.cu_seqlens_q,
+            cu_seqlens_k_new=metadata_expand.cu_seqlens_k,
+            max_seqlen_q=metadata_expand.max_seq_len_q,
+            causal=False,
+            page_size=page_size,
+        )
+        if metadata.swa_spec_metadata is None:
+            return
+
+        swa_spec_metadata = metadata.swa_spec_metadata
+        # Some speculative SWA batches carry a dedicated metadata owner because
+        # their page table/length tensors differ from the base expand owner.
+        self._init_swa_scheduler_metadata(
+            swa_spec_metadata,
+            "swa_scheduler_metadata",
+            max_seqlen_k=self._max_seqlen_from_metadata(
+                0,
+                swa_spec_metadata.cache_seqlens_int32,
+            ),
+            cache_seqlens=swa_spec_metadata.cache_seqlens_int32,
+            cu_seqlens_q=swa_spec_metadata.cu_seqlens_q,
+            cu_seqlens_k_new=swa_spec_metadata.cu_seqlens_k,
+            max_seqlen_q=swa_spec_metadata.max_seq_len_q,
+            causal=True,
+            page_size=page_size,
+        )
+
+    def _init_spec_decode_expand_scheduler_metadata(
+        self,
+        metadata,
+        forward_batch: ForwardBatch,
+        *,
+        use_cascade: bool,
+    ):
+        # Speculative cascade performs a second kvcache call over the expanded
+        # draft/verify tokens. Target-verify disables cascade for SWA layers, so
+        # a model with no full-attention layers does not need expand metadata in
+        # that mode.
+        metadata_expand = self._spec_decode_expand_metadata(forward_batch, use_cascade)
+        if metadata_expand is None:
+            stale_expand_metadata = self.forward_metadata_spec_decode_expand
+            if stale_expand_metadata is not None:
+                setattr(stale_expand_metadata, "scheduler_metadata", None)
+                setattr(stale_expand_metadata, "swa_scheduler_metadata", None)
+            if getattr(metadata, "swa_spec_metadata", None) is not None:
+                setattr(metadata.swa_spec_metadata, "swa_scheduler_metadata", None)
+            return
+
+        expand_page_size = (
+            1 if forward_batch.forward_mode.is_target_verify() else self.page_size
+        )
+        self._init_full_spec_decode_expand_scheduler_metadata(
+            metadata_expand,
+            page_size=expand_page_size,
+        )
+        self._init_swa_spec_decode_expand_scheduler_metadata(
+            metadata,
+            metadata_expand,
+            page_size=expand_page_size,
+        )
+
+    def _init_no_mla_scheduler_metadata(self, forward_batch: ForwardBatch):
+        metadata = self.forward_metadata
+        if metadata is None:
+            return
+
+        is_decode = forward_batch.forward_mode.is_decode_or_idle()
+        use_cascade = self.topk > 1 and (
+            (is_decode and forward_batch.spec_info is not None)
+            or forward_batch.forward_mode.is_target_verify()
+        )
+        # Target-verify SWA does not use the cascade path in forward_extend, so
+        # its scheduler metadata must keep the normal causal flag.
+        use_swa_cascade = (
+            self.topk > 1 and is_decode and forward_batch.spec_info is not None
+        )
+        needs_kvcache_metadata = self._needs_no_mla_kvcache_scheduler_metadata(
+            forward_batch
+        )
+        local_metadata = getattr(metadata, "local_attn_metadata", None)
+
+        cu_seqlens_k_new = None if is_decode else metadata.cu_seqlens_k
+        self._init_full_self_scheduler_metadata(
+            metadata,
+            needs_kvcache_metadata=needs_kvcache_metadata,
+            cu_seqlens_k_new=cu_seqlens_k_new,
+            max_seqlen_k=metadata.max_seq_len_k,
+            causal=not use_cascade,
+        )
+        self._init_self_scheduler_metadata(
+            metadata,
+            needs_kvcache_metadata=needs_kvcache_metadata,
+            cu_seqlens_k_new=cu_seqlens_k_new,
+            max_seqlen_k=metadata.max_seq_len_k,
+            causal=not use_swa_cascade,
+        )
+        self._init_local_scheduler_metadata(
+            local_metadata,
+            needs_kvcache_metadata=needs_kvcache_metadata,
+        )
+        self._init_cp_scheduler_metadata(forward_batch, local_metadata)
+        self._init_encoder_scheduler_metadata(
+            metadata,
+            needs_kvcache_metadata=needs_kvcache_metadata,
+            is_decode=is_decode,
+        )
+        self._init_spec_decode_expand_scheduler_metadata(
+            metadata,
+            forward_batch,
+            use_cascade=use_cascade,
+        )
 
     def _init_scheduler_metadata(self, forward_batch: ForwardBatch):
         if self.use_mla:
@@ -485,9 +1095,77 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         else:
             self._init_no_mla_scheduler_metadata(forward_batch)
 
+    @staticmethod
+    def _synthetic_forward_batch_for_scheduler_metadata(forward_mode, spec_info):
+        return SimpleNamespace(
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+            attn_cp_metadata=None,
+        )
+
+    def _init_scheduler_metadata_for_batch(
+        self,
+        forward_batch,
+        *,
+        input_token_count: Optional[int],
+        seq_lens_cpu=None,
+    ):
+        self._prepare_attn_cp_metadata_for_init(
+            forward_batch,
+            input_token_count=input_token_count,
+            seq_lens_cpu=seq_lens_cpu,
+        )
+        self._init_scheduler_metadata(forward_batch)
+
+    def _prepare_cuda_graph_capture_scheduler_metadata(
+        self,
+        bs: int,
+        num_tokens: int,
+        seq_lens: torch.Tensor,
+        forward_mode,
+        spec_info,
+    ):
+        forward_batch_for_init = self._synthetic_forward_batch_for_scheduler_metadata(
+            forward_mode, spec_info
+        )
+        self._init_scheduler_metadata_for_batch(
+            forward_batch_for_init,
+            input_token_count=num_tokens,
+            seq_lens_cpu=seq_lens,
+        )
+        self._capture_cuda_graph_scheduler_metadata(bs, forward_mode, spec_info)
+
+    def _prepare_cuda_graph_replay_scheduler_metadata(
+        self,
+        bs: int,
+        seq_lens_sum: int,
+        forward_mode,
+        spec_info,
+        seq_lens_cpu: Optional[torch.Tensor],
+    ):
+        """Regenerate replay metadata without changing graph-captured addresses."""
+        forward_batch_for_init = self._synthetic_forward_batch_for_scheduler_metadata(
+            forward_mode, spec_info
+        )
+        self._prepare_attn_cp_metadata_for_init(
+            forward_batch_for_init,
+            input_token_count=seq_lens_sum,
+            seq_lens_cpu=seq_lens_cpu,
+        )
+        self._restore_cuda_graph_scheduler_static_fields(bs, forward_mode, spec_info)
+        self._init_scheduler_metadata(forward_batch_for_init)
+        self._sync_cuda_graph_scheduler_metadata(bs, forward_mode, spec_info)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
-        self._init_scheduler_metadata(forward_batch)
+        self._init_scheduler_metadata_for_batch(
+            forward_batch,
+            input_token_count=(
+                len(forward_batch.input_ids)
+                if getattr(forward_batch, "input_ids", None) is not None
+                else None
+            ),
+        )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -508,12 +1186,12 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
             forward_mode,
             spec_info,
         )
-        self._init_scheduler_metadata(
-            SimpleNamespace(
-                forward_mode=forward_mode,
-                spec_info=spec_info,
-                attn_cp_metadata=None,
-            )
+        self._prepare_cuda_graph_capture_scheduler_metadata(
+            bs,
+            num_tokens,
+            seq_lens,
+            forward_mode,
+            spec_info,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -539,12 +1217,12 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
             seq_lens_cpu,
             out_cache_loc,
         )
-        self._init_scheduler_metadata(
-            SimpleNamespace(
-                forward_mode=forward_mode,
-                spec_info=spec_info,
-                attn_cp_metadata=None,
-            )
+        self._prepare_cuda_graph_replay_scheduler_metadata(
+            bs,
+            seq_lens_sum,
+            forward_mode,
+            spec_info,
+            seq_lens_cpu,
         )
 
     def _scheduler_metadata_for_kvcache(
@@ -554,36 +1232,34 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         is_swa_layer: bool = False,
         is_cross_attention: bool = False,
         local_metadata=None,
-        max_seqlen_k: Optional[int] = None,
-        cache_seqlens: Optional[torch.Tensor] = None,
-        cu_seqlens_q: Optional[torch.Tensor] = None,
-        cu_seqlens_k_new: Optional[torch.Tensor] = None,
-        max_seqlen_q: Optional[int] = None,
-        causal: bool = True,
-        window_size: Tuple[int, int] = (-1, -1),
-        page_size: Optional[int] = None,
     ):
+        # Runtime kvcache call sites should not rebuild scheduler metadata.
+        # They select the owner refreshed by init/cuda-graph replay and fail
+        # fast if the selected family was not initialized for this batch.
         if local_metadata is not None:
-            return getattr(local_metadata, "scheduler_metadata", None)
-        if is_swa_layer:
-            assert max_seqlen_q is not None
-            assert cache_seqlens is not None
-            assert cu_seqlens_q is not None
-            if max_seqlen_k is None:
-                max_seqlen_k = self._max_seqlen_from_metadata(0, cache_seqlens)
-            return self._compute_no_mla_scheduler_metadata(
-                max_seqlen_k=max_seqlen_k,
-                cache_seqlens=cache_seqlens,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k_new=cu_seqlens_k_new,
-                max_seqlen_q=max_seqlen_q,
-                causal=causal,
-                window_size=window_size,
-                page_size=page_size if page_size is not None else self.page_size,
-            )
-        if is_cross_attention:
-            return getattr(metadata, "encoder_scheduler_metadata", None)
-        return getattr(metadata, "scheduler_metadata", None)
+            scheduler_metadata = getattr(local_metadata, "scheduler_metadata", None)
+            attr = "local_attn_metadata.scheduler_metadata"
+        elif is_swa_layer:
+            scheduler_metadata = getattr(metadata, "swa_scheduler_metadata", None)
+            attr = "swa_scheduler_metadata"
+        elif is_cross_attention:
+            scheduler_metadata = getattr(metadata, "encoder_scheduler_metadata", None)
+            attr = "encoder_scheduler_metadata"
+        else:
+            scheduler_metadata = getattr(metadata, "scheduler_metadata", None)
+            attr = "scheduler_metadata"
+
+        assert scheduler_metadata is not None, (
+            "MUSA FA3 kvcache attention requires precomputed "
+            f"{attr}; init_forward_metadata/replay must refresh it first."
+        )
+        return scheduler_metadata
+
+    def _spec_decode_expand_scheduler_metadata(self, *, is_swa_layer: bool):
+        return self._scheduler_metadata_for_kvcache(
+            self.forward_metadata_spec_decode_expand,
+            is_swa_layer=is_swa_layer,
+        )
 
     def _cp_scheduler_metadata_for_kvcache(
         self,
@@ -591,37 +1267,43 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         forward_batch: ForwardBatch,
         cache_seqlens_cp,
         is_swa_layer: bool,
-        cu_seqlens_q_cp: Optional[torch.Tensor] = None,
-        max_seqlen_q_cp: Optional[int] = None,
-        cu_seqlens_k_new: Optional[torch.Tensor] = None,
-        window_size: Tuple[int, int] = (-1, -1),
+        use_local_attn: bool,
     ):
         assert not self.use_mla
-        if is_swa_layer or cu_seqlens_k_new is None:
-            assert cu_seqlens_q_cp is not None
-            assert max_seqlen_q_cp is not None
-            return self._compute_no_mla_scheduler_metadata(
-                max_seqlen_k=self._max_seqlen_from_metadata(0, cache_seqlens_cp),
-                cache_seqlens=cache_seqlens_cp,
-                cu_seqlens_q=cu_seqlens_q_cp,
-                cu_seqlens_k_new=cu_seqlens_k_new,
-                max_seqlen_q=max_seqlen_q_cp,
-                causal=True,
-                window_size=window_size,
-                page_size=self.page_size,
-            )
         is_cp_prev = (
             cache_seqlens_cp is forward_batch.attn_cp_metadata.kv_len_prev_tensor
         )
-        return getattr(
-            metadata,
-            (
-                "cp_scheduler_metadata_prev"
-                if is_cp_prev
-                else "cp_scheduler_metadata_next"
-            ),
-            None,
+        side = "prev" if is_cp_prev else "next"
+        if use_local_attn:
+            prefix = "cp_local_swa" if is_swa_layer else "cp_local"
+            error_scope = "CP local"
+        else:
+            prefix = "cp_swa" if is_swa_layer else "cp"
+            error_scope = "CP"
+        attr = f"{prefix}_scheduler_metadata_{side}"
+        scheduler_metadata = getattr(metadata, attr, None)
+        assert scheduler_metadata is not None, (
+            f"MUSA FA3 {error_scope} kvcache attention requires precomputed "
+            f"{attr}; init_forward_metadata must refresh it first."
         )
+        return scheduler_metadata
+
+    def _cp_cu_seqlens_k_new_for_kvcache(
+        self,
+        metadata,
+        forward_batch: ForwardBatch,
+        cache_seqlens_cp,
+    ) -> torch.Tensor:
+        is_cp_prev = (
+            cache_seqlens_cp is forward_batch.attn_cp_metadata.kv_len_prev_tensor
+        )
+        attr = "cp_cu_seqlens_k_new_prev" if is_cp_prev else "cp_cu_seqlens_k_new_next"
+        cu_seqlens_k_new = getattr(metadata, attr, None)
+        assert cu_seqlens_k_new is not None, (
+            "MUSA FA3 CP kvcache attention requires precomputed "
+            f"{attr}; init_forward_metadata must refresh it first."
+        )
+        return cu_seqlens_k_new
 
     def forward_extend(
         self,
@@ -706,6 +1388,10 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         if sinks is not None:
             kwargs["sinks"] = sinks
 
+        flash_attn_varlen_func = self.flash_attn_varlen_func
+        flash_attn_with_kvcache = self.flash_attn_with_kvcache
+
+        scheduler_metadata_owner = metadata
         if use_local_attn:
             local_metadata = metadata.local_attn_metadata
             page_table = local_metadata.local_block_table
@@ -719,6 +1405,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
             cache_seqlens = swa_spec_metadata.cache_seqlens_int32
             max_seqlen_q = swa_spec_metadata.max_seq_len_q
             cu_seqlens_k = swa_spec_metadata.cu_seqlens_k
+            scheduler_metadata_owner = swa_spec_metadata
         else:
             page_table = metadata.page_table
             if is_swa_layer and self.use_sliding_window_kv_pool:
@@ -759,15 +1446,19 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                 def _fa_cp_attn(
                     q_chunk, cu_seqlens_q_cp, cache_seqlens_cp, max_seqlen_q_cp
                 ):
+                    cu_seqlens_k_cp = None
+                    if not use_local_attn:
+                        cu_seqlens_k_cp = self._cp_cu_seqlens_k_new_for_kvcache(
+                            metadata,
+                            forward_batch,
+                            cache_seqlens_cp,
+                        )
                     scheduler_metadata = self._cp_scheduler_metadata_for_kvcache(
                         metadata,
                         forward_batch,
                         cache_seqlens_cp,
                         is_swa_layer,
-                        cu_seqlens_q_cp=cu_seqlens_q_cp,
-                        max_seqlen_q_cp=max_seqlen_q_cp,
-                        cu_seqlens_k_new=(cu_seqlens_k if not use_local_attn else None),
-                        window_size=window_size,
+                        use_local_attn=use_local_attn,
                     )
                     return flash_attn_with_kvcache(
                         q=q_chunk,
@@ -776,7 +1467,9 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                         page_table=page_table,
                         cache_seqlens=cache_seqlens_cp,
                         cu_seqlens_q=cu_seqlens_q_cp,
-                        cu_seqlens_k_new=(cu_seqlens_k if not use_local_attn else None),
+                        cu_seqlens_k_new=(
+                            cu_seqlens_k_cp if not use_local_attn else None
+                        ),
                         max_seqlen_q=max_seqlen_q_cp,
                         softmax_scale=layer.scaling,
                         causal=False if use_cascade_attn else causal,
@@ -797,13 +1490,20 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     _fa_cp_attn,
                 )
             elif (
-                (
+                layer.is_cross_attention
+                or (
                     forward_batch.extend_prefix_lens_cpu is not None
                     and any(forward_batch.extend_prefix_lens_cpu)
                 )
                 or forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend()
+                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
             ):
+                scheduler_metadata = self._scheduler_metadata_for_kvcache(
+                    scheduler_metadata_owner,
+                    is_swa_layer=is_swa_layer,
+                    is_cross_attention=layer.is_cross_attention,
+                    local_metadata=local_metadata if use_local_attn else None,
+                )
                 result = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
@@ -820,25 +1520,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
-                    scheduler_metadata=self._scheduler_metadata_for_kvcache(
-                        metadata,
-                        is_swa_layer=is_swa_layer,
-                        is_cross_attention=layer.is_cross_attention,
-                        local_metadata=local_metadata if use_local_attn else None,
-                        max_seqlen_k=(
-                            metadata.encoder_max_seq_len_k
-                            if layer.is_cross_attention
-                            else self._max_seqlen_from_metadata(
-                                metadata.max_seq_len_k, cache_seqlens
-                            )
-                        ),
-                        cache_seqlens=cache_seqlens,
-                        cu_seqlens_q=cu_seqlens_q,
-                        cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
-                        max_seqlen_q=max_seqlen_q,
-                        causal=False if use_cascade_attn else causal,
-                        window_size=window_size,
-                    ),
+                    scheduler_metadata=scheduler_metadata,
                     num_splits=self.num_splits,
                     **kwargs,
                 )
@@ -885,8 +1567,8 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=True,
-                    scheduler_metadata=self._scheduler_metadata_for_kvcache(
-                        self.forward_metadata_spec_decode_expand,
+                    scheduler_metadata=self._spec_decode_expand_scheduler_metadata(
+                        is_swa_layer=is_swa_layer,
                     ),
                     num_splits=self.num_splits,
                     **kwargs,
@@ -1098,6 +1780,8 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         if sinks is not None:
             kwargs["sinks"] = sinks
 
+        flash_attn_with_kvcache = self.flash_attn_with_kvcache
+
         k_descale, v_descale = None, None
         if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
             if layer.k_scale is not None:
@@ -1138,13 +1822,6 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     scheduler_metadata=self._scheduler_metadata_for_kvcache(
                         metadata,
                         is_cross_attention=True,
-                        max_seqlen_k=metadata.encoder_max_seq_len_k,
-                        cache_seqlens=metadata.encoder_lens_int32,
-                        cu_seqlens_q=metadata.cu_seqlens_q,
-                        cu_seqlens_k_new=metadata.encoder_cu_seqlens_k,
-                        max_seqlen_q=1,
-                        causal=False,
-                        window_size=(-1, -1),
                     ),
                     num_splits=self.num_splits,
                     **kwargs,
@@ -1168,13 +1845,6 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     scheduler_metadata=self._scheduler_metadata_for_kvcache(
                         metadata,
                         local_metadata=local_attn_metadata,
-                        max_seqlen_k=local_attn_metadata.local_max_seq_len,
-                        cache_seqlens=local_attn_metadata.local_seqused_k,
-                        cu_seqlens_q=local_attn_metadata.local_query_start_loc,
-                        cu_seqlens_k_new=None,
-                        max_seqlen_q=local_attn_metadata.local_max_query_len,
-                        causal=True,
-                        window_size=(-1, -1),
                     ),
                     num_splits=self.num_splits,
                     **kwargs,
@@ -1191,7 +1861,6 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                             )
                         )
                 cache_seqlens = metadata.cache_seqlens_int32
-                cu_seqlens_k = metadata.cu_seqlens_k
                 max_seqlen_q = metadata.max_seq_len_q
                 q_reshaped = q.contiguous().view(
                     -1, layer.tp_q_head_num, layer.head_dim
@@ -1215,15 +1884,6 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     scheduler_metadata=self._scheduler_metadata_for_kvcache(
                         metadata,
                         is_swa_layer=is_swa_layer,
-                        max_seqlen_k=self._max_seqlen_from_metadata(
-                            metadata.max_seq_len_k, cache_seqlens
-                        ),
-                        cache_seqlens=cache_seqlens,
-                        cu_seqlens_q=metadata.cu_seqlens_q,
-                        cu_seqlens_k_new=None,
-                        max_seqlen_q=max_seqlen_q,
-                        causal=False if use_cascade_attn else causal,
-                        window_size=window_size,
                     ),
                     num_splits=self.num_splits,
                     **kwargs,
@@ -1247,8 +1907,8 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                             k_descale=k_descale,
                             v_descale=v_descale,
                             return_softmax_lse=True,
-                            scheduler_metadata=self._scheduler_metadata_for_kvcache(
-                                self.forward_metadata_spec_decode_expand,
+                            scheduler_metadata=self._spec_decode_expand_scheduler_metadata(
+                                is_swa_layer=is_swa_layer,
                             ),
                             num_splits=self.num_splits,
                             **kwargs,

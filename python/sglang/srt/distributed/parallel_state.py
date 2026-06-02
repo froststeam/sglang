@@ -1567,7 +1567,9 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
     ):
         with contextlib.ExitStack() as stack:
             seen = {id(_TP)}
-            for group in (_MOE_EP, _MOE_TP):
+            # MUSA(XXX): ATTN_TP can own a custom allreduce communicator for
+            # DP attention, so it must join graph capture like TP/MOE groups.
+            for group in (_MOE_EP, _MOE_TP, _ATTN_TP):
                 if group is not None and id(group) not in seen:
                     seen.add(id(group))
                     stack.enter_context(group.graph_capture(context))
@@ -1919,14 +1921,16 @@ def initialize_model_parallel(
                 )
                 ranks = list(range(st, en))
                 group_ranks.append(ranks)
-
+        # MUSA(XXX): DP attention on MUSA uses custom allreduce on the
+        # attention TP group. Keep PyNccl enabled here so its communicator
+        # matches the TP group communication path used during graph capture.
         _ATTN_TP = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,
             backend,
-            use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
+            use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem or _is_musa,
             use_mscclpp_allreduce=False,
-            use_custom_allreduce=False,
+            use_custom_allreduce=_is_musa,
             use_torch_symm_mem_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attention_tp",

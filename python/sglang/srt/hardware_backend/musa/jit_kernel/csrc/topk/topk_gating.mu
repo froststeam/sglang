@@ -829,7 +829,40 @@ void launch_topk(ffi::TensorView topk_weights, ffi::TensorView topk_ids,
   ffi::MUSADeviceGuard device_guard(gating_output.device().device_id);
   musaStream_t stream = get_stream(gating_output.device());
 
-  if (num_experts == 256) {
+  if (num_experts == 128) {
+    constexpr int values_per_thread = 4;
+    const int blocks = (num_tokens + kWarpsPerCta - 1) / kWarpsPerCta;
+    if constexpr (IsSoftmax) {
+      if (topk == 8 && !has_correction_bias && moe_softcapping <= 0.0f) {
+        if (renormalize) {
+          const int halfwarp_rows_per_cta = kWarpsPerCta * 2;
+          const int halfwarp_blocks =
+              (num_tokens + halfwarp_rows_per_cta - 1) / halfwarp_rows_per_cta;
+          topk_softmax_no_bias_renorm_halfwarp_kernel_fixed_k<T, 128, 8>
+              <<<halfwarp_blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                  input_ptr, weights_ptr, ids_ptr, num_tokens);
+        } else {
+          topk_softmax_no_bias_warp_kernel_fixed_k<T, 128, values_per_thread, 8>
+              <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                  input_ptr, weights_ptr, ids_ptr, num_tokens, renormalize);
+        }
+      } else {
+        topk_softmax_warp_kernel<T, 128, values_per_thread>
+            <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                input_ptr, weights_ptr, ids_ptr, bias_ptr, num_tokens, topk,
+                renormalize, moe_softcapping, has_correction_bias);
+      }
+    } else if (!has_correction_bias) {
+      topk_sigmoid_no_bias_warp_kernel<T, 128, values_per_thread>
+          <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+              input_ptr, weights_ptr, ids_ptr, num_tokens, topk, renormalize);
+    } else {
+      topk_sigmoid_warp_kernel<T, 128, values_per_thread>
+          <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+              input_ptr, weights_ptr, ids_ptr, bias_ptr, num_tokens, topk,
+              renormalize, has_correction_bias);
+    }
+  } else if (num_experts == 256) {
     constexpr int values_per_thread = 8;
     const int blocks = (num_tokens + kWarpsPerCta - 1) / kWarpsPerCta;
     if constexpr (IsSoftmax) {
