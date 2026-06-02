@@ -301,12 +301,16 @@ __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) custom_all_reduce_2sho
   int32_t idx_base = bidx * thread_num;
   int32_t idx_in_blk = coalesce_tid + (local_rank << coalesce_sft) + (group_id << group_stride_sft);
 
-  // first sync barrier
+  // MUSA(XXX): The peer counters are the inter-rank communication barrier for
+  // this custom allreduce, so every replay needs a fresh device-side epoch.
   FlagType* target_barrier = nullptr;
   FlagType* local_barrier = nullptr;
   FlagType flag;
   if (tidx < nranks) {
-    flag = round << 1;
+    // Use a device-side epoch instead of the host-provided round. Host kernel
+    // arguments are fixed during graph capture, so using round as the barrier
+    // epoch can make graph replay reuse stale signal values and deadlock.
+    flag = atomicAdd(&(self_sg->self_counter[bidx][tidx]), 1) + 1;
     target_barrier = &sg.signals[tidx]->peer_counter[flag & 1][bidx][local_rank];
     local_barrier = &self_sg->peer_counter[flag & 1][bidx][tidx];
     atomicExch(target_barrier, flag);
@@ -362,9 +366,10 @@ __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) custom_all_reduce_2sho
     __threadfence_system_noflush();
   }
   buffer_ptr = get_tmp_buf<Vec>(sg.signals[target_rank]);
-  // second sync barrier
+  // MUSA(XXX): Reuse the same counter protocol after publishing the reduced
+  // chunks, making sure remote ranks observe ready data before all-gather.
   if (tidx < nranks) {
-    flag = atomicAdd(&(self_sg->self_counter[bidx][tidx]), 1);
+    flag = atomicAdd(&(self_sg->self_counter[bidx][tidx]), 1) + 1;
     target_barrier = &sg.signals[tidx]->peer_counter[flag & 1][bidx][local_rank];
     local_barrier = &self_sg->peer_counter[flag & 1][bidx][tidx];
     atomicExch(target_barrier, flag);
