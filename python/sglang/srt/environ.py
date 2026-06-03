@@ -351,6 +351,7 @@ class Envs:
 
     # MTHREADS & MUSA
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
+    SGLANG_MUSA_FA3_SYNC_BEFORE_KVCACHE_ATTENTION = EnvBool(False)
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)

@@ -86,6 +86,24 @@ def test_causal_conv1d_tilelang_matches_triton():
 
     torch.testing.assert_close(out_tilelang, out_triton, rtol=1e-2, atol=1e-2)
 
+    padded_seq_lens_cpu = [seq_len] * batch + [seq_len * 4]
+    out_tilelang_padded_lens = tilelang_causal_conv1d_fwd(
+        x,
+        weight,
+        bias,
+        state.clone(),
+        query_start_loc,
+        padded_seq_lens_cpu,
+        cache_indices,
+        has_initial_state,
+        "silu",
+    )
+    torch.musa.synchronize()
+
+    torch.testing.assert_close(
+        out_tilelang_padded_lens, out_triton, rtol=1e-2, atol=1e-2
+    )
+
 
 def test_rms_norm_gated_tilelang_matches_triton():
     from sglang.srt.layers.attention.fla.layernorm_gated import (

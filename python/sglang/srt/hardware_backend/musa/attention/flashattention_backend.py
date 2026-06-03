@@ -94,6 +94,12 @@ def flash_attn_with_kvcache(
         scheduler_metadata is not None
     ), "MUSA MATE FA3 flash_attn_with_kvcache requires scheduler_metadata."
 
+    if (
+        envs.SGLANG_MUSA_FA3_SYNC_BEFORE_KVCACHE_ATTENTION.get()
+        and not get_is_capture_mode()
+    ):
+        torch.get_device_module(q.device).synchronize()
+
     return mate_flash_attn_with_kvcache(
         q=q,
         k_cache=k_cache,
@@ -141,15 +147,16 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         self.num_hidden_layers = model_runner.model_config.num_hidden_layers
         self.first_k_dense_replace = model_runner.model_config.first_k_dense_replace
         self.full_attention_interval = model_runner.model_config.full_attention_interval
-        (
-            self._full_attention_layout,
-            self._swa_attention_layout,
-            self._swa_window_size,
-            self._has_full_attention_layer,
-            self._has_local_attention_layer,
-            self._has_cross_attention_layer,
-            self._has_swa_local_attention_layer,
-        ) = self._get_layer_attention_layouts(model_runner)
+        if not self.use_mla:
+            (
+                self._full_attention_layout,
+                self._swa_attention_layout,
+                self._swa_window_size,
+                self._has_full_attention_layer,
+                self._has_local_attention_layer,
+                self._has_cross_attention_layer,
+                self._has_swa_local_attention_layer,
+            ) = self._get_no_mla_layer_attention_layouts(model_runner)
         _softcapping = getattr(
             model_runner.model_config.hf_text_config, "attn_logit_softcapping", None
         )
@@ -224,7 +231,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         )
 
     @classmethod
-    def _get_layer_attention_layouts(cls, model_runner: ModelRunner):
+    def _get_no_mla_layer_attention_layouts(cls, model_runner: ModelRunner):
         # MATE scheduler metadata is built from a single attention layout per
         # call. A model may have different full-attention and SWA structures,
         # but each family must be internally uniform:

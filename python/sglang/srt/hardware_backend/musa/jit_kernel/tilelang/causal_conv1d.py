@@ -1072,13 +1072,19 @@ def _check_inputs(
             )
         if conv_states.size(1) != dim or conv_states.size(2) < width - 1:
             raise ValueError("conv_states shape is incompatible with x/weight")
-    if sum(seq_lens_cpu) != total_tokens:
-        raise ValueError("seq_lens_cpu must sum to x.shape[1]")
+    seq_lens_sum = sum(seq_lens_cpu)
+    max_seq_len = max(seq_lens_cpu, default=0)
+    if seq_lens_sum != total_tokens:
+        # CUDA graph / DP padding can leave seq_lens_cpu describing the padded
+        # batch while x and query_start_loc describe the actual packed tokens.
+        # The kernel gets true per-sequence bounds from query_start_loc, so use
+        # a conservative launch bound instead of rejecting a valid packed input.
+        max_seq_len = total_tokens
     return (
         dim,
         total_tokens,
         width,
-        max(seq_lens_cpu, default=0),
+        max_seq_len,
         tilelang_dtype(x.dtype),
     )
 
