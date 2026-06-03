@@ -616,13 +616,23 @@ def _fused_moe_kernel_sequence(
     elif activation == "gelu" and is_gated:
         assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
         assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
-        if _is_cuda or _is_hip:
+        if _is_cuda or _is_hip or _is_musa:
             if filter_expert and _is_cuda:
                 gelu_and_mul(
                     intermediate_cache1.view(-1, N),
                     intermediate_cache2,
                     expert_ids=(expert_ids if down_moe_use_tma else topk_ids.view(-1)),
                     expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
+                )
+            elif _is_musa:
+                act_and_mul_triton(
+                    intermediate_cache1.view(-1, N),
+                    intermediate_cache2,
+                    config,
+                    topk_ids,
+                    expert_ids,
+                    down_moe_use_tma,
+                    activation,
                 )
             else:
                 gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)

@@ -718,12 +718,17 @@ class PrefillAdder:
                 self.tree_cache.dec_lock_ref(last_node)
 
     def add_one_req_ignore_eos(self, req: Req):
-        paged_input = self.ceil_paged_tokens(req.extend_input_len)
-        if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
+        input_tokens = self.ceil_paged_tokens(req.extend_input_len)
+
+        # Early exit if no enough tokens for the input tokens
+        if input_tokens > min(self.cur_rem_tokens, self.rem_total_tokens):
             return AddReqResult.NO_TOKEN
         if self.is_hybrid_swa:
             if self._swa_budget_for_req(req.extend_input_len) > self.rem_swa_tokens:
                 return AddReqResult.NO_TOKEN
+
+        if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+            return AddReqResult.OTHER
 
         def add_req_state(r, insert_sort=False):
             new_token_ratio = (
@@ -761,9 +766,7 @@ class PrefillAdder:
         if not self.is_hybrid_swa:
             # Skip this logic for swa. The SWA has different memory management, and
             # this mechanism is underestimating the memory usage.
-            cur_rem_tokens = self.cur_rem_tokens - self.ceil_paged_tokens(
-                req.extend_input_len
-            )
+            cur_rem_tokens = self.cur_rem_tokens - input_tokens
             tokens_freed = 0
             for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
                 # tokens_left gives a reservative calculation as the last token is not stored

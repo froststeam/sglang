@@ -951,8 +951,7 @@ def _apply_activation(x, ACTIVATION_TYPE: tl.constexpr):
     if ACTIVATION_TYPE == "silu":
         return x * tl.sigmoid(x)
     elif ACTIVATION_TYPE == "gelu":
-        kAlpha = 0.7978845608028654
-        return 0.5 * x * (1 + tanh(kAlpha * (x + 0.044715 * x * x * x)))
+        return 0.5 * x * (1 + tl.erf(x * 0.7071067811865475))
     else:
         raise ValueError(f"Unsupported activation: {ACTIVATION_TYPE}")
 
