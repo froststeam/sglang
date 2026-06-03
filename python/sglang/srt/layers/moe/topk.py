@@ -1115,21 +1115,6 @@ def biased_grouped_topk_gpu(
             routed_scaling_factor if routed_scaling_factor is not None else 1.0,
         )
         return topk_weights, topk_ids
-    elif _is_musa and (
-        gating_output.shape[1] // num_expert_group <= 32
-        or (num_expert_group == 1 and gating_output.shape[1] in {160, 256, 384})
-    ):
-        topk_weights, topk_ids = moe_fused_gate(
-            gating_output.to(dtype=torch.float32),
-            correction_bias,
-            num_expert_group,
-            topk_group,
-            topk,
-            num_fused_shared_experts,
-            routed_scaling_factor if routed_scaling_factor is not None else 1.0,
-            True,
-            apply_routed_scaling_factor_on_output,
-        )
     else:
         # Use optimized path for Kimi K2 (384 experts with num_expert_group=1)
         num_experts = gating_output.shape[1]
