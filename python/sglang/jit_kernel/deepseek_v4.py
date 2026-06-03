@@ -13,7 +13,6 @@ from sglang.jit_kernel.utils import (
     make_cpp_args,
 )
 from sglang.srt.environ import envs
-
 from sglang.srt.layers import deep_gemm_wrapper
 
 if TYPE_CHECKING:

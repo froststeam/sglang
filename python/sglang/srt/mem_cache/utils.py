@@ -47,7 +47,7 @@ def set_mla_kv_buffer_kernel(
     mask = offs < total_dim
 
     if USE_GDC:
-        tl.extra.cuda.gdc_wait()
+        pass
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
@@ -88,7 +88,7 @@ def set_mla_kv_buffer_kernel(
     tl.store(dst_ptr, src, mask=mask)
 
     if USE_GDC:
-        tl.extra.cuda.gdc_launch_dependents()
+        pass
 
 
 # Above this loc count the TMA bulk-store path overtakes the single-CTA-per-loc
@@ -195,7 +195,7 @@ def set_mla_kv_buffer_fp8_quant_kernel(
     mask = offs < total_dim
 
     if USE_GDC:
-        tl.extra.cuda.gdc_wait()
+        pass
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     dst_ptr = kv_buffer_fp8_ptr + loc * buffer_stride + offs
@@ -231,7 +231,7 @@ def set_mla_kv_buffer_fp8_quant_kernel(
     tl.store(dst_ptr, src, mask=mask)
 
     if USE_GDC:
-        tl.extra.cuda.gdc_launch_dependents()
+        pass
 
 
 def set_mla_kv_buffer_triton_fp8_quant(

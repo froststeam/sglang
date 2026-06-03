@@ -89,6 +89,7 @@ class MusaFlashInferGDNKernel(LinearAttnKernelBase):
             raise NotImplementedError(
                 "FlashInfer GDN decode kernel is only supported on MP31."
             )
+        self.supports_target_verify = sm_major == 3 and sm_minor == 1
 
         if sm_major == 3:
             if self._prefill_fn is None:

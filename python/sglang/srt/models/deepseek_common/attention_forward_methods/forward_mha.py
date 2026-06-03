@@ -27,8 +27,10 @@ _use_fp8_prefill_attn = (
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
-if _is_cuda or _is_musa:
+if _is_cuda:
     from sgl_kernel import concat_mla_k, merge_state_v2
+elif _is_musa:
+    from sgl_kernel import merge_state_v2
 
 if _use_aiter_gfx95:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
@@ -492,7 +494,7 @@ class DeepseekMHAForwardMixin:
         # Temporary for DeepSeek V3/R1 only, but can generalize if needed
         k_shape = (k_nope.shape[0], self.num_local_heads, self.qk_head_dim)
         if (
-            (_is_cuda or _is_musa)
+            _is_cuda
             and (self.num_local_heads == 128)
             and (self.qk_nope_head_dim == 128)
             and (self.qk_rope_head_dim == 64)

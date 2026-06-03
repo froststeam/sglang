@@ -70,6 +70,7 @@ elif _is_musa:
         output_shape = x.shape[:-1] + (d,)
         return torch.empty(output_shape, dtype=x.dtype, device=x.device)
 
+
 if is_npu():
     import torch_npu
 
