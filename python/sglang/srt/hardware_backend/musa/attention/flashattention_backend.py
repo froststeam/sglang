@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
 
@@ -35,12 +34,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 MATE_MLA_WORKSPACE_SIZE_BYTES = 128 * 1024 * 1024
-
-
-@dataclass
-class _CudaGraphSchedulerMetadataState:
-    tensors: Dict[str, torch.Tensor]
-    static_fields: Dict[str, object]
 
 
 def flash_attn_with_kvcache(
@@ -170,9 +163,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
             if self.use_mla
             else None
         )
-        self._cuda_graph_scheduler_metadata: Dict[
-            tuple, _CudaGraphSchedulerMetadataState
-        ] = {}
+        self._captured_cuda_graph_metadata: Dict[tuple, Dict[str, torch.Tensor]] = {}
         # Disable default scheduler metadata for fa3
         self._get_scheduler_metadata = None
 
@@ -452,29 +443,6 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         if metadata_expand is not None:
             setattr(metadata_expand, "scheduler_metadata", None)
 
-    def _set_scheduler_metadata(self, owner, attr: str, new_metadata):
-        if envs.SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA.get():
-            # Override mode: consume the metadata freshly returned by MATE for
-            # this prepare/replay step. CUDA/MUSA graph replay still copies the
-            # fresh tensor into the captured tensor because the graph itself can
-            # only see capture-time addresses.
-            setattr(owner, attr, new_metadata)
-            return
-
-        old_metadata = getattr(owner, attr, None)
-        # CUDA graph replay reuses metadata owners. Preserve tensor objects when
-        # the shape is stable so captured graphs keep valid addresses; replace
-        # only when the shape changes or the old value was not a tensor.
-        if isinstance(old_metadata, torch.Tensor) and isinstance(
-            new_metadata, torch.Tensor
-        ):
-            if old_metadata.shape == new_metadata.shape:
-                old_metadata.copy_(new_metadata)
-            else:
-                setattr(owner, attr, new_metadata)
-        else:
-            setattr(owner, attr, new_metadata)
-
     def _cuda_graph_metadata_key(self, bs: int, forward_mode, spec_info):
         if forward_mode.is_target_verify():
             return ("target_verify", bs, self.topk, self.speculative_num_draft_tokens)
@@ -483,104 +451,107 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         return ("decode", bs)
 
     @staticmethod
-    def _scheduler_metadata_tensor_paths(metadata, prefix: str = ""):
-        if metadata is None:
+    def _append_cuda_graph_metadata_slots(slots, owner, name_prefix: str = ""):
+        if owner is None:
             return
 
-        for attr in ("scheduler_metadata", "swa_scheduler_metadata"):
-            value = getattr(metadata, attr, None)
-            if isinstance(value, torch.Tensor):
-                yield f"{prefix}{attr}", value
+        for attr in (
+            "scheduler_metadata",
+            "swa_scheduler_metadata",
+            "encoder_scheduler_metadata",
+        ):
+            tensor = getattr(owner, attr, None)
+            if isinstance(tensor, torch.Tensor):
+                slots.append((f"{name_prefix}{attr}", owner, attr, tensor))
 
-        value = getattr(metadata, "encoder_scheduler_metadata", None)
-        if isinstance(value, torch.Tensor):
-            yield f"{prefix}encoder_scheduler_metadata", value
-
-        local_metadata = getattr(metadata, "local_attn_metadata", None)
+        local_metadata = getattr(owner, "local_attn_metadata", None)
         if local_metadata is not None:
-            value = getattr(local_metadata, "scheduler_metadata", None)
-            if isinstance(value, torch.Tensor):
-                yield f"{prefix}local_attn_metadata.scheduler_metadata", value
+            tensor = getattr(local_metadata, "scheduler_metadata", None)
+            if isinstance(tensor, torch.Tensor):
+                slots.append(
+                    (
+                        f"{name_prefix}local_attn_metadata.scheduler_metadata",
+                        local_metadata,
+                        "scheduler_metadata",
+                        tensor,
+                    )
+                )
+
+        swa_spec_metadata = getattr(owner, "swa_spec_metadata", None)
+        if swa_spec_metadata is not None:
+            tensor = getattr(swa_spec_metadata, "swa_scheduler_metadata", None)
+            if isinstance(tensor, torch.Tensor):
+                slots.append(
+                    (
+                        f"{name_prefix}swa_spec_metadata.swa_scheduler_metadata",
+                        swa_spec_metadata,
+                        "swa_scheduler_metadata",
+                        tensor,
+                    )
+                )
+
+        for side in ("prev", "next"):
+            for attr in (
+                f"cp_scheduler_metadata_{side}",
+                f"cp_swa_scheduler_metadata_{side}",
+                f"cp_local_scheduler_metadata_{side}",
+                f"cp_local_swa_scheduler_metadata_{side}",
+                f"cp_cu_seqlens_k_new_{side}",
+            ):
+                tensor = getattr(owner, attr, None)
+                if isinstance(tensor, torch.Tensor):
+                    slots.append((f"{name_prefix}{attr}", owner, attr, tensor))
+
+    def _cuda_graph_metadata_slots(self):
+        slots = []
+        self._append_cuda_graph_metadata_slots(slots, self.forward_metadata)
+        self._append_cuda_graph_metadata_slots(
+            slots,
+            self.forward_metadata_spec_decode_expand,
+            name_prefix="spec_expand.",
+        )
+        return slots
 
     def _capture_cuda_graph_scheduler_metadata(self, bs: int, forward_mode, spec_info):
         key = self._cuda_graph_metadata_key(bs, forward_mode, spec_info)
-        tensors = dict(self._scheduler_metadata_tensor_paths(self.forward_metadata))
-        tensors.update(
-            self._scheduler_metadata_tensor_paths(
-                self.forward_metadata_spec_decode_expand, prefix="spec_expand."
-            )
-        )
-        self._cuda_graph_scheduler_metadata[key] = _CudaGraphSchedulerMetadataState(
-            tensors=tensors,
-            static_fields={
-                "max_seq_len_q": getattr(self.forward_metadata, "max_seq_len_q", None),
-                "max_seq_len_k": getattr(self.forward_metadata, "max_seq_len_k", None),
-                "spec_expand.max_seq_len_q": getattr(
-                    self.forward_metadata_spec_decode_expand, "max_seq_len_q", None
-                ),
-                "spec_expand.max_seq_len_k": getattr(
-                    self.forward_metadata_spec_decode_expand, "max_seq_len_k", None
-                ),
-            },
-        )
+        self._captured_cuda_graph_metadata[key] = {
+            name: tensor
+            for name, _owner, _attr, tensor in self._cuda_graph_metadata_slots()
+        }
 
-    def _restore_cuda_graph_scheduler_static_fields(
+    def _copy_fresh_metadata_to_cuda_graph_tensors(
         self, bs: int, forward_mode, spec_info
     ):
         key = self._cuda_graph_metadata_key(bs, forward_mode, spec_info)
-        state = self._cuda_graph_scheduler_metadata.get(key)
-        if state is None:
-            return
-
-        metadata = self.forward_metadata
-        metadata_expand = self.forward_metadata_spec_decode_expand
-        for attr in ("max_seq_len_q", "max_seq_len_k"):
-            value = state.static_fields.get(attr)
-            if metadata is not None and value is not None:
-                setattr(metadata, attr, value)
-        if metadata_expand is not None:
-            for attr in ("max_seq_len_q", "max_seq_len_k"):
-                value = state.static_fields.get(f"spec_expand.{attr}")
-                if value is not None:
-                    setattr(metadata_expand, attr, value)
-
-    @staticmethod
-    def _scheduler_metadata_owner_and_attr(metadata, spec_expand_metadata, path: str):
-        owner = metadata
-        attr = path
-        if path.startswith("spec_expand."):
-            owner = spec_expand_metadata
-            attr = path[len("spec_expand.") :]
-        if owner is None:
-            return None, attr
-        if attr == "local_attn_metadata.scheduler_metadata":
-            local_metadata = getattr(owner, "local_attn_metadata", None)
-            return local_metadata, "scheduler_metadata"
-        return owner, attr
-
-    def _sync_cuda_graph_scheduler_metadata(self, bs: int, forward_mode, spec_info):
-        key = self._cuda_graph_metadata_key(bs, forward_mode, spec_info)
-        state = self._cuda_graph_scheduler_metadata.get(key)
-        if state is None:
+        captured_tensors = self._captured_cuda_graph_metadata.get(key)
+        if captured_tensors is None:
             return False
 
-        for path, captured_tensor in state.tensors.items():
-            owner, attr = self._scheduler_metadata_owner_and_attr(
-                self.forward_metadata,
-                self.forward_metadata_spec_decode_expand,
-                path,
-            )
-            replay_tensor = getattr(owner, attr, None) if owner is not None else None
-            assert isinstance(replay_tensor, torch.Tensor), (
-                "MUSA FA3 CUDA graph replay did not regenerate scheduler "
-                f"metadata for captured path {path}."
-            )
-            assert captured_tensor.shape == replay_tensor.shape, (
+        # CUDA graph captured the old tensor addresses. Replay generates fresh
+        # metadata, then copies the fresh values back into those old tensors.
+        fresh_slots = {
+            name: (owner, attr, tensor)
+            for name, owner, attr, tensor in self._cuda_graph_metadata_slots()
+        }
+        assert set(captured_tensors) == set(fresh_slots), (
+            "MUSA FA3 CUDA graph scheduler metadata slots changed between "
+            f"capture and replay: capture={sorted(captured_tensors)} "
+            f"replay={sorted(fresh_slots)}."
+        )
+        for name, captured_tensor in captured_tensors.items():
+            owner, attr, fresh_tensor = fresh_slots[name]
+            assert captured_tensor.shape == fresh_tensor.shape, (
                 "MUSA FA3 CUDA graph scheduler metadata shape changed for "
-                f"{path}: capture={tuple(captured_tensor.shape)} "
-                f"replay={tuple(replay_tensor.shape)}."
+                f"{name}: capture={tuple(captured_tensor.shape)} "
+                f"replay={tuple(fresh_tensor.shape)}."
             )
-            captured_tensor.copy_(replay_tensor)
+            assert captured_tensor.data_ptr() != fresh_tensor.data_ptr(), (
+                "MUSA FA3 CUDA graph replay scheduler metadata refresh did not "
+                f"produce a fresh tensor for {name}, key={key}, "
+                f"shape={tuple(captured_tensor.shape)}. This is a self-copy, "
+                "so the captured graph can keep using stale scheduler metadata."
+            )
+            captured_tensor.copy_(fresh_tensor)
             setattr(owner, attr, captured_tensor)
         return True
 
@@ -621,7 +592,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         # kernel will see at runtime. The model scan above enforces one uniform
         # SWA window, so callers do not need to thread layer objects through
         # metadata initialization.
-        self._set_scheduler_metadata(
+        setattr(
             owner,
             attr,
             self._compute_no_mla_scheduler_metadata(
@@ -678,7 +649,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         full_attr = f"cp_scheduler_metadata_{side}"
         swa_attr = f"cp_swa_scheduler_metadata_{side}"
         if self._has_full_attention_layer:
-            self._set_scheduler_metadata(
+            setattr(
                 metadata,
                 full_attr,
                 self._compute_no_mla_scheduler_metadata(
@@ -725,7 +696,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         # path does not append newly gathered KV through the normal paged-cache
         # table in the callback.
         if local_metadata is not None and self._has_local_attention_layer:
-            self._set_scheduler_metadata(
+            setattr(
                 metadata,
                 local_attr,
                 self._compute_no_mla_scheduler_metadata(
@@ -810,7 +781,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
             metadata, local_metadata, cp_meta, "next", device
         )
 
-    def _init_full_self_scheduler_metadata(
+    def _init_full_attention_metadata(
         self,
         metadata,
         *,
@@ -823,7 +794,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         # In all-SWA models this would never be consumed, so keep the attr clear
         # and let accidental full-layer use fail at `_scheduler_metadata_for_kvcache`.
         if needs_kvcache_metadata and self._has_full_attention_layer:
-            self._set_scheduler_metadata(
+            setattr(
                 metadata,
                 "scheduler_metadata",
                 self._compute_no_mla_scheduler_metadata(
@@ -840,7 +811,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         else:
             setattr(metadata, "scheduler_metadata", None)
 
-    def _init_self_scheduler_metadata(
+    def _init_swa_attention_metadata(
         self,
         metadata,
         *,
@@ -883,7 +854,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
             return
 
         if needs_kvcache_metadata:
-            self._set_scheduler_metadata(
+            setattr(
                 local_metadata,
                 "scheduler_metadata",
                 self._compute_no_mla_scheduler_metadata(
@@ -914,7 +885,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
             and self._has_cross_attention_layer
             and metadata.encoder_lens_int32 is not None
         ):
-            self._set_scheduler_metadata(
+            setattr(
                 metadata,
                 "encoder_scheduler_metadata",
                 self._compute_no_mla_scheduler_metadata(
@@ -951,7 +922,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
             setattr(metadata_expand, "scheduler_metadata", None)
             return
 
-        self._set_scheduler_metadata(
+        setattr(
             metadata_expand,
             "scheduler_metadata",
             self._compute_no_mla_scheduler_metadata(
@@ -1028,8 +999,28 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
             if stale_expand_metadata is not None:
                 setattr(stale_expand_metadata, "scheduler_metadata", None)
                 setattr(stale_expand_metadata, "swa_scheduler_metadata", None)
-            if getattr(metadata, "swa_spec_metadata", None) is not None:
-                setattr(metadata.swa_spec_metadata, "swa_scheduler_metadata", None)
+            swa_spec_metadata = getattr(metadata, "swa_spec_metadata", None)
+            if (
+                swa_spec_metadata is not None
+                and forward_batch.forward_mode.is_target_verify()
+                and self.topk > 1
+            ):
+                self._init_swa_scheduler_metadata(
+                    swa_spec_metadata,
+                    "swa_scheduler_metadata",
+                    max_seqlen_k=self._max_seqlen_from_metadata(
+                        0,
+                        swa_spec_metadata.cache_seqlens_int32,
+                    ),
+                    cache_seqlens=swa_spec_metadata.cache_seqlens_int32,
+                    cu_seqlens_q=swa_spec_metadata.cu_seqlens_q,
+                    cu_seqlens_k_new=swa_spec_metadata.cu_seqlens_k,
+                    max_seqlen_q=swa_spec_metadata.max_seq_len_q,
+                    causal=True,
+                    page_size=1,
+                )
+            elif swa_spec_metadata is not None:
+                setattr(swa_spec_metadata, "swa_scheduler_metadata", None)
             return
 
         expand_page_size = (
@@ -1065,15 +1056,18 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         )
         local_metadata = getattr(metadata, "local_attn_metadata", None)
 
+        if self._is_context_parallel_extend(forward_batch):
+            needs_kvcache_metadata = False
+
         cu_seqlens_k_new = None if is_decode else metadata.cu_seqlens_k
-        self._init_full_self_scheduler_metadata(
+        self._init_full_attention_metadata(
             metadata,
             needs_kvcache_metadata=needs_kvcache_metadata,
             cu_seqlens_k_new=cu_seqlens_k_new,
             max_seqlen_k=metadata.max_seq_len_k,
             causal=not use_cascade,
         )
-        self._init_self_scheduler_metadata(
+        self._init_swa_attention_metadata(
             metadata,
             needs_kvcache_metadata=needs_kvcache_metadata,
             cu_seqlens_k_new=cu_seqlens_k_new,
@@ -1159,9 +1153,8 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
             input_token_count=seq_lens_sum,
             seq_lens_cpu=seq_lens_cpu,
         )
-        self._restore_cuda_graph_scheduler_static_fields(bs, forward_mode, spec_info)
         self._init_scheduler_metadata(forward_batch_for_init)
-        self._sync_cuda_graph_scheduler_metadata(bs, forward_mode, spec_info)
+        self._copy_fresh_metadata_to_cuda_graph_tensors(bs, forward_mode, spec_info)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -1246,12 +1239,12 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         if local_metadata is not None:
             scheduler_metadata = getattr(local_metadata, "scheduler_metadata", None)
             attr = "local_attn_metadata.scheduler_metadata"
-        elif is_swa_layer:
-            scheduler_metadata = getattr(metadata, "swa_scheduler_metadata", None)
-            attr = "swa_scheduler_metadata"
         elif is_cross_attention:
             scheduler_metadata = getattr(metadata, "encoder_scheduler_metadata", None)
             attr = "encoder_scheduler_metadata"
+        elif is_swa_layer:
+            scheduler_metadata = getattr(metadata, "swa_scheduler_metadata", None)
+            attr = "swa_scheduler_metadata"
         else:
             scheduler_metadata = getattr(metadata, "scheduler_metadata", None)
             attr = "scheduler_metadata"
@@ -1357,6 +1350,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
 
         metadata = self.forward_metadata
 
+        local_metadata = None
         is_swa_layer = (
             layer.sliding_window_size is not None and layer.sliding_window_size > -1
         )
@@ -1443,6 +1437,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                 cache_seqlens = metadata.encoder_lens_int32
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
+                scheduler_metadata_owner = metadata
 
             if (
                 forward_batch.forward_mode.is_context_parallel_extend()
