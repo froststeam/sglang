@@ -1,5 +1,16 @@
 """MUSA TVM-FFI/C++ JIT kernels."""
 
+from sglang.srt.hardware_backend.musa.jit_kernel.csrc.moe import (
+    act_and_mul,
+    act_and_mul_masked_post_quant,
+    act_and_mul_masked_post_quant_fwd,
+    deep_gemm_contig_preprocess,
+    fused_share_gate_sigmoid_mul,
+    moe_align_block_size,
+    moe_sum_reduce,
+    topk_sigmoid,
+    topk_softmax,
+)
 from sglang.srt.hardware_backend.musa.jit_kernel.csrc.norm import (
     fused_add_rmsnorm,
     gemma_fused_add_rmsnorm,
@@ -10,15 +21,18 @@ from sglang.srt.hardware_backend.musa.jit_kernel.csrc.quant import (
     per_token_group_quant_8bit,
 )
 from sglang.srt.hardware_backend.musa.jit_kernel.csrc.rope import rotary_embedding
-from sglang.srt.hardware_backend.musa.jit_kernel.csrc.topk import (
-    topk_sigmoid,
-    topk_softmax,
-)
 
 __all__ = [
     "fused_add_rmsnorm",
     "gemma_fused_add_rmsnorm",
     "gemma_rmsnorm",
+    "deep_gemm_contig_preprocess",
+    "fused_share_gate_sigmoid_mul",
+    "moe_align_block_size",
+    "act_and_mul",
+    "act_and_mul_masked_post_quant",
+    "act_and_mul_masked_post_quant_fwd",
+    "moe_sum_reduce",
     "per_token_group_quant_8bit",
     "rmsnorm",
     "rotary_embedding",

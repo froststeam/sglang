@@ -23,6 +23,9 @@ from typing import Optional
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import is_musa
+
+_is_musa = is_musa()
 
 
 @dataclass(kw_only=True)
@@ -203,9 +206,24 @@ class Mamba2Metadata(ForwardMetadata):
         num_decodes = len(forward_batch.seq_lens) - num_prefills
         context_lens_tensor = forward_batch.extend_prefix_lens
         assert context_lens_tensor is not None
-        # precompute flag to avoid device syncs later
         has_initial_states = context_lens_tensor > 0
-        prep_initial_states = torch.any(has_initial_states[:num_prefills]).item()
+        if _is_musa:
+            # XXX (MUSA): Avoid torch.any(...).item() here because it
+            # synchronizes the MUSA stream before every prefill causal conv1d
+            # layer. Keep the tensor on device for kernels, but compute this
+            # aggregate flag from CPU-side prefix lengths.
+            extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+            prep_initial_states = (
+                any(
+                    prefix_len > 0
+                    for prefix_len in extend_prefix_lens_cpu[:num_prefills]
+                )
+                if extend_prefix_lens_cpu is not None
+                else False
+            )
+        else:
+            # precompute flag to avoid device syncs later
+            prep_initial_states = torch.any(has_initial_states[:num_prefills]).item()
 
         query_start_loc = forward_metadata.query_start_loc[: num_prefills + 1]
         seq_idx = torch.repeat_interleave(

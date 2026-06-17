@@ -33,6 +33,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_hip,
+    is_musa,
     is_npu,
     next_power_of_2,
     set_weight_attrs,
@@ -49,9 +50,13 @@ if TYPE_CHECKING:
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
+_is_musa = is_musa()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_MUSA_CONTIG_DEEPGEMM_TOKEN_THRESHOLD = (
+    envs.SGLANG_MUSA_CONTIG_DEEPGEMM_TOKEN_THRESHOLD.get()
+)
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -175,7 +180,20 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self.with_bias = False
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
         self.use_deep_gemm = use_deep_gemm
+        self.use_musa_contig_deepgemm = False
         self._cache_permute_indices = dict({})
+
+    @staticmethod
+    def is_musa_contig_deepgemm_hybrid_enabled() -> bool:
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        moe_runner_backend = get_moe_runner_backend()
+        return (
+            _is_musa
+            and moe_runner_backend.is_mixed()
+            and get_moe_a2a_backend().is_none()
+            and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        )
 
     def create_weights(
         self,
@@ -374,6 +392,29 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        if (
+            not self.use_flashinfer_cutlass
+            and not self.use_flashinfer_trtllm_moe
+            and not self.use_triton_kernels
+            and self.is_musa_contig_deepgemm_hybrid_enabled()
+        ):
+            # BF16 standard MoE follows the same MUSA hybrid policy as FP8:
+            # small batches stay on Triton, large batches use contiguous DeepGEMM.
+            self.use_musa_contig_deepgemm = True
+            self.triton_runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+            self.deep_gemm_runner = MoeRunner(
+                MoeRunnerBackend.DEEP_GEMM, moe_runner_config
+            )
+            self.deep_gemm_runner.use_contiguous_gemm = True
+            self.runner = self.triton_runner
+            return
+
+        if get_moe_runner_backend().is_mixed():
+            raise ValueError(
+                "mixed MoE runner backend is only supported on MUSA standard MoE "
+                "with JIT DeepGEMM enabled."
+            )
+
         if self.use_flashinfer_trtllm_moe:
             backend = (
                 MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
@@ -426,7 +467,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         moe_runner_config = self.moe_runner_config
 
-        backend = self.runner.runner_backend
+        runner = self.runner
+        if self.use_musa_contig_deepgemm:
+            runner = (
+                self.deep_gemm_runner
+                if x.shape[0] > _MUSA_CONTIG_DEEPGEMM_TOKEN_THRESHOLD
+                else self.triton_runner
+            )
+
+        backend = runner.runner_backend
         if backend.is_triton_kernels():
             from sglang.srt.layers.moe.moe_runner.triton_kernels import (
                 TritonKernelsQuantInfo,
@@ -438,8 +487,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 w13_bias=getattr(layer, "w13_weight_bias", None),
                 w2_bias=getattr(layer, "w2_weight_bias", None),
             )
-            return self.runner.run(dispatch_output, quant_info)
-        elif self.runner.runner_backend.is_deep_gemm():
+            return runner.run(dispatch_output, quant_info)
+        elif runner.runner_backend.is_deep_gemm():
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
             from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
@@ -452,7 +501,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 w2_weight=w2_weight,
                 use_fp8=use_fp8,
             )
-            return self.runner.run(dispatch_output, quant_info)
+            return runner.run(dispatch_output, quant_info)
         elif self.use_flashinfer_cutlass:
             topk_output = dispatch_output.topk_output
             output = flashinfer_cutlass_fused_moe(
@@ -512,7 +561,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 b13=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
             )
-            return self.runner.run(dispatch_output, quant_info)
+            return runner.run(dispatch_output, quant_info)
 
     def forward_cpu(
         self,

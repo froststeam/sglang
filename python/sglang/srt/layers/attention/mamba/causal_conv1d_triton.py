@@ -10,7 +10,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_musa
+
 PAD_SLOT_ID = -1
+_is_musa = is_musa()
 
 
 @triton.jit()
@@ -1086,6 +1089,12 @@ def causal_conv1d_update(
             triton.cdiv(dim, META["BLOCK_N"]),
         )
 
+    block_n = 256
+    if _is_musa and seqlen == 1 and batch <= 64:
+        # XXX (MUSA): Smaller feature blocks improve decode latency for small
+        # batches by exposing more programs and reducing per-program work.
+        block_n = 128
+
     # prepare intermediate buffer strides if provided
     if intermediate_conv_window is not None:
         stride_inter_seq, stride_inter_step, stride_inter_dim, stride_inter_win = (
@@ -1180,7 +1189,7 @@ def causal_conv1d_update(
         NP2_STATELEN=np2_statelen,
         NP2_SEQLEN=np2_seqlen,
         USE_PAD_SLOT=pad_slot_id is not None,
-        BLOCK_N=256,
+        BLOCK_N=block_n,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
     )

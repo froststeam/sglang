@@ -92,6 +92,92 @@ def gemma_fused_add_rmsnorm(
     _fused_add_rmsnorm_custom(input, residual, weight, float(eps), True)
 
 
+def fused_qk_rmsnorm_mrope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    mrope_section_t: int,
+    mrope_section_h: int,
+    mrope_section_w: int,
+    is_interleaved: bool,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    q_out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+    k_out = torch.empty(k.shape, device=k.device, dtype=k.dtype)
+    _fused_qk_rmsnorm_mrope_custom(
+        q,
+        k,
+        q_weight,
+        k_weight,
+        positions,
+        cos_sin_cache,
+        q_out,
+        k_out,
+        bool(is_neox),
+        int(mrope_section_t),
+        int(mrope_section_h),
+        int(mrope_section_w),
+        bool(is_interleaved),
+        float(eps),
+    )
+    return q_out, k_out
+
+
+def fused_qk_rmsnorm_mrope_cache(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    indices: torch.Tensor,
+    is_neox: bool,
+    mrope_section_t: int,
+    mrope_section_h: int,
+    mrope_section_w: int,
+    is_interleaved: bool,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    q_out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+    _fused_qk_rmsnorm_mrope_cache_custom(
+        q,
+        k,
+        v,
+        q_weight,
+        k_weight,
+        positions,
+        cos_sin_cache,
+        q_out,
+        k_cache,
+        v_cache,
+        indices,
+        bool(is_neox),
+        int(mrope_section_t),
+        int(mrope_section_h),
+        int(mrope_section_w),
+        bool(is_interleaved),
+        float(eps),
+    )
+    return q_out
+
+
+def store_cache(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    indices: torch.Tensor,
+) -> None:
+    _norm_module().sgl_musa_store_cache(k, v, k_cache, v_cache, indices)
+
+
 @register_custom_op(
     op_name="musa_csrc_rmsnorm",
     mutates_args=["out"],
@@ -119,4 +205,86 @@ def _fused_add_rmsnorm_custom(
 ) -> None:
     _norm_module().sgl_musa_fused_add_rmsnorm(
         input, residual, weight, float(eps), bool(gemma)
+    )
+
+
+@register_custom_op(
+    op_name="musa_csrc_fused_qk_rmsnorm_mrope",
+    mutates_args=["q_out", "k_out"],
+)
+def _fused_qk_rmsnorm_mrope_custom(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    is_neox: bool,
+    mrope_section_t: int,
+    mrope_section_h: int,
+    mrope_section_w: int,
+    is_interleaved: bool,
+    eps: float,
+) -> None:
+    _norm_module().sgl_musa_fused_qk_rmsnorm_mrope(
+        q,
+        k,
+        q_weight,
+        k_weight,
+        positions,
+        cos_sin_cache,
+        q_out,
+        k_out,
+        bool(is_neox),
+        int(mrope_section_t),
+        int(mrope_section_h),
+        int(mrope_section_w),
+        bool(is_interleaved),
+        float(eps),
+    )
+
+
+@register_custom_op(
+    op_name="musa_csrc_fused_qk_rmsnorm_mrope_cache",
+    mutates_args=["q_out", "k_cache", "v_cache"],
+)
+def _fused_qk_rmsnorm_mrope_cache_custom(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    q_out: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    indices: torch.Tensor,
+    is_neox: bool,
+    mrope_section_t: int,
+    mrope_section_h: int,
+    mrope_section_w: int,
+    is_interleaved: bool,
+    eps: float,
+) -> None:
+    _norm_module().sgl_musa_fused_qk_rmsnorm_mrope_cache(
+        q,
+        k,
+        v,
+        q_weight,
+        k_weight,
+        positions,
+        cos_sin_cache,
+        q_out,
+        k_cache,
+        v_cache,
+        indices,
+        bool(is_neox),
+        int(mrope_section_t),
+        int(mrope_section_h),
+        int(mrope_section_w),
+        bool(is_interleaved),
+        float(eps),
     )

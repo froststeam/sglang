@@ -302,11 +302,19 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         self, forward_batch: ForwardBatch
     ) -> bool:
         forward_mode = forward_batch.forward_mode
+        extend_prefix_lens_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+        extend_with_prefix = extend_prefix_lens_cpu is not None and any(
+            extend_prefix_lens_cpu
+        )
         return (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
-            or forward_mode.is_extend_or_draft_extend_or_mixed(
-                include_draft_extend_v2=True
+            or forward_mode.is_draft_extend(include_v2=True)
+            or (
+                forward_mode.is_extend_or_draft_extend_or_mixed(
+                    include_draft_extend_v2=True
+                )
+                and extend_with_prefix
             )
         )
 
@@ -1059,6 +1067,9 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         if self._is_context_parallel_extend(forward_batch):
             needs_kvcache_metadata = False
 
+        needs_encoder_kvcache_metadata = (
+            needs_kvcache_metadata or metadata.encoder_lens_int32 is not None
+        )
         cu_seqlens_k_new = None if is_decode else metadata.cu_seqlens_k
         self._init_full_attention_metadata(
             metadata,
@@ -1081,7 +1092,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         self._init_cp_scheduler_metadata(forward_batch, local_metadata)
         self._init_encoder_scheduler_metadata(
             metadata,
-            needs_kvcache_metadata=needs_kvcache_metadata,
+            needs_kvcache_metadata=needs_encoder_kvcache_metadata,
             is_decode=is_decode,
         )
         self._init_spec_decode_expand_scheduler_metadata(

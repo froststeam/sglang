@@ -19,7 +19,7 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils import get_compiler_backend, is_musa
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -166,13 +166,21 @@ class FlashAttentionBackend(AttentionBackend):
         # Select version
         self.fa_impl_ver = fa_impl_ver
         if self.fa_impl_ver == 3:
-            from sgl_kernel.flash_attn import (
-                flash_attn_varlen_func,
-                flash_attn_with_kvcache,
-                get_scheduler_metadata,
-            )
+            if is_musa():
+                from flash_attn_interface import (
+                    flash_attn_varlen_func,
+                    flash_attn_with_kvcache,
+                )
 
-            self._get_scheduler_metadata = get_scheduler_metadata
+                self._get_scheduler_metadata = None
+            else:
+                from sgl_kernel.flash_attn import (
+                    flash_attn_varlen_func,
+                    flash_attn_with_kvcache,
+                    get_scheduler_metadata,
+                )
+
+                self._get_scheduler_metadata = get_scheduler_metadata
         elif self.fa_impl_ver == 4:
             from sglang.jit_kernel.flash_attention_v4 import (
                 flash_attn_varlen_func,

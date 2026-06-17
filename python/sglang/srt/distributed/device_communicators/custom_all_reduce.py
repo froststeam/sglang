@@ -4,6 +4,7 @@
 
 import ctypes
 import logging
+import os
 from contextlib import contextmanager
 from functools import partial
 from typing import Any, List, Optional, Union
@@ -35,6 +36,22 @@ _is_musa = is_musa()
 logger = logging.getLogger(__name__)
 
 
+def _env_flag(names: tuple[str, ...], default: bool) -> bool:
+    for name in names:
+        value = os.environ.get(name)
+        if value is not None:
+            return value.lower() in ("1", "true", "yes", "on")
+    return default
+
+
+def _use_jit_all_reduce() -> bool:
+    if _is_cuda:
+        return envs.SGLANG_USE_JIT_ALL_REDUCE.get()
+    if _is_musa:
+        return envs.SGLANG_MUSA_USE_JIT_ALL_REDUCE.get()
+    return False
+
+
 class CustomAllreduce:
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
     _MAX_CAR_SIZE = 8192 * 1024
@@ -42,8 +59,10 @@ class CustomAllreduce:
         # crossover is at 16MB buffer size for ROCm
         _MAX_CAR_SIZE = 2 * 8192 * 1024
     if _is_musa:
-        # crossover is at 128MB buffer size for MUSA
-        _MAX_CAR_SIZE = 16 * 8196 * 1024
+        # XXX (MUSA): 40k prefill can produce ~252MB TP embedding all-reduce
+        # inputs. Keep a bounded fast path instead of forcing oversized tensors
+        # into the custom kernel without registered buffer space.
+        _MAX_CAR_SIZE = 512 * 1024 * 1024
 
     # max_size: max supported allreduce size
     def __init__(
@@ -267,6 +286,10 @@ class CustomAllreduce:
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
         if not _is_hip:
+            if _is_musa:
+                # XXX (MUSA): MUSA CAR does not use the CUDA NVLink topology
+                # gate; rely on registered-buffer size support instead.
+                return inp_size <= self.max_size
             if self.world_size == 2 or self.full_nvlink:
                 return inp_size <= self.max_size
             return False
@@ -310,7 +333,7 @@ class CustomAllreduce:
         if self.disabled or not self.should_custom_ar(input):
             return None
         if self._IS_CAPTURING:
-            if torch.cuda.is_current_stream_capturing():
+            if torch.get_device_module().is_current_stream_capturing():
                 return self._all_reduce_impl(input, registered=not self.tms_cudagraph)
             else:
                 # Could be warmup OR piecewise cuda graph split op execution.
@@ -338,24 +361,571 @@ class CustomAllreduce:
         self.close()
 
 
+class MusaJitCustomAllreduce:
+    _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
+    _MAX_CAR_SIZE = 512 * 1024 * 1024
+
+    def __init__(
+        self,
+        group: ProcessGroup,
+        device: Union[int, str, torch.device],
+        max_size=_MAX_CAR_SIZE,
+    ) -> None:
+        self.disabled = True
+        self.original_disabled = True
+        self.group = group
+        self.max_size = max_size
+        self._IS_CAPTURING = False
+        self._rank_data_cache: dict[int, torch.Tensor] = {}
+        self._rank_data_context_cache: dict[tuple[int, int], int] = {}
+        self._unregistered_context_cache: dict[tuple[int, int], int] = {}
+        self._opened_ipc_ptrs: dict[bytes, int] = {}
+        self._last_input_ptr: Optional[int] = None
+        self._last_rank_data: Optional[torch.Tensor] = None
+        self._graph_inputs: dict[int, torch.Tensor] = {}
+        self._shot_decision_cache: dict[tuple[int, bool, bool], int] = {}
+        self._eager_staging_cache: dict[tuple[int, int], bool] = {}
+        self._eager_graph_cache: dict[tuple[int, int, torch.dtype, int], list[dict]] = (
+            {}
+        )
+        self._eager_graph_cursor: dict[tuple[int, int, torch.dtype, int], int] = {}
+        self._launch_context_enabled = _env_flag(
+            ("SGLANG_CUSTOM_AR_LAUNCH_CONTEXT", "SGL_CUSTOM_AR_LAUNCH_CONTEXT"),
+            True,
+        )
+
+        if isinstance(device, int):
+            device = torch.device(f"musa:{device}")
+        elif isinstance(device, str):
+            device = torch.device(device)
+        assert isinstance(device, torch.device)
+        self.device = device
+
+        self.rank = dist.get_rank(group=group)
+        self.world_size = dist.get_world_size(group=group)
+        if self.world_size not in self._SUPPORTED_WORLD_SIZES:
+            return
+
+        from sglang.srt.hardware_backend.musa.jit_kernel.csrc import allreduce as jit_ar
+
+        self._jit_ar = jit_ar
+        self.meta_ptrs = CustomAllreduce.create_shared_buffer(
+            jit_ar.meta_size(self.world_size) + max_size, group=group
+        )
+        self.buffer_ptrs = CustomAllreduce.create_shared_buffer(max_size, group=group)
+        jit_ar.ensure_compiled(self.world_size)
+        self._registered_launchers = {}
+        self._context_launchers = {}
+        self._context_pybind_launchers = {}
+        self._context_torchop_launchers = {}
+        self._unregistered_launchers = {}
+        self._unregistered_pybind_launchers = {}
+        self._unregistered_context_pybind_launchers = {}
+        self._unregistered_context_pybind_creators = {}
+        self._unregistered_context_pybind_disposers = {}
+        self._torchop_context_enabled = _env_flag(
+            ("SGLANG_CUSTOM_AR_TORCHOP_CONTEXT", "SGL_CUSTOM_AR_TORCHOP_CONTEXT"),
+            False,
+        )
+        self._pybind_context_enabled = _env_flag(
+            ("SGLANG_CUSTOM_AR_PYBIND_CONTEXT", "SGL_CUSTOM_AR_PYBIND_CONTEXT"),
+            True,
+        )
+        self._pybind_unregistered_enabled = _env_flag(
+            (
+                "SGLANG_CUSTOM_AR_PYBIND_UNREGISTERED",
+                "SGL_CUSTOM_AR_PYBIND_UNREGISTERED",
+            ),
+            True,
+        )
+        self._pybind_unregistered_context_enabled = _env_flag(
+            (
+                "SGLANG_CUSTOM_AR_PYBIND_UNREGISTERED_CONTEXT",
+                "SGL_CUSTOM_AR_PYBIND_UNREGISTERED_CONTEXT",
+            ),
+            False,
+        )
+        self.rank_data = torch.tensor(
+            self.buffer_ptrs + [0] * (8 - self.world_size), dtype=torch.int64
+        )
+        self.signal_ptrs_cpu = torch.tensor(self.meta_ptrs, dtype=torch.int64)
+        self.disabled = False
+        self.original_disabled = False
+
+    def _use_eager_graph_cache(self, input: torch.Tensor, shot: int) -> bool:
+        if not _env_flag(
+            ("SGLANG_CUSTOM_AR_EAGER_GRAPH_CACHE", "SGL_CUSTOM_AR_EAGER_GRAPH_CACHE"),
+            False,
+        ):
+            return False
+        if self._IS_CAPTURING:
+            return False
+        if shot in (self._jit_ar.SHOT_PUSH, self._jit_ar.SHOT_PUSH_WIDE):
+            return False
+        # Keep tiny packets on the normal path; graph replay only pays off once
+        # launch overhead becomes a meaningful fraction of the all-reduce.
+        return input.numel() * input.element_size() >= 512 * 1024
+
+    def _eager_graph_cache_size(self) -> int:
+        return max(
+            1,
+            int(
+                os.environ.get("SGLANG_CUSTOM_AR_EAGER_GRAPH_CACHE_SIZE")
+                or os.environ.get("SGL_CUSTOM_AR_EAGER_GRAPH_CACHE_SIZE", "2")
+            ),
+        )
+
+    def _launch_registered_eager_graph(
+        self, input: torch.Tensor, rank_data: torch.Tensor, shot: int
+    ) -> torch.Tensor:
+        key = (int(input.data_ptr()), int(input.numel()), input.dtype, int(shot))
+        entries = self._eager_graph_cache.setdefault(key, [])
+        cursor = self._eager_graph_cursor.get(key, 0)
+        if len(entries) < self._eager_graph_cache_size():
+            out = torch.empty_like(input)
+            graph = torch.musa.MUSAGraph()
+            with torch.musa.graph(graph):
+                self._launch_registered(rank_data, out, shot)
+            entry = {"graph": graph, "out": out}
+            entries.append(entry)
+        else:
+            entry = entries[cursor % len(entries)]
+        self._eager_graph_cursor[key] = (cursor + 1) % max(1, len(entries))
+        entry["graph"].replay()
+        return entry["out"]
+
+    @contextmanager
+    def capture(self):
+        try:
+            self._graph_inputs.clear()
+            self._IS_CAPTURING = True
+            yield
+        finally:
+            self._IS_CAPTURING = False
+            try:
+                if not self.disabled:
+                    self.register_graph_buffers()
+            finally:
+                self._graph_inputs.clear()
+
+    def should_custom_ar(self, inp: torch.Tensor):
+        if self.disabled:
+            return False
+        if inp.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            return False
+        inp_size = inp.numel() * inp.element_size()
+        if inp_size % 16 != 0 or inp_size > self.max_size:
+            return False
+        return is_weak_contiguous(inp)
+
+    def _get_base_ptr_and_offset(self, inp: torch.Tensor) -> tuple[int, int]:
+        ptr_value = int(inp.data_ptr())
+        musa = ctypes.CDLL("libmusa.so")
+        mu_pointer_get_attribute = musa.muPointerGetAttribute
+        mu_pointer_get_attribute.restype = ctypes.c_int
+        mu_pointer_get_attribute.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_ulonglong,
+        ]
+        base_ptr = ctypes.c_void_p()
+        err = mu_pointer_get_attribute(
+            ctypes.byref(base_ptr),
+            11,  # MU_POINTER_ATTRIBUTE_RANGE_START_ADDR
+            ctypes.c_ulonglong(ptr_value),
+        )
+        if err != 0:
+            raise RuntimeError(f"muPointerGetAttribute failed: {err}")
+        base_value = int(base_ptr.value)
+        return base_value, ptr_value - base_value
+
+    def _gather_ipc_meta(self, shard_data):
+        handle, offset = shard_data
+        handle_tensor = torch.tensor(list(handle), dtype=torch.uint8, device="cpu")
+        offset_tensor = torch.tensor([offset], dtype=torch.int64, device="cpu")
+        handle_list = [torch.empty_like(handle_tensor) for _ in range(self.world_size)]
+        offset_list = [torch.empty_like(offset_tensor) for _ in range(self.world_size)]
+        dist.all_gather(handle_list, handle_tensor, group=self.group)
+        dist.all_gather(offset_list, offset_tensor, group=self.group)
+        handles = [bytes(t.tolist()) for t in handle_list]
+        offsets = [int(t.item()) for t in offset_list]
+        return handles, offsets
+
+    def _rank_data_for_input(self, inp: torch.Tensor) -> torch.Tensor:
+        ptr_value = int(inp.data_ptr())
+        if ptr_value == self._last_input_ptr and self._last_rank_data is not None:
+            return self._last_rank_data
+        cached = self._rank_data_cache.get(ptr_value)
+        if cached is not None:
+            self._last_input_ptr = ptr_value
+            self._last_rank_data = cached
+            return cached
+
+        base_value, offset = self._get_base_ptr_and_offset(inp)
+        lib = CudaRTLibrary()
+        handle = lib.cudaIpcGetMemHandle(ctypes.c_void_p(base_value))
+        handles, offsets = self._gather_ipc_meta((bytes(handle), offset))
+        ptrs: List[int] = []
+        for i, (h, off) in enumerate(zip(handles, offsets)):
+            if i == self.rank:
+                ptrs.append(ptr_value)
+            else:
+                opened_base = self._opened_ipc_ptrs.get(h)
+                if opened_base is None:
+                    from sglang.srt.distributed.device_communicators.cuda_wrapper import (
+                        cudaIpcMemHandle_t,
+                    )
+
+                    ipc_handle = cudaIpcMemHandle_t.from_buffer_copy(h)
+                    opened_base = lib.cudaIpcOpenMemHandle(ipc_handle).value
+                    self._opened_ipc_ptrs[h] = opened_base
+                ptrs.append(opened_base + int(off))
+        ptrs += [0] * (8 - self.world_size)
+        rank_data = torch.tensor(ptrs, dtype=torch.int64)
+        self._rank_data_cache[ptr_value] = rank_data
+        self._last_input_ptr = ptr_value
+        self._last_rank_data = rank_data
+        return rank_data
+
+    def _record_graph_input(self, inp: torch.Tensor) -> None:
+        self._graph_inputs.setdefault(int(inp.data_ptr()), inp)
+
+    def register_graph_buffers(self) -> None:
+        for inp in tuple(self._graph_inputs.values()):
+            if self.should_custom_ar(inp):
+                self._rank_data_for_input(inp)
+
+    def _launch_registered(
+        self, rank_data: torch.Tensor, out: torch.Tensor, shot: int
+    ) -> None:
+        launcher = self._registered_launchers.get(shot)
+        if launcher is None:
+            launcher = self._jit_ar.launch_registered_func(self.world_size, shot)
+            self._registered_launchers[shot] = launcher
+        launcher(
+            rank_data,
+            self.signal_ptrs_cpu,
+            out,
+            self.meta_ptrs[self.rank],
+            self.rank,
+            self.world_size,
+            shot,
+        )
+
+    def _context_for_input(self, inp: torch.Tensor, shot: int) -> int:
+        key = (int(inp.data_ptr()), int(shot))
+        cached = self._rank_data_context_cache.get(key)
+        if cached is not None:
+            return cached
+        rank_data = self._rank_data_for_input(inp)
+        context_ptr = self._jit_ar.create_context(
+            rank_data,
+            self.signal_ptrs_cpu,
+            self.meta_ptrs[self.rank],
+            self.rank,
+            self.world_size,
+            shot,
+        )
+        self._rank_data_context_cache[key] = context_ptr
+        return context_ptr
+
+    def _launch_registered_context(
+        self, context_ptr: int, out: torch.Tensor, shot: int
+    ) -> None:
+        launcher = self._context_launchers.get(shot)
+        if launcher is None:
+            launcher = self._jit_ar.launch_context_func(self.world_size, shot)
+            self._context_launchers[shot] = launcher
+        launcher(int(context_ptr), out, shot)
+
+    def _launch_registered_context_pybind(
+        self, context_ptr: int, out: torch.Tensor, shot: int
+    ) -> None:
+        launcher = self._context_pybind_launchers.get(shot)
+        if launcher is None:
+            launcher = self._jit_ar.launch_context_pybind_func(self.world_size, shot)
+            self._context_pybind_launchers[shot] = launcher
+        launcher(int(context_ptr), out, int(shot))
+
+    def _launch_registered_context_torchop(
+        self, context_ptr: int, out: torch.Tensor, shot: int
+    ) -> None:
+        launcher = self._context_torchop_launchers.get(shot)
+        if launcher is None:
+            launcher = self._jit_ar.launch_context_torchop_func(self.world_size, shot)
+            self._context_torchop_launchers[shot] = launcher
+        launcher(int(context_ptr), out, int(shot))
+
+    def _use_launch_context(self, shot: int) -> bool:
+        if not self._launch_context_enabled:
+            return False
+        return shot in (
+            self._jit_ar.SHOT_TWO_STAGE,
+            self._jit_ar.SHOT_TWO_STAGE_512,
+        )
+
+    def _use_pybind_context(self, shot: int) -> bool:
+        if not self._pybind_context_enabled:
+            return False
+        return self._use_launch_context(shot)
+
+    def _use_torchop_context(self, shot: int) -> bool:
+        if not self._torchop_context_enabled:
+            return False
+        return self._use_launch_context(shot)
+
+    def _preferred_shot_cached(
+        self, input_bytes: int, is_capturing: bool, is_graph_launch: bool
+    ) -> int:
+        key = (int(input_bytes), bool(is_capturing), bool(is_graph_launch))
+        cached = self._shot_decision_cache.get(key)
+        if cached is not None:
+            return cached
+        if (
+            is_capturing
+            and not self._jit_ar.is_shot_forced()
+            and not self._jit_ar.use_push_in_graph()
+        ):
+            shot = self._jit_ar.preferred_graph_fallback_shot(
+                self.world_size, input_bytes
+            )
+        else:
+            shot = self._jit_ar.preferred_shot(self.world_size, input_bytes)
+        if (
+            shot in (self._jit_ar.SHOT_PUSH, self._jit_ar.SHOT_PUSH_WIDE)
+            and is_graph_launch
+            and not self._jit_ar.use_push_in_graph()
+        ):
+            shot = self._jit_ar.preferred_graph_fallback_shot(
+                self.world_size, input_bytes
+            )
+        if (
+            shot in (self._jit_ar.SHOT_PUSH, self._jit_ar.SHOT_PUSH_WIDE)
+            and self._jit_ar.push_buffer_bytes(input_bytes, self.world_size)
+            > self.max_size
+        ):
+            if self._jit_ar.is_shot_forced():
+                raise RuntimeError(
+                    "MUSA custom AR push requires "
+                    f"{self._jit_ar.push_buffer_bytes(input_bytes, self.world_size)} "
+                    f"bytes of staging buffer, but max_size is {self.max_size}"
+                )
+            shot = self._jit_ar.preferred_fallback_shot(self.world_size, input_bytes)
+        self._shot_decision_cache[key] = shot
+        return shot
+
+    def _use_eager_staging_cached(self, input_bytes: int, shot: int) -> bool:
+        key = (int(input_bytes), int(shot))
+        cached = self._eager_staging_cache.get(key)
+        if cached is not None:
+            return cached
+        value = self._jit_ar.use_eager_staging(self.world_size, input_bytes, shot)
+        self._eager_staging_cache[key] = value
+        return value
+
+    def _launch_unregistered(
+        self, input: torch.Tensor, out: torch.Tensor, shot: int
+    ) -> None:
+        launcher = self._unregistered_launchers.get(shot)
+        if launcher is None:
+            launcher = self._jit_ar.launch_unregistered_func(self.world_size, shot)
+            self._unregistered_launchers[shot] = launcher
+        launcher(
+            self.rank_data,
+            self.signal_ptrs_cpu,
+            input,
+            out,
+            self.meta_ptrs[self.rank],
+            self.buffer_ptrs[self.rank],
+            self.max_size,
+            self.rank,
+            self.world_size,
+            shot,
+        )
+
+    def _launch_unregistered_pybind(
+        self, input: torch.Tensor, out: torch.Tensor, shot: int
+    ) -> None:
+        launcher = self._unregistered_pybind_launchers.get(shot)
+        if launcher is None:
+            launcher = self._jit_ar.launch_unregistered_pybind_func(
+                self.world_size, shot
+            )
+            self._unregistered_pybind_launchers[shot] = launcher
+        launcher(
+            self.rank_data,
+            self.signal_ptrs_cpu,
+            input,
+            out,
+            int(self.meta_ptrs[self.rank]),
+            int(self.buffer_ptrs[self.rank]),
+            int(self.rank),
+            int(self.world_size),
+            int(shot),
+        )
+
+    def _unregistered_context_for_input(self, input: torch.Tensor, shot: int) -> int:
+        key = (int(input.data_ptr()), int(shot))
+        cached = self._unregistered_context_cache.get(key)
+        if cached is not None:
+            return cached
+        creator = self._unregistered_context_pybind_creators.get(shot)
+        if creator is None:
+            creator = self._jit_ar.create_unregistered_context_pybind_func(
+                self.world_size, shot
+            )
+            self._unregistered_context_pybind_creators[shot] = creator
+        context_ptr = int(
+            creator(
+                self.rank_data,
+                self.signal_ptrs_cpu,
+                input,
+                int(self.meta_ptrs[self.rank]),
+                int(self.buffer_ptrs[self.rank]),
+                int(self.rank),
+                int(self.world_size),
+            )
+        )
+        self._unregistered_context_cache[key] = context_ptr
+        return context_ptr
+
+    def _launch_unregistered_context_pybind(
+        self, context_ptr: int, out: torch.Tensor, shot: int
+    ) -> None:
+        launcher = self._unregistered_context_pybind_launchers.get(shot)
+        if launcher is None:
+            launcher = self._jit_ar.launch_unregistered_context_pybind_func(
+                self.world_size, shot
+            )
+            self._unregistered_context_pybind_launchers[shot] = launcher
+        launcher(int(context_ptr), out, int(shot))
+
+    def custom_all_reduce(self, input: torch.Tensor) -> Optional[torch.Tensor]:
+        if not self.should_custom_ar(input):
+            return None
+        ptr_value = int(input.data_ptr())
+        input_bytes = input.numel() * input.element_size()
+        is_graph_launch = (
+            self._IS_CAPTURING
+            and torch.get_device_module().is_current_stream_capturing()
+        )
+        shot = self._preferred_shot_cached(
+            input_bytes, self._IS_CAPTURING, is_graph_launch
+        )
+
+        if shot in (self._jit_ar.SHOT_PUSH, self._jit_ar.SHOT_PUSH_WIDE):
+            out = torch.empty_like(input)
+            if not self._IS_CAPTURING and self._pybind_unregistered_enabled:
+                if self._pybind_unregistered_context_enabled:
+                    context_ptr = self._unregistered_context_for_input(input, shot)
+                    self._launch_unregistered_context_pybind(context_ptr, out, shot)
+                else:
+                    self._launch_unregistered_pybind(input, out, shot)
+            else:
+                self._launch_unregistered(input, out, shot)
+            return out
+
+        out = None
+        if self._IS_CAPTURING:
+            self._record_graph_input(input)
+            out = torch.empty_like(input)
+            if is_graph_launch:
+                if self._use_launch_context(shot):
+                    context_ptr = self._rank_data_context_cache.get(
+                        (ptr_value, int(shot))
+                    )
+                    if context_ptr is not None:
+                        self._launch_registered_context(context_ptr, out, shot)
+                    else:
+                        self._launch_unregistered(input, out, shot)
+                else:
+                    rank_data = self._rank_data_cache.get(ptr_value)
+                    if rank_data is not None:
+                        self._launch_registered(rank_data, out, shot)
+                    else:
+                        self._launch_unregistered(input, out, shot)
+            else:
+                if self._use_launch_context(shot):
+                    self._context_for_input(input, shot)
+                else:
+                    self._rank_data_for_input(input)
+                self._launch_unregistered(input, out, shot)
+        else:
+            out = torch.empty_like(input)
+            if self._use_eager_staging_cached(input_bytes, shot):
+                if self._pybind_unregistered_enabled:
+                    self._launch_unregistered_pybind(input, out, shot)
+                else:
+                    self._launch_unregistered(input, out, shot)
+                return out
+            if self._use_launch_context(shot):
+                context_ptr = self._context_for_input(input, shot)
+                if self._use_torchop_context(shot):
+                    self._launch_registered_context_torchop(context_ptr, out, shot)
+                elif self._use_pybind_context(shot):
+                    self._launch_registered_context_pybind(context_ptr, out, shot)
+                else:
+                    self._launch_registered_context(context_ptr, out, shot)
+            else:
+                rank_data = self._rank_data_for_input(input)
+                if self._use_eager_graph_cache(input, shot):
+                    return self._launch_registered_eager_graph(input, rank_data, shot)
+                self._launch_registered(rank_data, out, shot)
+        return out
+
+    def close(self):
+        if not self.disabled and dist.is_initialized():
+            self._eager_graph_cache.clear()
+            self._eager_graph_cursor.clear()
+            for (_, shot), context_ptr in tuple(self._rank_data_context_cache.items()):
+                self._jit_ar.dispose_context(context_ptr, self.world_size, shot)
+            self._rank_data_context_cache.clear()
+            for (_, shot), context_ptr in tuple(
+                self._unregistered_context_cache.items()
+            ):
+                disposer = self._unregistered_context_pybind_disposers.get(shot)
+                if disposer is None:
+                    disposer = self._jit_ar.dispose_unregistered_context_pybind_func(
+                        self.world_size, shot
+                    )
+                    self._unregistered_context_pybind_disposers[shot] = disposer
+                disposer(int(context_ptr))
+            self._unregistered_context_cache.clear()
+            lib = CudaRTLibrary()
+            for ptr in self._opened_ipc_ptrs.values():
+                lib.cudaIpcCloseMemHandle(ctypes.c_void_p(ptr))
+            self._opened_ipc_ptrs.clear()
+            CustomAllreduce.free_shared_buffer(self.buffer_ptrs, group=self.group)
+            CustomAllreduce.free_shared_buffer(self.meta_ptrs, group=self.group)
+        self.disabled = True
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 def dispatch_custom_allreduce():
     """Return the CustomAllreduce class to use (aiter on ROCm if enabled).
 
     On AMD with 1-stage AR enabled, use sglang's CustomAllreduce.
     Otherwise use AiterCustomAllreduce if available.
 
-    On CUDA, the JIT-compiled v2 implementation is used by default.
-    Set SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0 to fall back to the legacy CustomAllreduce.
-    Note: ``ServerArgs._handle_environment_variables`` forces this env to "0" when
-    ``nnodes > 1`` since custom AR is intra-node only.
+    Set SGLANG_USE_JIT_ALL_REDUCE=1 for CUDA or
+    SGLANG_MUSA_USE_JIT_ALL_REDUCE=1 for MUSA to use the JIT-compiled implementation.
     """
-    if _is_cuda and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
-        from .custom_all_reduce_v2 import CustomAllReduceV2
+    if _use_jit_all_reduce():
+        if _is_cuda:
+            from .custom_all_reduce_v2 import CustomAllReduceV2
 
-        logger.debug("[AR] Using CustomAllReduceV2 (JIT-compiled)")
-        return CustomAllReduceV2
+            logger.debug("[AR] Using CustomAllReduceV2 (JIT-compiled)")
+            return CustomAllReduceV2
+        if _is_musa:
+            logger.debug("[AR] Using MusaJitCustomAllreduce (JIT-compiled)")
+            return MusaJitCustomAllreduce
 
-    if _is_cuda or _is_musa:
+    if _is_cuda:
         return CustomAllreduce
 
     assert _is_hip

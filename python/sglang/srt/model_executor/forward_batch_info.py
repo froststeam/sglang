@@ -304,6 +304,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     # The mask to track mamba state if needed
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
+    # XXX (MUSA): Optional CPU-side summary and compact tracked indices used to
+    # avoid tensor.any()/nonzero() syncs in the GDN/Mamba tracking path.
+    mamba_track_mask_cpu: Optional[List[bool]] = None
+    mamba_track_mask_indices: Optional[torch.Tensor] = None  # shape: [num_tracked]
     # The seqlens to track mamba state if masked, prefill only.
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
 
@@ -455,6 +459,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             out_cache_loc=batch.out_cache_loc,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
+            mamba_track_mask_cpu=batch.mamba_track_mask_cpu,
+            mamba_track_mask_indices=batch.mamba_track_mask_indices,
             mamba_track_seqlens=batch.mamba_track_seqlens,
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,

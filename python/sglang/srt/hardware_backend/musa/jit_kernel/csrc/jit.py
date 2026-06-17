@@ -79,6 +79,10 @@ def _object_path(build_dir: Path, source: Path) -> Path:
     return build_dir / f"{source.parent.name}_{source.stem}{suffix}"
 
 
+def musa_jit_build_dir(name: str) -> Path:
+    return _CACHE_DIR / name
+
+
 def _ninja_content(
     name: str,
     sources: Sequence[Path],
@@ -193,3 +197,60 @@ def load_musa_jit(
         sys.stderr.flush()
         subprocess.run(command, check=True)
     return tvm_ffi.load_module(str(so_path))
+
+
+@functools.lru_cache(maxsize=16)
+def load_musa_pybind(
+    name: str,
+    sources: tuple[str, ...],
+    extra_cflags: tuple[str, ...] = (),
+    extra_musa_cflags: tuple[str, ...] = (),
+    extra_ldflags: tuple[str, ...] = (),
+):
+    from torch_musa.utils.musa_extension import load
+
+    resolved_sources = tuple(str((_CSRC_DIR / source).resolve()) for source in sources)
+    build_dir = musa_jit_build_dir(name)
+    lock_path = _CACHE_DIR / "tmp" / f"{name}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    build_dir.mkdir(parents=True, exist_ok=True)
+    libtvm = Path(find_libtvm_ffi())
+    include_paths = [
+        str(find_include_path()),
+        str(find_dlpack_include_path()),
+        str(_musa_home() / "include"),
+    ]
+    ldflags = [
+        f"-L{libtvm.parent}",
+        "-ltvm_ffi",
+        f"-L{_musa_home() / 'lib'}",
+        "-lmusa",
+        "-lmusart",
+        *extra_ldflags,
+        *_parse_env_flags("SGLANG_MUSA_EXTRA_LDFLAGS"),
+    ]
+    with FileLock(str(lock_path)):
+        return load(
+            name=name,
+            sources=list(resolved_sources),
+            extra_cflags=[
+                "-O3",
+                "-std=c++17",
+                *extra_cflags,
+                *_parse_env_flags("SGLANG_MUSA_EXTRA_CFLAGS"),
+            ],
+            extra_musa_cflags=[
+                "-O3",
+                "-std=c++17",
+                "-ffast-math",
+                *_musa_arch_flags(),
+                *extra_musa_cflags,
+                *_parse_env_flags("SGLANG_MUSA_EXTRA_MUSAFLAGS"),
+            ],
+            extra_ldflags=ldflags,
+            extra_include_paths=include_paths,
+            build_directory=str(build_dir),
+            verbose=os.environ.get("SGLANG_MUSA_JIT_VERBOSE") == "1",
+            with_musa=True,
+            is_python_module=True,
+        )

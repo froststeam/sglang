@@ -16,16 +16,27 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 _is_cuda = current_platform.is_cuda()
 _is_hip = current_platform.is_hip()
 _is_npu = current_platform.is_npu()
+_is_musa = current_platform.is_musa()
 if _is_cuda:
     from sglang.jit_kernel.activation import silu_and_mul
 elif _is_hip:
     from sgl_kernel import silu_and_mul
+elif _is_musa:
+    from sglang.srt.hardware_backend.musa.jit_kernel import act_and_mul
 
 
 if _is_npu:
     import torch_npu
 # TODO (will): remove this dependency
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
+
+
+def _musa_act_and_mul(x: torch.Tensor, activation: str) -> torch.Tensor:
+    d = x.shape[-1] // 2
+    output_shape = x.shape[:-1] + (d,)
+    return act_and_mul(x.view(-1, x.shape[-1]), activation=activation).view(
+        output_shape
+    )
 
 
 @CustomOp.register("silu_and_mul")
@@ -59,7 +70,7 @@ class SiluAndMul(CustomOp):
         return out
 
     def forward_musa(self, x: torch.Tensor) -> torch.Tensor:
-        return nn.SwishGLU()(x)
+        return _musa_act_and_mul(x, "silu")
 
 
 @CustomOp.register("gelu_and_mul")
@@ -95,6 +106,13 @@ class GeluAndMul(CustomOp):
         """PyTorch-native implementation equivalent to forward()."""
         d = x.shape[-1] // 2
         return F.gelu(x[..., :d], approximate=self.approximate) * x[..., d:]
+
+    def forward_musa(self, x: torch.Tensor) -> torch.Tensor:
+        if self.approximate == "none":
+            return _musa_act_and_mul(x, "gelu")
+        if self.approximate == "tanh":
+            return _musa_act_and_mul(x, "gelu_tanh")
+        return self.forward_native(x)
 
     def extra_repr(self) -> str:
         return f"approximate={repr(self.approximate)}"

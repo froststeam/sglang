@@ -94,7 +94,9 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
 
-if is_musa():
+_is_musa = is_musa()
+
+if _is_musa:
     from sglang.srt.hardware_backend.musa.jit_kernel import RMSNorm as RMSNormGated
     from sglang.srt.hardware_backend.musa.jit_kernel import (
         fused_qkvzba_split_reshape_cat_contiguous,
@@ -425,6 +427,29 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         z = z.reshape(z.size(0), -1, self.head_v_dim)
 
         return query, key, value, z, b, a
+
+    def _prefill_qkvzba_views(
+        self,
+        projected_states_qkvz: torch.Tensor,
+        projected_states_ba: torch.Tensor,
+    ):
+        """Use checkpoint projection layout directly for extend/prefill.
+
+        The GDN conv consumes flat [q, k, v] channels. For prefill we can pass
+        the leading qkv slice directly and avoid materializing a second qkv
+        tensor through fused split/cat. Decode keeps the existing fused path.
+        """
+        k_tp = self.key_dim // self.attn_tp_size
+        v_tp = self.value_dim // self.attn_tp_size
+        nv_tp = self.num_v_heads // self.attn_tp_size
+
+        qkv_dim = k_tp + k_tp + v_tp
+        mixed_qkv = projected_states_qkvz[:, :qkv_dim]
+        z = projected_states_qkvz[:, qkv_dim : qkv_dim + v_tp].reshape(
+            projected_states_qkvz.size(0), -1, self.head_v_dim
+        )
+        b, a = projected_states_ba.split([nv_tp, nv_tp], dim=-1)
+        return mixed_qkv, z, b, a
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
         if (

@@ -70,9 +70,10 @@ elif _is_hip:
 elif _is_xpu:
     from sgl_kernel import moe_sum_reduce, silu_and_mul
 elif _is_musa:
-    from sgl_kernel import moe_sum_reduce
-
-    _silu_and_mul_musa = torch.nn.SwishGLU()
+    from sglang.srt.hardware_backend.musa.jit_kernel import (
+        moe_act_and_mul,
+        moe_sum_reduce,
+    )
 
 # Try to import vllm_ops for non-CUDA/HIP/XPU platforms
 _has_vllm_ops = False
@@ -602,7 +603,16 @@ def _fused_moe_kernel_sequence(
             else:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
         elif _is_musa:
-            intermediate_cache2 = _silu_and_mul_musa(intermediate_cache1.view(-1, N))
+            moe_act_and_mul(
+                intermediate_cache1.view(-1, N),
+                intermediate_cache2,
+                config,
+                topk_ids,
+                expert_ids,
+                down_moe_use_tma,
+                activation,
+                filter_expert=filter_expert,
+            )
         else:
             if _has_vllm_ops:
                 vllm_ops.silu_and_mul(
@@ -625,7 +635,7 @@ def _fused_moe_kernel_sequence(
                     expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
                 )
             elif _is_musa:
-                act_and_mul_triton(
+                moe_act_and_mul(
                     intermediate_cache1.view(-1, N),
                     intermediate_cache2,
                     config,
@@ -633,6 +643,7 @@ def _fused_moe_kernel_sequence(
                     expert_ids,
                     down_moe_use_tma,
                     activation,
+                    filter_expert=filter_expert,
                 )
             else:
                 gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)

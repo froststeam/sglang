@@ -1,0 +1,672 @@
+from __future__ import annotations
+
+import os
+from typing import Optional
+
+import torch
+import torch.nn.functional as F
+import triton
+
+from sglang.jit_kernel.utils import cache_once
+from sglang.srt.hardware_backend.musa.jit_kernel.csrc.jit import load_musa_jit
+from sglang.srt.utils.custom_op import register_custom_op
+
+
+@cache_once
+def _topk_module():
+    return load_musa_jit(
+        "sglang_musa_topk_gating",
+        ("moe/topk_gating.mu",),
+    )
+
+
+def _topk_softmax_impl(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    gating_output: torch.Tensor,
+    renormalize: bool = False,
+    moe_softcapping: float = 0.0,
+    correction_bias: Optional[torch.Tensor] = None,
+) -> None:
+    has_correction_bias = correction_bias is not None
+    bias_arg = correction_bias if has_correction_bias else topk_weights.reshape(-1)
+    _topk_module().sgl_musa_topk_softmax(
+        topk_weights,
+        topk_ids,
+        gating_output,
+        bool(renormalize),
+        float(moe_softcapping),
+        bias_arg,
+        bool(has_correction_bias),
+    )
+
+
+def _topk_sigmoid_impl(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    gating_output: torch.Tensor,
+    renormalize: bool = False,
+    correction_bias: Optional[torch.Tensor] = None,
+) -> None:
+    has_correction_bias = correction_bias is not None
+    bias_arg = correction_bias if has_correction_bias else topk_weights.reshape(-1)
+    _topk_module().sgl_musa_topk_sigmoid(
+        topk_weights,
+        topk_ids,
+        gating_output,
+        bool(renormalize),
+        bias_arg,
+        bool(has_correction_bias),
+    )
+
+
+@register_custom_op(
+    op_name="musa_topk_softmax",
+    mutates_args=["topk_weights", "topk_ids"],
+)
+def _topk_softmax_custom(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    gating_output: torch.Tensor,
+    renormalize: bool = False,
+) -> None:
+    _topk_softmax_impl(
+        topk_weights,
+        topk_ids,
+        gating_output,
+        renormalize,
+    )
+
+
+@register_custom_op(
+    op_name="musa_topk_sigmoid",
+    mutates_args=["topk_weights", "topk_ids"],
+)
+def _topk_sigmoid_custom(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    gating_output: torch.Tensor,
+    renormalize: bool = False,
+    correction_bias: Optional[torch.Tensor] = None,
+) -> None:
+    _topk_sigmoid_impl(
+        topk_weights,
+        topk_ids,
+        gating_output,
+        renormalize,
+        correction_bias,
+    )
+
+
+def topk_softmax(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    gating_output: torch.Tensor,
+    renormalize: bool = False,
+) -> None:
+    """sgl_kernel-compatible top-k softmax entry point."""
+    _topk_softmax_custom(
+        topk_weights,
+        topk_ids,
+        gating_output,
+        renormalize,
+    )
+
+
+def topk_sigmoid(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    gating_output: torch.Tensor,
+    renormalize: bool = False,
+    correction_bias: Optional[torch.Tensor] = None,
+) -> None:
+    _topk_sigmoid_custom(
+        topk_weights,
+        topk_ids,
+        gating_output,
+        renormalize,
+        correction_bias,
+    )
+
+
+@cache_once
+def _moe_sum_reduce_module():
+    return load_musa_jit(
+        "sglang_musa_moe_sum_reduce",
+        ("moe/moe_sum_reduce.mu",),
+    )
+
+
+def _moe_sum_reduce_impl(
+    input_tensor: torch.Tensor,
+    output_tensor: torch.Tensor,
+    routed_scaling_factor: float = 0.0,
+) -> None:
+    _moe_sum_reduce_module().sgl_musa_moe_sum_reduce(
+        input_tensor,
+        output_tensor,
+        float(routed_scaling_factor),
+    )
+
+
+@register_custom_op(
+    op_name="musa_moe_sum_reduce",
+    mutates_args=["output_tensor"],
+)
+def _moe_sum_reduce_custom(
+    input_tensor: torch.Tensor,
+    output_tensor: torch.Tensor,
+    routed_scaling_factor: float = 0.0,
+) -> None:
+    _moe_sum_reduce_impl(input_tensor, output_tensor, routed_scaling_factor)
+
+
+def moe_sum_reduce(
+    input_tensor: torch.Tensor,
+    output_tensor: torch.Tensor,
+    routed_scaling_factor: float = 0.0,
+) -> None:
+    _moe_sum_reduce_custom(input_tensor, output_tensor, routed_scaling_factor)
+
+
+@cache_once
+def _act_and_mul_module():
+    return load_musa_jit(
+        "sglang_musa_act_and_mul",
+        ("moe/act_and_mul.mu",),
+    )
+
+
+def _activation_type_id(activation: str) -> int:
+    if activation == "silu":
+        return 0
+    if activation == "gelu":
+        return 1
+    if activation == "gelu_tanh":
+        return 2
+    raise ValueError(f"Unsupported activation: {activation}")
+
+
+def _act_and_mul_impl(
+    gateup_output: torch.Tensor,
+    down_input: torch.Tensor,
+    expert_ids: torch.Tensor,
+    expert_step: int,
+    activation_type: int,
+    skip_expert_check: int,
+) -> None:
+    _act_and_mul_module().sgl_musa_act_and_mul(
+        gateup_output,
+        down_input,
+        expert_ids,
+        int(expert_step),
+        int(activation_type),
+        int(skip_expert_check),
+    )
+
+
+@register_custom_op(
+    op_name="musa_act_and_mul",
+    mutates_args=["down_input"],
+)
+def _act_and_mul_custom(
+    gateup_output: torch.Tensor,
+    down_input: torch.Tensor,
+    expert_ids: torch.Tensor,
+    expert_step: int,
+    activation_type: int,
+    skip_expert_check: int,
+) -> None:
+    _act_and_mul_impl(
+        gateup_output,
+        down_input,
+        expert_ids,
+        expert_step,
+        activation_type,
+        skip_expert_check,
+    )
+
+
+def act_and_mul(
+    gateup_output: torch.Tensor,
+    down_input: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
+    topk_ids: Optional[torch.Tensor] = None,
+    expert_ids: Optional[torch.Tensor] = None,
+    down_moe_use_tma: bool = False,
+    activation: str = "silu",
+    filter_expert: bool = False,
+) -> Optional[torch.Tensor]:
+    """MUSA JIT gated activation-and-multiply op."""
+    return_output = down_input is None
+    if down_input is None:
+        down_input = torch.empty(
+            (gateup_output.shape[0], gateup_output.shape[1] // 2),
+            dtype=gateup_output.dtype,
+            device=gateup_output.device,
+        )
+
+    if down_moe_use_tma:
+        if expert_ids is None:
+            raise ValueError("expert_ids is required when down_moe_use_tma=True")
+        selected_expert_ids = expert_ids
+        expert_step = int(config["BLOCK_SIZE_M"]) if config is not None else 1
+        skip_expert_check = 0
+    else:
+        selected_expert_ids = (
+            topk_ids.view(-1)
+            if topk_ids is not None
+            else torch.empty((0,), dtype=torch.int32, device=gateup_output.device)
+        )
+        expert_step = 1
+        skip_expert_check = 0 if filter_expert and topk_ids is not None else 1
+
+    _act_and_mul_custom(
+        gateup_output,
+        down_input,
+        selected_expert_ids,
+        expert_step,
+        _activation_type_id(activation),
+        skip_expert_check,
+    )
+    if return_output:
+        return down_input
+    return None
+
+
+@cache_once
+def _act_and_mul_post_quant_module():
+    return load_musa_jit(
+        "sglang_musa_act_and_mul_post_quant",
+        ("moe/act_and_mul_post_quant.mu",),
+    )
+
+
+def _act_and_mul_masked_post_quant_impl(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    activation_type: int,
+) -> None:
+    _act_and_mul_post_quant_module().sgl_musa_act_and_mul_masked_post_quant(
+        input,
+        output,
+        output_scale,
+        masked_m,
+        int(activation_type),
+    )
+
+
+@register_custom_op(
+    op_name="musa_act_and_mul_masked_post_quant",
+    mutates_args=["output", "output_scale"],
+)
+def _act_and_mul_masked_post_quant_custom(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    activation_type: int,
+) -> None:
+    _act_and_mul_masked_post_quant_impl(
+        input,
+        output,
+        output_scale,
+        masked_m,
+        activation_type,
+    )
+
+
+def act_and_mul_masked_post_quant(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    activation: str = "silu",
+) -> None:
+    _act_and_mul_masked_post_quant_custom(
+        input,
+        output,
+        output_scale,
+        masked_m,
+        _activation_type_id(activation),
+    )
+
+
+def act_and_mul_masked_post_quant_fwd(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    quant_group_size: int,
+    masked_m: torch.Tensor,
+    scale_ue8m0: bool = False,
+    activation: str = "silu",
+) -> None:
+    assert input.is_contiguous()
+    assert output.dtype == torch.float8_e4m3fn
+    assert output.is_contiguous()
+    assert len(input.shape) == 3
+    assert input.shape[0] == masked_m.shape[0]
+    assert input.shape[-1] % 2 == 0
+    assert activation in ("silu", "gelu", "gelu_tanh")
+
+    size_n = input.shape[-1] // 2
+    assert size_n % quant_group_size == 0
+
+    if input.dtype != torch.bfloat16 or quant_group_size != 128 or scale_ue8m0:
+        raise ValueError(
+            "MUSA act_and_mul masked post-quant requires bf16 input, "
+            "quant_group_size=128, and scale_ue8m0=False."
+        )
+
+    act_and_mul_masked_post_quant(
+        input,
+        output,
+        output_scale,
+        masked_m,
+        activation=activation,
+    )
+
+
+@cache_once
+def _moe_align_block_size_module():
+    return load_musa_jit(
+        "sglang_musa_moe_align_block_size",
+        ("moe/moe_align_block_size.mu",),
+        extra_musa_cflags=(
+            "-mtgpu",
+            "-Od3",
+            "-fmusa-flush-denormals-to-zero",
+            "-fno-strict-aliasing",
+        ),
+    )
+
+
+def _moe_align_block_size_impl(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+    cumsum_buffer: torch.Tensor,
+    pad_sorted_token_ids: bool = False,
+) -> None:
+    large_threshold = int(os.getenv("SGLANG_MUSA_MOE_ALIGN_LARGE_THRESHOLD", "16384"))
+    chunked_direct_threshold = int(
+        os.getenv("SGLANG_MUSA_MOE_ALIGN_CHUNKED_DIRECT_THRESHOLD", "8192")
+    )
+    chunked_direct_limit = int(
+        os.getenv("SGLANG_MUSA_MOE_ALIGN_CHUNKED_DIRECT_LIMIT", "8193")
+    )
+    use_chunked_direct = (
+        chunked_direct_threshold <= topk_ids.size(0) < chunked_direct_limit
+        and int(num_experts) <= 257
+    )
+    if use_chunked_direct:
+        chunk_size = int(os.getenv("SGLANG_MUSA_MOE_ALIGN_DIRECT_CHUNK", "4096"))
+        num_chunks = triton.cdiv(topk_ids.numel(), chunk_size)
+        workspace = torch.empty(
+            (num_chunks * int(num_experts),),
+            device=topk_ids.device,
+            dtype=torch.int32,
+        )
+        _moe_align_block_size_module().sgl_musa_moe_align_block_size_chunked_direct(
+            topk_ids,
+            int(num_experts),
+            int(block_size),
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            cumsum_buffer,
+            workspace,
+            chunk_size,
+            bool(pad_sorted_token_ids),
+        )
+        return
+
+    if topk_ids.size(0) >= large_threshold:
+        chunk_size = int(os.getenv("SGLANG_MUSA_MOE_ALIGN_CHUNK", "4096"))
+        num_chunks = triton.cdiv(topk_ids.numel(), chunk_size)
+        workspace = torch.empty(
+            (2 * (num_chunks + 1) * int(num_experts),),
+            device=topk_ids.device,
+            dtype=torch.int32,
+        )
+        _moe_align_block_size_module().sgl_musa_moe_align_block_size_large_sort(
+            topk_ids,
+            int(num_experts),
+            int(block_size),
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            cumsum_buffer,
+            workspace,
+            chunk_size,
+            bool(pad_sorted_token_ids),
+        )
+        return
+
+    _moe_align_block_size_module().sgl_musa_moe_align_block_size(
+        topk_ids,
+        int(num_experts),
+        int(block_size),
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        cumsum_buffer,
+        bool(pad_sorted_token_ids),
+    )
+
+
+@register_custom_op(
+    op_name="musa_moe_align_block_size",
+    mutates_args=[
+        "sorted_token_ids",
+        "expert_ids",
+        "num_tokens_post_pad",
+        "cumsum_buffer",
+    ],
+)
+def _moe_align_block_size_custom(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+    cumsum_buffer: torch.Tensor,
+    pad_sorted_token_ids: bool = False,
+) -> None:
+    _moe_align_block_size_impl(
+        topk_ids,
+        num_experts,
+        block_size,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        cumsum_buffer,
+        pad_sorted_token_ids,
+    )
+
+
+def moe_align_block_size(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+    cumsum_buffer: torch.Tensor,
+    pad_sorted_token_ids: bool = False,
+) -> None:
+    _moe_align_block_size_custom(
+        topk_ids,
+        num_experts,
+        block_size,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        cumsum_buffer,
+        pad_sorted_token_ids,
+    )
+
+
+def deep_gemm_contig_preprocess(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    src2dst: torch.Tensor,
+    topk_ids_for_combine: torch.Tensor,
+    num_local_experts: int,
+    use_fp8_quant: bool,
+    block_m: int,
+) -> None:
+    if block_m <= 0:
+        raise ValueError(f"block_m must be positive, got {block_m}")
+
+    # XXX (MUSA): Workspace is private to the contiguous DeepGEMM preprocess op.
+    counts = torch.empty(
+        (num_local_experts,), device=hidden_states.device, dtype=torch.int32
+    )
+    cursor = torch.empty_like(counts)
+
+    from sglang.srt.hardware_backend.musa.jit_kernel.tilelang.deep_gemm_contig_preprocess import (
+        can_use_bf16_tilelang,
+        can_use_fp8_tilelang,
+        deep_gemm_contig_preprocess_bf16_tilelang,
+        deep_gemm_contig_preprocess_fp8_tilelang,
+    )
+
+    if use_fp8_quant:
+        if not can_use_fp8_tilelang(
+            hidden_states, topk_ids, num_local_experts, use_fp8_quant
+        ):
+            raise RuntimeError(
+                "MUSA DeepGEMM fp8 contiguous preprocess now requires the "
+                "TileLang implementation: expected hidden_size to be a "
+                "supported multiple of 128, topk=8, and num_local_experts>0."
+            )
+        deep_gemm_contig_preprocess_fp8_tilelang(
+            hidden_states,
+            topk_ids,
+            output,
+            output_scale,
+            m_indices,
+            src2dst,
+            topk_ids_for_combine,
+            counts,
+            cursor,
+            num_local_experts,
+            block_m,
+        )
+        return
+
+    if not can_use_bf16_tilelang(
+        hidden_states, topk_ids, num_local_experts, use_fp8_quant
+    ):
+        raise RuntimeError(
+            "MUSA DeepGEMM bf16 contiguous preprocess now requires the "
+            "TileLang implementation: expected hidden_size to be a supported "
+            "multiple of 128, topk<=16, and num_local_experts>0."
+        )
+    deep_gemm_contig_preprocess_bf16_tilelang(
+        hidden_states,
+        topk_ids,
+        output,
+        m_indices,
+        src2dst,
+        topk_ids_for_combine,
+        counts,
+        cursor,
+        num_local_experts,
+        block_m,
+    )
+
+
+@cache_once
+def _fused_share_gate_sigmoid_mul_module():
+    return load_musa_jit(
+        "sglang_musa_fused_share_gate_sigmoid_mul",
+        ("moe/fused_share_gate_sigmoid_mul.mu",),
+    )
+
+
+def _can_use_fused_share_gate_sigmoid_mul(
+    hidden_state: torch.Tensor,
+    share_gate_weight: torch.Tensor,
+    share_expert_output: torch.Tensor,
+) -> bool:
+    return (
+        hidden_state.is_contiguous()
+        and share_gate_weight.is_contiguous()
+        and share_expert_output.is_contiguous()
+        and hidden_state.dim() == 2
+        and share_gate_weight.dim() == 2
+        and share_expert_output.dim() == 2
+        and share_gate_weight.size(0) == 1
+        and hidden_state.shape == share_expert_output.shape
+        and hidden_state.size(1) == share_gate_weight.size(1)
+        and hidden_state.size(1) % 8 == 0
+        and hidden_state.dtype in (torch.float16, torch.bfloat16)
+        and share_gate_weight.dtype == hidden_state.dtype
+        and share_expert_output.dtype == hidden_state.dtype
+    )
+
+
+def _fused_share_gate_sigmoid_mul_impl(
+    hidden_state: torch.Tensor,
+    share_gate_weight: torch.Tensor,
+    share_expert_output: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    _fused_share_gate_sigmoid_mul_module().sgl_musa_fused_share_gate_sigmoid_mul(
+        output,
+        hidden_state,
+        share_gate_weight,
+        share_expert_output,
+    )
+
+
+@register_custom_op(
+    op_name="musa_fused_share_gate_sigmoid_mul",
+    mutates_args=["output"],
+)
+def _fused_share_gate_sigmoid_mul_custom(
+    hidden_state: torch.Tensor,
+    share_gate_weight: torch.Tensor,
+    share_expert_output: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    _fused_share_gate_sigmoid_mul_impl(
+        hidden_state,
+        share_gate_weight,
+        share_expert_output,
+        output,
+    )
+
+
+def fused_share_gate_sigmoid_mul(
+    hidden_state: torch.Tensor,
+    share_gate_weight: torch.Tensor,
+    share_expert_output: torch.Tensor,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if output is None:
+        output = torch.empty_like(share_expert_output)
+    if _can_use_fused_share_gate_sigmoid_mul(
+        hidden_state, share_gate_weight, share_expert_output
+    ):
+        _fused_share_gate_sigmoid_mul_custom(
+            hidden_state,
+            share_gate_weight,
+            share_expert_output,
+            output,
+        )
+        return output
+
+    gate = F.linear(hidden_state, share_gate_weight)
+    return torch.mul(torch.sigmoid(gate), share_expert_output, out=output)

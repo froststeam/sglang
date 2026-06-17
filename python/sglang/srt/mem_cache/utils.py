@@ -46,9 +46,6 @@ def set_mla_kv_buffer_kernel(
     total_dim = nope_dim + rope_dim
     mask = offs < total_dim
 
-    if USE_GDC:
-        pass
-
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
 
@@ -86,16 +83,6 @@ def set_mla_kv_buffer_kernel(
         src = tl.where(is_nope, src_nope, src_rope)
 
     tl.store(dst_ptr, src, mask=mask)
-
-    if USE_GDC:
-        pass
-
-
-# Above this loc count the TMA bulk-store path overtakes the single-CTA-per-loc
-# Triton kernel. Below it, Triton with BLOCK = next_pow2(total_dim) (one CTA
-# does the whole row in one tile, no boundary fan-out) is the winning fallback.
-# Tuned on GB300 with DSv4 row widths.
-_TMA_BULK_STORE_MIN_LOCS = 768
 
 
 def set_mla_kv_buffer_triton(
@@ -194,9 +181,6 @@ def set_mla_kv_buffer_fp8_quant_kernel(
     total_dim = nope_dim + rope_dim
     mask = offs < total_dim
 
-    if USE_GDC:
-        pass
-
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     dst_ptr = kv_buffer_fp8_ptr + loc * buffer_stride + offs
 
@@ -229,9 +213,6 @@ def set_mla_kv_buffer_fp8_quant_kernel(
 
     # Destination pointer is FP8-typed view; tl.store performs downcast.
     tl.store(dst_ptr, src, mask=mask)
-
-    if USE_GDC:
-        pass
 
 
 def set_mla_kv_buffer_triton_fp8_quant(

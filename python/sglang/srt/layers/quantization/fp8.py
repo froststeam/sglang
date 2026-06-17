@@ -111,6 +111,13 @@ _is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
+# XXX (MUSA): Standard FP8 MoE uses Triton for small batches and contiguous
+# DeepGEMM for larger batches on MUSA. These cutoffs are selected from the
+# Qwen3.5-35B-A3B FP8 TP1 measurements on MTT S5000.
+_MUSA_TRITON_MOE_MAX_TOKENS = 8192
+_MUSA_CONTIG_BLOCK_M_256_MIN_TOKENS = 32768
+_MUSA_CONTIG_DEEPGEMM_BLOCK_M_SMALL = 128
+_MUSA_CONTIG_DEEPGEMM_BLOCK_M_LARGE = 256
 
 if _use_aiter or _use_hip_int4:
     from aiter.ops.shuffle import shuffle_weight
@@ -829,6 +836,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.with_bias = False
+        self.use_musa_contig_deepgemm = False
         if get_moe_runner_backend().is_cutlass():
             assert (
                 cutlass_fp8_supported()
@@ -854,6 +862,36 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 or get_moe_a2a_backend().is_nixl()
             )
         return False
+
+    @staticmethod
+    def is_musa_contig_deepgemm_hybrid_enabled() -> bool:
+        from sglang.srt.layers import deep_gemm_wrapper
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        moe_runner_backend = get_moe_runner_backend()
+        return (
+            _is_musa
+            and moe_runner_backend.is_mixed()
+            and get_moe_a2a_backend().is_none()
+            and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        )
+
+    @staticmethod
+    def select_musa_moe_runner(
+        num_tokens: int, triton_runner: MoeRunner, deep_gemm_runner: MoeRunner
+    ) -> MoeRunner:
+        if num_tokens < _MUSA_TRITON_MOE_MAX_TOKENS:
+            return triton_runner
+
+        if num_tokens < _MUSA_CONTIG_BLOCK_M_256_MIN_TOKENS:
+            deep_gemm_runner.contiguous_gemm_block_m = (
+                _MUSA_CONTIG_DEEPGEMM_BLOCK_M_SMALL
+            )
+        else:
+            deep_gemm_runner.contiguous_gemm_block_m = (
+                _MUSA_CONTIG_DEEPGEMM_BLOCK_M_LARGE
+            )
+        return deep_gemm_runner
 
     def create_weights(
         self,
@@ -1634,6 +1672,24 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
 
+        if self.is_musa_contig_deepgemm_hybrid_enabled():
+            # XXX (MUSA): Keep the default small-token path on Triton, but switch
+            # large standard MoE batches to contiguous DeepGEMM.
+            self.use_musa_contig_deepgemm = True
+            self.triton_runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+            self.deep_gemm_runner = MoeRunner(
+                MoeRunnerBackend.DEEP_GEMM, moe_runner_config
+            )
+            self.deep_gemm_runner.use_contiguous_gemm = True
+            self.runner = self.triton_runner
+            return
+
+        if moe_runner_backend.is_mixed():
+            raise ValueError(
+                "mixed MoE runner backend is only supported on MUSA standard MoE "
+                "with JIT DeepGEMM enabled."
+            )
+
         if moe_runner_backend.is_auto():
             if self.is_deepgemm_moe_runner_backend_enabled():
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
@@ -1766,7 +1822,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             return StandardCombineInput(hidden_states=output)
 
-        if self.runner.runner_backend.is_deep_gemm():
+        runner = self.runner
+        if self.use_musa_contig_deepgemm:
+            runner = self.select_musa_moe_runner(
+                x.shape[0], self.triton_runner, self.deep_gemm_runner
+            )
+
+        if runner.runner_backend.is_deep_gemm():
 
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
@@ -1805,8 +1867,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 is_fp4_experts=self.is_fp4_expert,
             )
         elif (
-            self.runner.runner_backend.is_flashinfer_trtllm()
-            or self.runner.runner_backend.is_flashinfer_trtllm_routed()
+            runner.runner_backend.is_flashinfer_trtllm()
+            or runner.runner_backend.is_flashinfer_trtllm_routed()
         ):
             # FlashInfer TRT-LLM backend only supports fused execution and consumes
             # router logits directly (no separate apply_with_router_logits needed).
@@ -1868,10 +1930,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             quant_info = self.get_triton_quant_info(layer)
         else:
             raise NotImplementedError(
-                "Unsupported runner backend: %s" % self.runner.runner_backend
+                "Unsupported runner backend: %s" % runner.runner_backend
             )
 
-        return self.runner.run(dispatch_output, quant_info)
+        return runner.run(dispatch_output, quant_info)
 
     def _ensure_cutlass_buffers_initialized(self, layer: Module) -> None:
         if getattr(self, "_cutlass_buffers_ready", False):

@@ -1,0 +1,78 @@
+.ci-default:
+  interruptible: true
+  before_script:
+    - echo "CI_PROJECT_PATH=$CI_PROJECT_PATH"
+    - echo "CI_COMMIT_REF_NAME=$CI_COMMIT_REF_NAME"
+    - echo "CI_PIPELINE_SOURCE=$CI_PIPELINE_SOURCE"
+    - export GITHUB_WORKSPACE="${CI_PROJECT_DIR:-$(pwd)}"
+    - export GITHUB_PATH="${CI_PROJECT_DIR:-$(pwd)}/.gitlab_github_path"
+    - export PATH="$HOME/.local/bin:$PATH"
+
+.rules-disabled:
+  rules:
+    - when: never
+
+.rules-daily-image:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $DAILY_IMAGE_BUILD == "1"'
+    - if: '$CI_PIPELINE_SOURCE == "web" && $DAILY_IMAGE_BUILD == "1"'
+    - when: never
+
+.rules-stage-a:
+  rules:
+    - when: never
+
+.rules-stage-b:
+  rules:
+    - when: never
+
+.rules-nightly:
+  rules:
+    - when: never
+
+.musa-test-job:
+  extends: .ci-default
+  variables:
+    HF_ENDPOINT: "https://hf-mirror.com"
+    HF_HOME: "/data/hf-cache"
+    HF_HUB_CACHE: "/data/hf-cache/hub"
+    TRANSFORMERS_CACHE: "/data/hf-cache/hub"
+
+.cpu-job:
+  extends: .musa-test-job
+  tags:
+    - cpu-musa
+
+.musa-1gpu-job:
+  extends: .musa-test-job
+  tags:
+    - 1-gpu-musa
+
+.musa-1gpu-test-job:
+  extends: .musa-test-job
+  tags:
+    - 1-gpu-musa
+
+.musa-2gpu-test-job:
+  extends: .musa-test-job
+  tags:
+    - 2-gpu-musa
+
+.musa-4gpu-test-job:
+  extends: .musa-test-job
+  tags:
+    - 4-gpu-musa
+
+.image-builder-job:
+  extends: .ci-default
+  tags:
+    - image-builder
+  variables:
+    IMAGE_BUILD_SCRIPT: "/workspace/sglang_test/docker/build_infer_images.sh"
+    IMAGE_BUILD_STATE_DIR: "/workspace/sglang_test/ci-state"
+    SGLANG_SOURCE_REPO: "git@sh-code.mthreads.com:mcc-ai-serving/sglang.git"
+    PUSH: "1"
+    BUILD_BASE: "0"
+    BUILD_MUSA_BASE: "0"
+    BUILD_SGLANG: "1"
+    BUILD_VLLM_MUSA: "0"

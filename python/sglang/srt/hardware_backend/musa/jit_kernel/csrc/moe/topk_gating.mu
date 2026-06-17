@@ -17,7 +17,34 @@
 
 constexpr float kFloatMinimum = -10000.0f;
 constexpr int kWarpSize = 32;
-constexpr int kWarpsPerCta = 4;
+#ifndef SGLANG_TOPK_WARPS_PER_CTA
+#define SGLANG_TOPK_WARPS_PER_CTA 4
+#endif
+constexpr int kWarpsPerCta = SGLANG_TOPK_WARPS_PER_CTA;
+
+#ifndef SGLANG_TOPK_USE_GLOBAL_SCRATCH_RENORM
+#define SGLANG_TOPK_USE_GLOBAL_SCRATCH_RENORM 0
+#endif
+
+#ifndef SGLANG_TOPK_USE_ONEWARP_CTA_RENORM
+#define SGLANG_TOPK_USE_ONEWARP_CTA_RENORM 0
+#endif
+
+#ifndef SGLANG_TOPK_USE_PRESORT_RENORM
+#define SGLANG_TOPK_USE_PRESORT_RENORM 0
+#endif
+
+#ifndef SGLANG_TOPK_FAST_ARGMAX_NO_TIE
+#define SGLANG_TOPK_FAST_ARGMAX_NO_TIE 0
+#endif
+
+#ifndef SGLANG_TOPK_SPLIT_ARGMAX
+#define SGLANG_TOPK_SPLIT_ARGMAX 1
+#endif
+
+#ifndef SGLANG_ENABLE_BF16_PACKED_TOPK
+#define SGLANG_ENABLE_BF16_PACKED_TOPK 1
+#endif
 
 __device__ __forceinline__ float stable_sigmoid(float x) {
   const bool positive = x >= 0.0f;
@@ -27,15 +54,34 @@ __device__ __forceinline__ float stable_sigmoid(float x) {
 }
 
 __device__ __forceinline__ void warp_argmax(float &val, int &idx) {
+#if SGLANG_TOPK_SPLIT_ARGMAX
+  const float local_val = val;
+  const int local_idx = idx;
+#pragma unroll
+  for (int mask = kWarpSize / 2; mask > 0; mask >>= 1) {
+    val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, mask));
+  }
+  idx = (local_val == val) ? local_idx : 0x7fffffff;
+#pragma unroll
+  for (int mask = kWarpSize / 2; mask > 0; mask >>= 1) {
+    const int other_idx = __shfl_xor_sync(0xffffffff, idx, mask);
+    idx = other_idx < idx ? other_idx : idx;
+  }
+#else
 #pragma unroll
   for (int mask = kWarpSize / 2; mask > 0; mask >>= 1) {
     const float other_val = __shfl_xor_sync(0xffffffff, val, mask);
     const int other_idx = __shfl_xor_sync(0xffffffff, idx, mask);
+#if SGLANG_TOPK_FAST_ARGMAX_NO_TIE
+    if (other_val >= val) {
+#else
     if (other_val > val || (other_val == val && other_idx < idx)) {
+#endif
       val = other_val;
       idx = other_idx;
     }
   }
+#endif
 }
 
 __device__ __forceinline__ float warp_sum(float val) {
@@ -438,6 +484,397 @@ __launch_bounds__(kWarpsPerCta *kWarpSize, 1) void topk_softmax_no_bias_renorm_w
     }
   }
 }
+
+template <typename T, int NumExperts, int ValuesPerThread, int TopK>
+__global__
+__launch_bounds__(kWarpSize, 1) void topk_softmax_no_bias_renorm_onewarp_cta_kernel_fixed_k(
+    const T *__restrict__ gating_output, float *__restrict__ topk_weights,
+    int32_t *__restrict__ topk_ids, int num_tokens) {
+  const int lane = lane_id();
+  const int row = blockIdx.x;
+  if (row >= num_tokens) {
+    return;
+  }
+
+  float logits[ValuesPerThread];
+
+#pragma unroll
+  for (int i = 0; i < ValuesPerThread; ++i) {
+    const int expert = lane + i * kWarpSize;
+    const float val = to_float(gating_output[row * NumExperts + expert]);
+    logits[i] = val;
+  }
+
+  float selected_logits[TopK];
+  int selected_ids[TopK];
+
+#pragma unroll
+  for (int k_idx = 0; k_idx < TopK; ++k_idx) {
+    float max_val = logits[0];
+    int max_idx = lane;
+#pragma unroll
+    for (int i = 1; i < ValuesPerThread; ++i) {
+      const int expert = lane + i * kWarpSize;
+      const float val = logits[i];
+      if (val > max_val) {
+        max_val = val;
+        max_idx = expert;
+      }
+    }
+    warp_argmax(max_val, max_idx);
+
+    if (lane == 0) {
+      selected_logits[k_idx] = max_val;
+      selected_ids[k_idx] = max_idx;
+    }
+
+#pragma unroll
+    for (int i = 0; i < ValuesPerThread; ++i) {
+      const int expert = lane + i * kWarpSize;
+      if (expert == max_idx) {
+        logits[i] = kFloatMinimum;
+      }
+    }
+  }
+
+  if (lane == 0) {
+    const float selected_max = selected_logits[0];
+    selected_logits[0] = 1.0f;
+    float selected_sum = 1.0f;
+#pragma unroll
+    for (int k_idx = 1; k_idx < TopK; ++k_idx) {
+      selected_logits[k_idx] = __expf(selected_logits[k_idx] - selected_max);
+      selected_sum += selected_logits[k_idx];
+    }
+    const float inv_selected_sum = 1.0f / selected_sum;
+#pragma unroll
+    for (int k_idx = 0; k_idx < TopK; ++k_idx) {
+      const int out_idx = row * TopK + k_idx;
+      topk_weights[out_idx] = selected_logits[k_idx] * inv_selected_sum;
+      topk_ids[out_idx] = selected_ids[k_idx];
+    }
+  }
+}
+
+template <typename T, int NumExperts, int ValuesPerThread, int TopK>
+__global__
+__launch_bounds__(kWarpsPerCta *kWarpSize, 1) void topk_softmax_no_bias_renorm_warp_kernel_fixed_k_global_scratch(
+    const T *__restrict__ gating_output, float *__restrict__ topk_weights,
+    int32_t *__restrict__ topk_ids, int num_tokens) {
+  const int tid = threadIdx.x;
+  const int warp_id = tid / kWarpSize;
+  const int lane = lane_id();
+  const int row = blockIdx.x * kWarpsPerCta + warp_id;
+  if (row >= num_tokens) {
+    return;
+  }
+
+  float logits[ValuesPerThread];
+
+#pragma unroll
+  for (int i = 0; i < ValuesPerThread; ++i) {
+    const int expert = lane + i * kWarpSize;
+    logits[i] = to_float(gating_output[row * NumExperts + expert]);
+  }
+
+#pragma unroll
+  for (int k_idx = 0; k_idx < TopK; ++k_idx) {
+    float max_val = logits[0];
+    int max_idx = lane;
+#pragma unroll
+    for (int i = 1; i < ValuesPerThread; ++i) {
+      const int expert = lane + i * kWarpSize;
+      const float val = logits[i];
+      if (val > max_val) {
+        max_val = val;
+        max_idx = expert;
+      }
+    }
+    warp_argmax(max_val, max_idx);
+
+    if (lane == 0) {
+      const int out_idx = row * TopK + k_idx;
+      topk_weights[out_idx] = max_val;
+      topk_ids[out_idx] = max_idx;
+    }
+
+#pragma unroll
+    for (int i = 0; i < ValuesPerThread; ++i) {
+      const int expert = lane + i * kWarpSize;
+      if (expert == max_idx) {
+        logits[i] = kFloatMinimum;
+      }
+    }
+  }
+
+  if (lane == 0) {
+    const int out_base = row * TopK;
+    const float selected_max = topk_weights[out_base];
+    topk_weights[out_base] = 1.0f;
+    float selected_sum = 1.0f;
+#pragma unroll
+    for (int k_idx = 1; k_idx < TopK; ++k_idx) {
+      const float prob = __expf(topk_weights[out_base + k_idx] - selected_max);
+      topk_weights[out_base + k_idx] = prob;
+      selected_sum += prob;
+    }
+    const float inv_selected_sum = 1.0f / selected_sum;
+#pragma unroll
+    for (int k_idx = 0; k_idx < TopK; ++k_idx) {
+      topk_weights[out_base + k_idx] *= inv_selected_sum;
+    }
+  }
+}
+
+template <typename T, int NumExperts, int ValuesPerThread, int TopK>
+__global__
+__launch_bounds__(kWarpsPerCta *kWarpSize, 1) void topk_softmax_no_bias_renorm_warp_kernel_fixed_k_presort(
+    const T *__restrict__ gating_output, float *__restrict__ topk_weights,
+    int32_t *__restrict__ topk_ids, int num_tokens) {
+  const int tid = threadIdx.x;
+  const int warp_id = tid / kWarpSize;
+  const int lane = lane_id();
+  const int row = blockIdx.x * kWarpsPerCta + warp_id;
+  if (row >= num_tokens) {
+    return;
+  }
+
+  float vals[ValuesPerThread];
+  int ids[ValuesPerThread];
+
+#pragma unroll
+  for (int i = 0; i < ValuesPerThread; ++i) {
+    const int expert = lane + i * kWarpSize;
+    vals[i] = to_float(gating_output[row * NumExperts + expert]);
+    ids[i] = expert;
+  }
+
+#pragma unroll
+  for (int i = 1; i < ValuesPerThread; ++i) {
+    const float key_val = vals[i];
+    const int key_id = ids[i];
+    int j = i - 1;
+#pragma unroll
+    for (int step = 0; step < i; ++step) {
+      if (j >= 0 && (key_val > vals[j] ||
+                     (key_val == vals[j] && key_id < ids[j]))) {
+        vals[j + 1] = vals[j];
+        ids[j + 1] = ids[j];
+        --j;
+      }
+    }
+    vals[j + 1] = key_val;
+    ids[j + 1] = key_id;
+  }
+
+  int local_pos = 0;
+  float selected_logits[TopK];
+  int selected_ids[TopK];
+
+#pragma unroll
+  for (int k_idx = 0; k_idx < TopK; ++k_idx) {
+    float max_val = local_pos < ValuesPerThread ? vals[local_pos] : kFloatMinimum;
+    int max_idx = local_pos < ValuesPerThread ? ids[local_pos] : lane;
+    warp_argmax(max_val, max_idx);
+
+    if (lane == 0) {
+      selected_logits[k_idx] = max_val;
+      selected_ids[k_idx] = max_idx;
+    }
+
+    if (local_pos < ValuesPerThread && ids[local_pos] == max_idx) {
+      ++local_pos;
+    }
+  }
+
+  if (lane == 0) {
+    const float selected_max = selected_logits[0];
+    selected_logits[0] = 1.0f;
+    float selected_sum = 1.0f;
+#pragma unroll
+    for (int k_idx = 1; k_idx < TopK; ++k_idx) {
+      selected_logits[k_idx] = __expf(selected_logits[k_idx] - selected_max);
+      selected_sum += selected_logits[k_idx];
+    }
+    const float inv_selected_sum = 1.0f / selected_sum;
+#pragma unroll
+    for (int k_idx = 0; k_idx < TopK; ++k_idx) {
+      const int out_idx = row * TopK + k_idx;
+      topk_weights[out_idx] = selected_logits[k_idx] * inv_selected_sum;
+      topk_ids[out_idx] = selected_ids[k_idx];
+    }
+  }
+}
+
+#if SGLANG_ENABLE_BF16_PACKED_TOPK
+template <int TopK>
+__global__
+__launch_bounds__(kWarpsPerCta *kWarpSize, 1) void topk_softmax_bf16_e256_no_bias_renorm_warp_kernel_fixed_k(
+    const __mt_bfloat16 *__restrict__ gating_output,
+    float *__restrict__ topk_weights, int32_t *__restrict__ topk_ids,
+    int num_tokens) {
+  constexpr int NumExperts = 256;
+  constexpr int ValuesPerThread = 8;
+  constexpr int Bfloat2PerThread = ValuesPerThread / 2;
+
+  const int tid = threadIdx.x;
+  const int warp_id = tid / kWarpSize;
+  const int lane = lane_id();
+  const int row = blockIdx.x * kWarpsPerCta + warp_id;
+  if (row >= num_tokens) {
+    return;
+  }
+
+  float logits[ValuesPerThread];
+  const __mt_bfloat162 *row_ptr =
+      reinterpret_cast<const __mt_bfloat162 *>(gating_output +
+                                               row * NumExperts);
+
+#pragma unroll
+  for (int i = 0; i < Bfloat2PerThread; ++i) {
+    const int pair_idx = lane + i * kWarpSize;
+    const __mt_bfloat162 packed = row_ptr[pair_idx];
+    const float2 vals = __bfloat1622float2(packed);
+    logits[i * 2] = vals.x;
+    logits[i * 2 + 1] = vals.y;
+  }
+
+  float selected_logits[TopK];
+  int selected_ids[TopK];
+
+#pragma unroll
+  for (int k_idx = 0; k_idx < TopK; ++k_idx) {
+    float max_val = logits[0];
+    int max_idx = lane * 2;
+#pragma unroll
+    for (int i = 1; i < ValuesPerThread; ++i) {
+      const int pair_idx = i >> 1;
+      const int expert = lane * 2 + pair_idx * (kWarpSize * 2) + (i & 1);
+      const float val = logits[i];
+      if (val > max_val) {
+        max_val = val;
+        max_idx = expert;
+      }
+    }
+    warp_argmax(max_val, max_idx);
+
+    if (lane == 0) {
+      selected_logits[k_idx] = max_val;
+      selected_ids[k_idx] = max_idx;
+    }
+
+#pragma unroll
+    for (int i = 0; i < ValuesPerThread; ++i) {
+      const int pair_idx = i >> 1;
+      const int expert = lane * 2 + pair_idx * (kWarpSize * 2) + (i & 1);
+      if (expert == max_idx) {
+        logits[i] = kFloatMinimum;
+      }
+    }
+  }
+
+  if (lane == 0) {
+    const float selected_max = selected_logits[0];
+    selected_logits[0] = 1.0f;
+    float selected_sum = 1.0f;
+#pragma unroll
+    for (int k_idx = 1; k_idx < TopK; ++k_idx) {
+      selected_logits[k_idx] = __expf(selected_logits[k_idx] - selected_max);
+      selected_sum += selected_logits[k_idx];
+    }
+    const float inv_selected_sum = 1.0f / selected_sum;
+#pragma unroll
+    for (int k_idx = 0; k_idx < TopK; ++k_idx) {
+      const int out_idx = row * TopK + k_idx;
+      topk_weights[out_idx] = selected_logits[k_idx] * inv_selected_sum;
+      topk_ids[out_idx] = selected_ids[k_idx];
+    }
+  }
+}
+
+template <int TopK>
+__global__
+__launch_bounds__(kWarpSize, 1) void topk_softmax_bf16_e256_no_bias_renorm_onewarp_cta_kernel_fixed_k(
+    const __mt_bfloat16 *__restrict__ gating_output,
+    float *__restrict__ topk_weights, int32_t *__restrict__ topk_ids,
+    int num_tokens) {
+  constexpr int NumExperts = 256;
+  constexpr int ValuesPerThread = 8;
+  constexpr int Bfloat2PerThread = ValuesPerThread / 2;
+
+  const int lane = lane_id();
+  const int row = blockIdx.x;
+  if (row >= num_tokens) {
+    return;
+  }
+
+  float logits[ValuesPerThread];
+  const __mt_bfloat162 *row_ptr =
+      reinterpret_cast<const __mt_bfloat162 *>(gating_output +
+                                               row * NumExperts);
+
+#pragma unroll
+  for (int i = 0; i < Bfloat2PerThread; ++i) {
+    const int pair_idx = lane + i * kWarpSize;
+    const __mt_bfloat162 packed = row_ptr[pair_idx];
+    const float2 vals = __bfloat1622float2(packed);
+    logits[i * 2] = vals.x;
+    logits[i * 2 + 1] = vals.y;
+  }
+
+  float selected_logits[TopK];
+  int selected_ids[TopK];
+
+#pragma unroll
+  for (int k_idx = 0; k_idx < TopK; ++k_idx) {
+    float max_val = logits[0];
+    int max_idx = lane * 2;
+#pragma unroll
+    for (int i = 1; i < ValuesPerThread; ++i) {
+      const int pair_idx = i >> 1;
+      const int expert = lane * 2 + pair_idx * (kWarpSize * 2) + (i & 1);
+      const float val = logits[i];
+      if (val > max_val) {
+        max_val = val;
+        max_idx = expert;
+      }
+    }
+    warp_argmax(max_val, max_idx);
+
+    if (lane == 0) {
+      selected_logits[k_idx] = max_val;
+      selected_ids[k_idx] = max_idx;
+    }
+
+#pragma unroll
+    for (int i = 0; i < ValuesPerThread; ++i) {
+      const int pair_idx = i >> 1;
+      const int expert = lane * 2 + pair_idx * (kWarpSize * 2) + (i & 1);
+      if (expert == max_idx) {
+        logits[i] = kFloatMinimum;
+      }
+    }
+  }
+
+  if (lane == 0) {
+    const float selected_max = selected_logits[0];
+    selected_logits[0] = 1.0f;
+    float selected_sum = 1.0f;
+#pragma unroll
+    for (int k_idx = 1; k_idx < TopK; ++k_idx) {
+      selected_logits[k_idx] = __expf(selected_logits[k_idx] - selected_max);
+      selected_sum += selected_logits[k_idx];
+    }
+    const float inv_selected_sum = 1.0f / selected_sum;
+#pragma unroll
+    for (int k_idx = 0; k_idx < TopK; ++k_idx) {
+      const int out_idx = row * TopK + k_idx;
+      topk_weights[out_idx] = selected_logits[k_idx] * inv_selected_sum;
+      topk_ids[out_idx] = selected_ids[k_idx];
+    }
+  }
+}
+#endif
 
 template <typename T, int NumExperts, int TopK>
 __global__
@@ -868,12 +1305,75 @@ void launch_topk(ffi::TensorView topk_weights, ffi::TensorView topk_ids,
     if constexpr (IsSoftmax) {
       if (topk == 8 && !has_correction_bias && moe_softcapping <= 0.0f) {
         if (renormalize) {
-          const int halfwarp_rows_per_cta = kWarpsPerCta * 2;
-          const int halfwarp_blocks =
-              (num_tokens + halfwarp_rows_per_cta - 1) / halfwarp_rows_per_cta;
-          topk_softmax_no_bias_renorm_halfwarp_kernel_fixed_k<T, 256, 8>
-              <<<halfwarp_blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
-                  input_ptr, weights_ptr, ids_ptr, num_tokens);
+          if (num_tokens <= 2048) {
+            if constexpr (std::is_same_v<T, __mt_bfloat16>) {
+#if SGLANG_ENABLE_BF16_PACKED_TOPK
+              if (num_tokens == 1 || (num_tokens >= 16 && num_tokens <= 32)) {
+                topk_softmax_bf16_e256_no_bias_renorm_onewarp_cta_kernel_fixed_k<
+                    8>
+                    <<<num_tokens, kWarpSize, 0, stream>>>(
+                        input_ptr, weights_ptr, ids_ptr, num_tokens);
+              } else if (num_tokens > 32) {
+                topk_softmax_bf16_e256_no_bias_renorm_warp_kernel_fixed_k<8>
+                    <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                        input_ptr, weights_ptr, ids_ptr, num_tokens);
+              } else {
+                topk_softmax_no_bias_renorm_warp_kernel_fixed_k<T, 256, 8, 8>
+                    <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                        input_ptr, weights_ptr, ids_ptr, num_tokens);
+              }
+#else
+#if SGLANG_TOPK_USE_PRESORT_RENORM
+              topk_softmax_no_bias_renorm_warp_kernel_fixed_k_presort<
+                  T, 256, 8, 8>
+                  <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                      input_ptr, weights_ptr, ids_ptr, num_tokens);
+#elif SGLANG_TOPK_USE_ONEWARP_CTA_RENORM
+              topk_softmax_no_bias_renorm_onewarp_cta_kernel_fixed_k<
+                  T, 256, 8, 8>
+                  <<<num_tokens, kWarpSize, 0, stream>>>(
+                      input_ptr, weights_ptr, ids_ptr, num_tokens);
+#elif SGLANG_TOPK_USE_GLOBAL_SCRATCH_RENORM
+              topk_softmax_no_bias_renorm_warp_kernel_fixed_k_global_scratch<
+                  T, 256, 8, 8>
+                  <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                      input_ptr, weights_ptr, ids_ptr, num_tokens);
+#else
+              topk_softmax_no_bias_renorm_warp_kernel_fixed_k<T, 256, 8, 8>
+                  <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                      input_ptr, weights_ptr, ids_ptr, num_tokens);
+#endif
+#endif
+            } else {
+#if SGLANG_TOPK_USE_PRESORT_RENORM
+              topk_softmax_no_bias_renorm_warp_kernel_fixed_k_presort<
+                  T, 256, 8, 8>
+                  <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                      input_ptr, weights_ptr, ids_ptr, num_tokens);
+#elif SGLANG_TOPK_USE_ONEWARP_CTA_RENORM
+              topk_softmax_no_bias_renorm_onewarp_cta_kernel_fixed_k<
+                  T, 256, 8, 8>
+                  <<<num_tokens, kWarpSize, 0, stream>>>(
+                      input_ptr, weights_ptr, ids_ptr, num_tokens);
+#elif SGLANG_TOPK_USE_GLOBAL_SCRATCH_RENORM
+              topk_softmax_no_bias_renorm_warp_kernel_fixed_k_global_scratch<
+                  T, 256, 8, 8>
+                  <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                      input_ptr, weights_ptr, ids_ptr, num_tokens);
+#else
+              topk_softmax_no_bias_renorm_warp_kernel_fixed_k<T, 256, 8, 8>
+                  <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                      input_ptr, weights_ptr, ids_ptr, num_tokens);
+#endif
+            }
+          } else {
+            const int halfwarp_rows_per_cta = kWarpsPerCta * 2;
+            const int halfwarp_blocks =
+                (num_tokens + halfwarp_rows_per_cta - 1) / halfwarp_rows_per_cta;
+            topk_softmax_no_bias_renorm_halfwarp_kernel_fixed_k<T, 256, 8>
+                <<<halfwarp_blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                    input_ptr, weights_ptr, ids_ptr, num_tokens);
+          }
         } else {
           topk_softmax_no_bias_warp_kernel_fixed_k<T, 256, values_per_thread, 8>
               <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(

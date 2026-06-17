@@ -74,6 +74,7 @@ class MoeRunnerBackend(Enum):
     AUTO = "auto"
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
+    MIXED = "mixed"
     TRITON_KERNELS = "triton_kernel"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     FLASHINFER_TRTLLM_ROUTED = "flashinfer_trtllm_routed"
@@ -92,6 +93,9 @@ class MoeRunnerBackend(Enum):
 
     def is_triton(self):
         return self == MoeRunnerBackend.TRITON
+
+    def is_mixed(self):
+        return self == MoeRunnerBackend.MIXED
 
     def is_triton_kernels(self):
         return self == MoeRunnerBackend.TRITON_KERNELS
