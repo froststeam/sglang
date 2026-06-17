@@ -1,0 +1,37 @@
+nightly:1gpu-musa:
+  stage: nightly
+  extends:
+    - .musa-1gpu-test-job
+    - .rules-nightly
+  script:
+    - cd test
+    - python3 run_suite.py --hw "$MUSA_RUN_SUITE_HW" --suite nightly-1-gpu-musa --nightly --continue-on-error
+
+nightly:musa-kernel:
+  stage: nightly
+  extends:
+    - .musa-1gpu-test-job
+    - .rules-nightly
+  variables:
+    SGLANG_JIT_KERNEL_RUN_FULL_TESTS: "1"
+  script:
+    - cd test
+    - python3 run_suite.py --hw "$MUSA_RUN_SUITE_HW" --suite nightly-kernel-1-gpu-musa --nightly --continue-on-error
+
+nightly:2gpu-musa:
+  stage: nightly
+  extends:
+    - .musa-2gpu-test-job
+    - .rules-nightly
+  script:
+    - cd test
+    - python3 run_suite.py --hw "$MUSA_RUN_SUITE_HW" --suite nightly-2-gpu-musa --nightly --timeout-per-file 3600 --continue-on-error
+
+nightly:4gpu-musa:
+  stage: nightly
+  extends:
+    - .musa-4gpu-test-job
+    - .rules-nightly
+  script:
+    - cd test
+    - python3 run_suite.py --hw "$MUSA_RUN_SUITE_HW" --suite nightly-4-gpu-musa --nightly --timeout-per-file 3600 --continue-on-error

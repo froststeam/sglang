@@ -1,0 +1,25 @@
+include:
+  - local: .gitlab/ci/templates.yml
+  - local: .gitlab/ci/daily-image.yml
+  - local: .gitlab/ci/stage-a.yml
+  - local: .gitlab/ci/stage-b.yml
+  - local: .gitlab/ci/nightly.yml
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_DRAFT == "true"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TITLE =~ /^(\[Draft\]|\(Draft\)|Draft:)/'
+      when: never
+    - when: always
+
+stages:
+  - daily-image
+  - stage-a
+  - stage-b
+  - nightly
+
+variables:
+  SGLANG_IS_IN_CI: "true"
+  GIT_SUBMODULE_STRATEGY: recursive
+  MUSA_RUN_SUITE_HW: "musa"

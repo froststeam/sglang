@@ -1,0 +1,386 @@
+daily:image-build:
+  stage: daily-image
+  extends:
+    - .image-builder-job
+    - .rules-daily-image
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - ci_artifacts/daily-image-changelog.txt
+      - ci_artifacts/daily-image-changelog-summary.txt
+  script:
+    - |
+      set -euo pipefail
+
+      requested_ref="${SGLANG_REF:-${BRANCH:-}}"
+      if [ -z "${requested_ref}" ]; then
+        echo "Daily image build requires one schedule/web variable: BRANCH or SGLANG_REF." >&2
+        exit 2
+      fi
+      if [ -z "${SGLANG_SOURCE_REPO:-}" ]; then
+        echo "SGLANG_SOURCE_REPO is required." >&2
+        exit 2
+      fi
+      if [ -z "${IMAGE_BUILD_SCRIPT:-}" ]; then
+        echo "IMAGE_BUILD_SCRIPT is required." >&2
+        exit 2
+      fi
+      case "${requested_ref}" in
+        -*|*..*|*~*|*^*|*:*|*\\*|*' '*|*'?'*|*'['*|*'//'*|*/.|*.lock|"" )
+          echo "Invalid SGLANG ref: ${requested_ref}" >&2
+          exit 2
+          ;;
+      esac
+
+      if [ ! -x "${IMAGE_BUILD_SCRIPT}" ]; then
+        echo "Image build script is not executable: ${IMAGE_BUILD_SCRIPT}" >&2
+        exit 1
+      fi
+
+      optional_build_inputs="
+        TORCH_WHL
+        TORCH_MUSA_WHL
+        TORCHVISION_WHL
+        MTML_URL
+        TOOLKIT_URL
+        MUDNN_URL
+        TRITON_WHL
+        MCCL_URL
+        DDK_URL
+        MT_SHMEM
+        MTCC_URL
+        MUALG_URL
+        MUTHRUST_URL
+        MCCL_TEST_REPO
+        MCCL_TEST_URL
+        TORCH_MUSA_REPO
+        MATE_TVM_URL
+        MATE_URL
+        MATE_WRAPPERS_URL
+        TILELANG_WHL
+        DEEPEP_WHL
+        MUTLASS_REPO
+        MOONCAKE_REPO
+        MOONCAKE_REF
+        MOONCAKE_URL
+        DIFFUSION_REPO
+        DIFFUSION_REF
+        ENABLE_DIFFUSION
+        ENABLE_MATE_OVERRIDE
+        SGLANG_ROUTER_WHL_URL
+        VLLM_MUSA_REPO
+        VLLM_MUSA_REF
+        VLLM_MUSA_MTGPU_TARGET
+        VLLM_MUSA_TORCH_MUSA_ARCH
+        VLLM_MUSA_TORCH_MUSA_ARCH_LIST
+        VLLM_MUSA_DISABLE_SLP
+        VLLM_MUSA_DISABLE_LOAD_CLUSTER
+        ENABLE_MOONCAKE
+      "
+      musa_base_build_inputs="
+        TORCH_WHL
+        TORCH_MUSA_WHL
+        TORCHVISION_WHL
+        MTML_URL
+        TOOLKIT_URL
+        MUDNN_URL
+        TRITON_WHL
+        MCCL_URL
+        DDK_URL
+        MT_SHMEM
+        MTCC_URL
+        MUALG_URL
+        MUTHRUST_URL
+        MCCL_TEST_REPO
+        MCCL_TEST_URL
+        TORCH_MUSA_REPO
+        MATE_TVM_URL
+        MATE_URL
+        MATE_WRAPPERS_URL
+        TILELANG_WHL
+        DEEPEP_WHL
+      "
+      provided_build_inputs=""
+      provided_musa_base_build_inputs=""
+      for input_name in ${optional_build_inputs}; do
+        input_value="${!input_name:-}"
+        if [ -n "${input_value}" ]; then
+          case "${input_value}" in
+            *[$'\t\r\n']* )
+              echo "Invalid ${input_name}: value must be a single line." >&2
+              exit 2
+              ;;
+          esac
+          export "${input_name}"
+          provided_build_inputs="${provided_build_inputs} ${input_name}"
+        else
+          unset "${input_name}" || true
+        fi
+      done
+      for input_name in ${musa_base_build_inputs}; do
+        input_value="${!input_name:-}"
+        if [ -n "${input_value}" ]; then
+          provided_musa_base_build_inputs="${provided_musa_base_build_inputs} ${input_name}"
+        fi
+      done
+
+      export SGLANG_REF="${requested_ref}"
+      export SGLANG_SOURCE_REPO="${SGLANG_SOURCE_REPO}"
+
+      echo "Daily image build input validation passed."
+      echo "  source repo: ${SGLANG_SOURCE_REPO}"
+      echo "  requested ref: ${SGLANG_REF}"
+      echo "  build script: ${IMAGE_BUILD_SCRIPT}"
+      if [ -n "${provided_build_inputs}" ]; then
+        echo "  optional build input overrides:${provided_build_inputs}"
+      else
+        echo "  optional build input overrides: <none; build script defaults will be used>"
+      fi
+
+      state_key="$(printf '%s' "${SGLANG_REF}" | tr '/:' '__')"
+      state_dir="${IMAGE_BUILD_STATE_DIR:-/workspace/sglang_test/ci-state}"
+      state_file="${state_dir}/sglang-daily-image.${state_key}.last_sha"
+      fingerprint_file="${state_dir}/sglang-daily-image.${state_key}.last_fingerprint"
+      musa_base_fingerprint_file="${state_dir}/sglang-daily-image.${state_key}.last_musa_base_fingerprint"
+      musa_base_inputs_file="${state_dir}/sglang-daily-image.${state_key}.last_musa_base_inputs"
+      sglang_musa_base_inputs_file="${state_dir}/sglang-daily-image.${state_key}.last_sglang_musa_base_inputs"
+      mkdir -p "${state_dir}"
+
+      current_sha="$(
+        GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o StrictHostKeyChecking=accept-new}" \
+          git ls-remote "${SGLANG_SOURCE_REPO}" \
+            "refs/heads/${SGLANG_REF}" \
+            "refs/tags/${SGLANG_REF}^{}" \
+            "refs/tags/${SGLANG_REF}" |
+          awk '
+            $2 == "refs/heads/'"${SGLANG_REF}"'" { print $1; found = 1; exit }
+            $2 == "refs/tags/'"${SGLANG_REF}"'^{}" { peeled = $1 }
+            $2 == "refs/tags/'"${SGLANG_REF}"'" { tag = $1 }
+            END {
+              if (found) {
+                exit
+              }
+              if (peeled != "") {
+                print peeled
+              } else if (tag != "") {
+                print tag
+              }
+            }
+          '
+      )"
+      if [ -z "${current_sha}" ]; then
+        echo "Unable to resolve SGLANG_REF=${SGLANG_REF} from ${SGLANG_SOURCE_REPO}" >&2
+        exit 1
+      fi
+
+      previous_sha=""
+      if [ -f "${state_file}" ]; then
+        previous_sha="$(tr -d '[:space:]' < "${state_file}")"
+      fi
+      previous_fingerprint=""
+      if [ -f "${fingerprint_file}" ]; then
+        previous_fingerprint="$(tr -d '[:space:]' < "${fingerprint_file}")"
+      fi
+      previous_musa_base_fingerprint=""
+      if [ -f "${musa_base_fingerprint_file}" ]; then
+        previous_musa_base_fingerprint="$(tr -d '[:space:]' < "${musa_base_fingerprint_file}")"
+      fi
+
+      current_musa_base_inputs="$(
+        {
+          for input_name in ${musa_base_build_inputs}; do
+            input_value="${!input_name:-}"
+            if [ -n "${input_value}" ]; then
+              printf '%s=%s\n' "${input_name}" "${input_value}"
+            fi
+          done
+        } | sort
+      )"
+      musa_base_fingerprint="$(
+        {
+          echo "fingerprint_version=1"
+          printf '%s\n' "${current_musa_base_inputs}"
+        } | sha256sum | awk '{print $1}'
+      )"
+      build_fingerprint="$(
+        {
+          echo "fingerprint_version=1"
+          echo "sglang_sha=${current_sha}"
+          echo "musa_base_fingerprint=${musa_base_fingerprint}"
+        } | sha256sum | awk '{print $1}'
+      )"
+      musa_base_inputs_changed=0
+      sglang_musa_base_inputs_changed=0
+      for input_name in ${musa_base_build_inputs}; do
+        input_value="${!input_name:-}"
+        if [ -n "${input_value}" ]; then
+          previous_input_value=""
+          if [ -f "${musa_base_inputs_file}" ]; then
+            previous_input_value="$(
+              awk -v key="${input_name}" '
+                index($0, key "=") == 1 {
+                  sub("^[^=]*=", "")
+                  print
+                  found = 1
+                  exit
+                }
+                END {
+                  if (!found) {
+                    exit 0
+                  }
+                }
+              ' "${musa_base_inputs_file}"
+            )"
+          fi
+          if [ "${previous_input_value}" != "${input_value}" ]; then
+            musa_base_inputs_changed=1
+          fi
+          previous_sglang_input_value=""
+          if [ -f "${sglang_musa_base_inputs_file}" ]; then
+            previous_sglang_input_value="$(
+              awk -v key="${input_name}" '
+                index($0, key "=") == 1 {
+                  sub("^[^=]*=", "")
+                  print
+                  found = 1
+                  exit
+                }
+                END {
+                  if (!found) {
+                    exit 0
+                  }
+                }
+              ' "${sglang_musa_base_inputs_file}"
+            )"
+          fi
+          if [ "${previous_sglang_input_value}" != "${input_value}" ]; then
+            sglang_musa_base_inputs_changed=1
+          fi
+        fi
+      done
+      source_inputs_changed=0
+      if [ "${previous_sha}" != "${current_sha}" ]; then
+        source_inputs_changed=1
+      fi
+      if [ -z "${previous_fingerprint}" ] && [ -n "${previous_sha}" ] && [ -z "${provided_musa_base_build_inputs}" ]; then
+        previous_fingerprint="$(
+          {
+            echo "fingerprint_version=1"
+            echo "sglang_sha=${previous_sha}"
+            echo "musa_base_fingerprint=${musa_base_fingerprint}"
+          } | sha256sum | awk '{print $1}'
+        )"
+      fi
+
+      echo "Daily image build ref: ${SGLANG_REF}"
+      echo "Daily image build current sha: ${current_sha}"
+      echo "Daily image build previous successful sha: ${previous_sha:-<none>}"
+      echo "Daily image build state file: ${state_file}"
+      echo "Daily image build current fingerprint: ${build_fingerprint}"
+      echo "Daily image build previous fingerprint: ${previous_fingerprint:-<none>}"
+      echo "Daily image build source inputs changed: ${source_inputs_changed}"
+      echo "Daily image build musa-base inputs changed: ${musa_base_inputs_changed}"
+      echo "Daily image build sglang musa-base inputs changed: ${sglang_musa_base_inputs_changed}"
+
+      mkdir -p ci_artifacts
+      changelog_file="ci_artifacts/daily-image-changelog.txt"
+      changelog_summary_file="ci_artifacts/daily-image-changelog-summary.txt"
+      {
+        echo "SGLang daily image changelog"
+        echo "Ref: ${SGLANG_REF}"
+        echo "Repo: ${SGLANG_SOURCE_REPO}"
+        echo "Previous successful SHA: ${previous_sha:-<none>}"
+        echo "Current SHA: ${current_sha}"
+        echo "Pipeline: ${CI_PIPELINE_URL:-<unknown>}"
+        echo
+
+        if [ -n "${previous_sha}" ] && [ "${previous_sha}" != "${current_sha}" ]; then
+          echo "Commits:"
+          GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o StrictHostKeyChecking=accept-new}" \
+            git fetch --no-tags "${SGLANG_SOURCE_REPO}" \
+              "${previous_sha}:refs/ci-daily-image-changelog/previous" \
+              "${current_sha}:refs/ci-daily-image-changelog/current"
+          git log --oneline "${previous_sha}..${current_sha}"
+          echo
+          echo "Changed files:"
+          git diff --stat "${previous_sha}..${current_sha}"
+        elif [ "${previous_sha}" = "${current_sha}" ]; then
+          echo "No source update since last successful image build."
+        else
+          echo "No previous successful build recorded."
+        fi
+        echo
+        echo "Build inputs:"
+        echo "Previous build fingerprint: ${previous_fingerprint:-<none>}"
+        echo "Current build fingerprint: ${build_fingerprint}"
+        echo "Previous musa-base fingerprint: ${previous_musa_base_fingerprint:-<none>}"
+        echo "Current musa-base fingerprint: ${musa_base_fingerprint}"
+        echo "Musa-base inputs changed: ${musa_base_inputs_changed}"
+        echo "SGLang musa-base inputs changed: ${sglang_musa_base_inputs_changed}"
+        echo "Optional overrides:${provided_build_inputs:- <none>}"
+      } | tee "${changelog_file}"
+
+      if [ -n "${previous_sha}" ] && [ "${previous_sha}" != "${current_sha}" ]; then
+        {
+          git log --oneline "${previous_sha}..${current_sha}" | head -20
+          total_commits="$(git rev-list --count "${previous_sha}..${current_sha}")"
+          if [ "${total_commits}" -gt 20 ]; then
+            echo "... and $((total_commits - 20)) more commits"
+          fi
+        } | tee "${changelog_summary_file}"
+      elif [ "${previous_sha}" = "${current_sha}" ]; then
+        echo "No source update since last successful image build." | tee "${changelog_summary_file}"
+      else
+        echo "No previous successful build recorded." | tee "${changelog_summary_file}"
+      fi
+
+      export DINGTALK_CHANGELOG="$(cat "${changelog_summary_file}")"
+      export DINGTALK_CHANGELOG_FILE="${CI_PROJECT_DIR:-$(pwd)}/${changelog_file}"
+      export DINGTALK_CHANGELOG_SUMMARY_FILE="${CI_PROJECT_DIR:-$(pwd)}/${changelog_summary_file}"
+      export DINGTALK_PIPELINE_URL="${CI_PIPELINE_URL:-}"
+
+      if [ "${source_inputs_changed}" = "0" ] && [ "${sglang_musa_base_inputs_changed}" = "0" ]; then
+        echo "No source or musa-base input update since last successful image build. Skip."
+        printf '%s\n' "${current_sha}" > "${state_file}"
+        printf '%s\n' "${build_fingerprint}" > "${fingerprint_file}"
+        printf '%s\n' "${musa_base_fingerprint}" > "${musa_base_fingerprint_file}"
+        printf '%s\n' "${current_musa_base_inputs}" > "${musa_base_inputs_file}"
+        printf '%s\n' "${current_musa_base_inputs}" > "${sglang_musa_base_inputs_file}"
+        exit 0
+      fi
+
+      build_date="$(TZ=Asia/Shanghai date +%Y%m%d)"
+      short_sha="${current_sha:0:8}"
+      if [ "${CI_PIPELINE_SOURCE}" = "schedule" ]; then
+        export BUILD_TS="${build_date}"
+      else
+        export BUILD_TS="${build_date}-${short_sha}"
+      fi
+      echo "Daily image build timestamp: ${BUILD_TS}"
+
+      export BUILD_BASE=0
+      export BUILD_MUSA_BASE="${musa_base_inputs_changed}"
+      export BUILD_SGLANG=1
+      export BUILD_VLLM_MUSA=0
+
+      echo "Daily image build script: ${IMAGE_BUILD_SCRIPT}"
+
+      if [ "${musa_base_inputs_changed}" = "1" ]; then
+        musa_base_args=(--push --skip-base --skip-sglang --skip-vllm-musa)
+        echo "Daily image build stages: base=skip musa-base=1 sglang=skip vllm-musa=skip"
+        echo "Daily image build args: ${musa_base_args[*]}"
+        BUILD_MUSA_BASE=1 BUILD_SGLANG=0 "${IMAGE_BUILD_SCRIPT}" "${musa_base_args[@]}"
+        printf '%s\n' "${musa_base_fingerprint}" > "${musa_base_fingerprint_file}"
+        printf '%s\n' "${current_musa_base_inputs}" > "${musa_base_inputs_file}"
+      fi
+
+      sglang_args=(--push --skip-base --skip-musa-base --skip-vllm-musa)
+      echo "Daily image build stages: base=skip musa-base=skip sglang=1 vllm-musa=skip"
+      echo "Daily image build args: ${sglang_args[*]}"
+      BUILD_MUSA_BASE=0 BUILD_SGLANG=1 "${IMAGE_BUILD_SCRIPT}" "${sglang_args[@]}"
+      printf '%s\n' "${current_sha}" > "${state_file}"
+      printf '%s\n' "${build_fingerprint}" > "${fingerprint_file}"
+      printf '%s\n' "${musa_base_fingerprint}" > "${musa_base_fingerprint_file}"
+      printf '%s\n' "${current_musa_base_inputs}" > "${musa_base_inputs_file}"
+      printf '%s\n' "${current_musa_base_inputs}" > "${sglang_musa_base_inputs_file}"

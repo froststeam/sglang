@@ -190,6 +190,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
     "deep_gemm",
     "triton",
+    "mixed",
     "triton_kernel",
     "flashinfer_trtllm",
     "flashinfer_trtllm_routed",
@@ -3100,6 +3101,28 @@ class ServerArgs:
             ), "Please enable dp attention when setting enable_dp_lm_head. "
 
     def _handle_moe_kernel_config(self):
+        if (
+            is_musa()
+            and self.moe_runner_backend == "auto"
+            and self.moe_a2a_backend == "none"
+            and self.quantization in ["fp8", None]
+        ):
+            self.moe_runner_backend = "mixed"
+            logger.warning(
+                "Detected MUSA standard MoE, using mixed MoE runner backend by default."
+            )
+
+        if self.moe_runner_backend == "mixed":
+            assert is_musa(), "mixed MoE runner backend is only supported on MUSA"
+            assert self.moe_a2a_backend == "none", (
+                "mixed MoE runner backend is only supported with "
+                "--moe-a2a-backend=none"
+            )
+            assert self.quantization in [
+                "fp8",
+                None,
+            ], "mixed MoE runner backend is only supported with fp8 or bfloat16"
+
         if self.quantization == "mxfp8":
             if self.moe_runner_backend == "auto":
                 self.moe_runner_backend = "flashinfer_trtllm"

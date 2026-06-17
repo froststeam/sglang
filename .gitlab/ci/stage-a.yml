@@ -1,0 +1,34 @@
+stage-a:cpu:
+  stage: stage-a
+  extends:
+    - .cpu-job
+    - .rules-stage-a
+  script:
+    - python3 -m pip install --user --upgrade pip virtualenv
+    - python3 -m virtualenv .venv
+    - export VIRTUAL_ENV="$PWD/.venv"
+    - export PATH="$VIRTUAL_ENV/bin:$PATH"
+    - python -m pip install --upgrade pip uv
+    - python -m uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
+    - cd test
+    - python run_suite.py --hw cpu --suite stage-a-test-cpu
+
+stage-a:1gpu-musa-smoke:
+  stage: stage-a
+  extends:
+    - .musa-1gpu-job
+    - .rules-stage-a
+  script:
+    - hostname
+    - whoami
+    - echo "MTHREADS_VISIBLE_DEVICES=$MTHREADS_VISIBLE_DEVICES"
+    - mthreads-gmi || true
+
+stage-a:1gpu-musa:
+  stage: stage-a
+  extends:
+    - .musa-1gpu-test-job
+    - .rules-stage-a
+  script:
+    - cd test
+    - python3 run_suite.py --hw "$MUSA_RUN_SUITE_HW" --suite stage-a-test-1-gpu-musa

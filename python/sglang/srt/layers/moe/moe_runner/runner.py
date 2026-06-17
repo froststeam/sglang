@@ -136,6 +136,13 @@ class MoeRunner:
         )
 
         running_state = {}
+        if getattr(self, "use_contiguous_gemm", False):
+            # XXX (MUSA): Propagate the contiguous DeepGEMM fast-path request to
+            # the standard pre-permute step.
+            running_state["use_contiguous_gemm"] = True
+            contiguous_gemm_block_m = getattr(self, "contiguous_gemm_block_m", None)
+            if contiguous_gemm_block_m is not None:
+                running_state["contiguous_gemm_block_m"] = contiguous_gemm_block_m
         if self.down_gemm_overlap_args is not None:
             running_state["down_gemm_overlap_args"] = self.down_gemm_overlap_args
         if self.meta_overlap_args is not None:

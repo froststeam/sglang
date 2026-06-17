@@ -21,8 +21,17 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-PIP_INSTALL="python3 -m pip install --no-cache-dir"
-${PIP_INSTALL} --upgrade pip setuptools torchada --user
+PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+PIP_TIMEOUT="${PIP_TIMEOUT:-30}"
+PIP_RETRIES="${PIP_RETRIES:-2}"
+PIP_INSTALL=(
+  python3 -m pip install
+  --no-cache-dir
+  --index-url "${PIP_INDEX_URL}"
+  --timeout "${PIP_TIMEOUT}"
+  --retries "${PIP_RETRIES}"
+)
+"${PIP_INSTALL[@]}" --upgrade pip setuptools torchada --user
 
 WHL_DIR="/sglang-checkout/whl"
 if [ -d "$WHL_DIR" ] && compgen -G "${WHL_DIR}"/*.whl > /dev/null; then
@@ -39,7 +48,7 @@ if [ -d "$WHL_DIR" ] && compgen -G "${WHL_DIR}"/*.whl > /dev/null; then
       pip uninstall -y "$pkg" || true
     done
     echo "Installing wheel files without dependency resolution..."
-    ${PIP_INSTALL} "${WHL_DIR}"/*.whl --user
+    "${PIP_INSTALL[@]}" "${WHL_DIR}"/*.whl --user
 fi
 
 if [ -n "$SKIP_SGLANG_BUILD" ]; then
@@ -54,7 +63,7 @@ else
     find "$REPO_ROOT" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
 
     rm -f "${REPO_ROOT}/python/pyproject.toml" && mv "${REPO_ROOT}/python/pyproject_other.toml" "${REPO_ROOT}/python/pyproject.toml"
-    cd "${REPO_ROOT}" && ${PIP_INSTALL} -v -e "python[dev_musa]" --user
+    cd "${REPO_ROOT}" && "${PIP_INSTALL[@]}" -v -e "python[dev_musa]" --user
 
     cd "${REPO_ROOT}/sgl-kernel"
     rm -f pyproject.toml && mv pyproject_musa.toml pyproject.toml && MTGPU_TARGET=mp_31 python3 setup_musa.py install --user

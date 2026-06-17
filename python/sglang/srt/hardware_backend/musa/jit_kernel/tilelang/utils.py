@@ -1,11 +1,18 @@
 """Shared helpers for MUSA TileLang kernels."""
 
+import os
+
 import tilelang
 import torch
 
 tilelang.set_log_level("WARNING")
 
-if hasattr(torch, "musa") and torch.musa.is_available():
+_DISABLE_TILELANG_CACHE = os.getenv("SGLANG_MUSA_TILELANG_DISABLE_CACHE", "0").lower()
+if (
+    hasattr(torch, "musa")
+    and torch.musa.is_available()
+    and _DISABLE_TILELANG_CACHE in ("1", "true", "yes", "on")
+):
     tilelang.disable_cache()
 
 MUSA_COMMON_PASS_CONFIGS = {

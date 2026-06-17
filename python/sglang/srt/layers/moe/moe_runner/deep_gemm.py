@@ -50,10 +50,19 @@ _is_musa = is_musa()
 
 # Imported only for the SGLANG_OPT_FIX_MEGA_MOE_MEMORY=False fallback path.
 if not (_is_npu or _is_hip) and _is_cuda:
-    from sglang.jit_kernel.activation import silu_and_mul as _legacy_silu_and_mul
+    from sglang.jit_kernel.activation import (
+        gelu_and_mul as _legacy_gelu_and_mul,
+        silu_and_mul as _legacy_silu_and_mul,
+    )
 elif _is_musa:
+    from sglang.srt.hardware_backend.musa.jit_kernel.csrc import (
+        act_and_mul,
+        act_and_mul_masked_post_quant_fwd,
+    )
+
     _silu_and_mul_musa = torch.nn.SwishGLU()
 else:
+    _legacy_gelu_and_mul = None
     _legacy_silu_and_mul = None
 
 
@@ -124,7 +133,10 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
 class DeepGemmRunnerCore(MoeRunnerCore):
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
-        assert self.config.activation == "silu"
+        if _is_musa:
+            assert self.config.activation in ("silu", "gelu", "gelu_tanh")
+        else:
+            assert self.config.activation in ("silu", "gelu")
         assert self.config.is_gated
         self.swiglu_limit = self.config.swiglu_limit
         self.use_swizzle = False
@@ -180,6 +192,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_dtype = running_state["hidden_states_dtype"]
         hidden_states_shape = running_state["hidden_states_shape"]
         m_indices = runner_input.m_indices
+        alignment_m = running_state.get(
+            "contiguous_gemm_block_m", deep_gemm_wrapper.DEEPGEMM_BLOCK_M
+        )
 
         N = quant_info.w13_weight.size(1)
         K = hidden_states_shape[1]
@@ -210,6 +225,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             m_indices,
             recipe_a=recipe_a,
             recipe_b=recipe_b,
+            alignment_m=alignment_m,
         )
 
         dispose_tensor(hidden_states)
@@ -263,7 +279,18 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 )
                 _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
             else:
-                down_input = _silu_and_mul_musa(gateup_output.view(-1, N))
+                gateup_output = gateup_output.view(-1, N)
+                down_input = torch.empty(
+                    (all_tokens, N // 2),
+                    device=gateup_output.device,
+                    dtype=torch.bfloat16,
+                )
+                act_and_mul(
+                    gateup_output,
+                    down_input,
+                    topk_ids=m_indices,
+                    activation=self.config.activation,
+                )
             del gateup_output
 
             down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
@@ -290,6 +317,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             m_indices,
             recipe_a=recipe_a,
             recipe_b=recipe_b,
+            alignment_m=alignment_m,
         )
 
         return down_output
@@ -306,6 +334,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_device = running_state["hidden_states_device"]
         hidden_states_shape = running_state["hidden_states_shape"]
         m_indices = runner_input.m_indices
+        alignment_m = running_state.get(
+            "contiguous_gemm_block_m", deep_gemm_wrapper.DEEPGEMM_BLOCK_M
+        )
 
         N = quant_info.w13_weight.size(1)
         K = hidden_states_shape[1]
@@ -325,6 +356,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             w13_weight,
             gateup_output,
             m_indices,
+            alignment_m=alignment_m,
         )
 
         dispose_tensor(hidden_states)
@@ -339,9 +371,25 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 device=gateup_output.device,
                 dtype=torch.bfloat16,
             )
-            _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
+            if self.config.activation == "silu":
+                _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
+            elif self.config.activation == "gelu":
+                _legacy_gelu_and_mul(gateup_output.view(-1, N), down_input)
+            else:
+                raise ValueError(f"Unsupported activation: {self.config.activation}")
         else:
-            down_input = _silu_and_mul_musa(gateup_output.view(-1, N))
+            gateup_output = gateup_output.view(-1, N)
+            down_input = torch.empty(
+                (all_tokens, N // 2),
+                device=gateup_output.device,
+                dtype=torch.bfloat16,
+            )
+            act_and_mul(
+                gateup_output,
+                down_input,
+                topk_ids=m_indices,
+                activation=self.config.activation,
+            )
         del gateup_output
 
         # GroupGemm-2: (M, N/2) (E, K, N/2) -> (M, K)
@@ -355,6 +403,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             w2_weight,
             down_output,
             m_indices,
+            alignment_m=alignment_m,
         )
 
         return down_output
@@ -447,6 +496,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             topk=self.config.top_k,
             swiglu_limit=swiglu_limit_arg,
             swizzle=self.use_swizzle,
+            activation=self.config.activation,
         )
         del gateup_output
 
@@ -584,6 +634,139 @@ def pre_permute_standard_to_deep_gemm(
 
     topk_weights, topk_ids = topk_weights, topk_ids
 
+    if running_state.get("use_contiguous_gemm", False):
+        # XXX (MUSA): Use the contiguous DeepGEMM path for standard MoE on
+        # MUSA. The fused preprocess removes the host-syncing nonzero/sort path
+        # and folds gather + g128 FP8 quantization into an independent MUSA op.
+        src2dst_numel = topk_ids.numel()
+        all_tokens = src2dst_numel
+        block_shape = quant_info.block_shape or [128, 128]
+        use_fp8_quant = quant_info.use_fp8
+        can_use_musa_fused_preprocess = (
+            _is_musa
+            and hidden_states.dtype == torch.bfloat16
+            and topk_ids.dtype == torch.int32
+            and (
+                not use_fp8_quant
+                or (
+                    block_shape[1] == 128 and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                )
+            )
+        )
+        use_musa_padded_contig = (
+            can_use_musa_fused_preprocess and hidden_states.dtype == torch.bfloat16
+        )
+        if use_musa_padded_contig:
+            alignment_m = running_state.get(
+                "contiguous_gemm_block_m", deep_gemm_wrapper.DEEPGEMM_BLOCK_M
+            )
+            all_tokens = (
+                ceil_div(
+                    src2dst_numel + runner_config.num_local_experts * (alignment_m - 1),
+                    alignment_m,
+                )
+                * alignment_m
+            )
+        # EP maps non-local experts to invalid slots. The preprocess compacts
+        # valid slots and leaves the tail unused; keep dummy tail indices valid
+        # so contiguous DeepGEMM never reads an uninitialized expert id.
+        m_indices = torch.empty(all_tokens, device=topk_ids.device, dtype=torch.int32)
+        src2dst = torch.empty(src2dst_numel, device=topk_ids.device, dtype=torch.int32)
+        topk_ids_for_combine = torch.empty_like(topk_ids)
+
+        if can_use_musa_fused_preprocess:
+            from sglang.srt.hardware_backend.musa.jit_kernel.csrc.moe import (
+                deep_gemm_contig_preprocess,
+            )
+
+            hidden_states_output = torch.empty(
+                (all_tokens, hidden_states_shape[1]),
+                device=hidden_states_device,
+                dtype=torch.float8_e4m3fn if use_fp8_quant else torch.bfloat16,
+            )
+            if use_fp8_quant:
+                hidden_states_scale = torch.empty(
+                    (all_tokens, hidden_states_shape[1] // 128),
+                    device=hidden_states_device,
+                    dtype=torch.float32,
+                )
+            else:
+                hidden_states_scale = None
+            output_scale = (
+                hidden_states_scale
+                if hidden_states_scale is not None
+                else torch.empty(
+                    (1, 1), device=hidden_states_device, dtype=torch.float32
+                )
+            )
+            deep_gemm_contig_preprocess(
+                hidden_states,
+                topk_ids,
+                hidden_states_output,
+                output_scale,
+                m_indices,
+                src2dst,
+                topk_ids_for_combine,
+                runner_config.num_local_experts,
+                use_fp8_quant,
+                alignment_m if use_musa_padded_contig else 1,
+            )
+            hidden_states = hidden_states_output
+        else:
+            import triton
+
+            from sglang.srt.layers.moe.ep_moe.kernels import (
+                compute_src2dst_triton_kernel,
+            )
+
+            m_indices, reorder_ids = torch.sort(topk_ids.reshape(-1), stable=True)
+            m_indices = m_indices.to(torch.int32)
+            grid = (triton.cdiv(src2dst_numel, 512),)
+            compute_src2dst_triton_kernel[grid](
+                reorder_ids,
+                src2dst,
+                src2dst_numel,
+                BLOCK_SIZE=512,
+            )
+            sorted_token_ids = torch.div(
+                reorder_ids, runner_config.top_k, rounding_mode="floor"
+            )
+            hidden_states = hidden_states.index_select(0, sorted_token_ids)
+            topk_ids_for_combine = topk_ids
+            hidden_states_scale = None
+
+        if use_fp8_quant and hidden_states.dtype != torch.float8_e4m3fn:
+            from sglang.srt.layers.quantization.fp8_kernel import (
+                sglang_per_token_group_quant_fp8,
+            )
+
+            hidden_states, hidden_states_scale = sglang_per_token_group_quant_fp8(
+                hidden_states,
+                block_shape[1],
+                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            )
+        elif not use_fp8_quant:
+            hidden_states_scale = None
+
+        dispose_tensor(hidden_states_ref)
+
+        running_state["topk_ids"] = topk_ids_for_combine
+        running_state["topk_weights"] = topk_weights
+        running_state["hidden_states_shape"] = hidden_states_shape
+        running_state["hidden_states_dtype"] = hidden_states_dtype
+        running_state["hidden_states_device"] = hidden_states_device
+        running_state["src2dst"] = src2dst
+        running_state["all_tokens"] = all_tokens
+
+        return DeepGemmRunnerInput(
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+            use_masked_gemm=False,
+            m_indices=m_indices,
+        )
+
     # PreReorder
     masked_m, expected_m, src2dst, hidden_states, hidden_states_scale = (
         moe_ep_deepgemm_preprocess(
@@ -633,6 +816,9 @@ def post_permute_deep_gemm_to_standard(
     output = torch.empty(
         hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
     )
+    # XXX (MUSA): Larger hidden blocks improve the post-combine bandwidth on
+    # MUSA for Qwen3.6 GDN/MoE shapes; keep the existing 512 block elsewhere.
+    block_size = 1024 if _is_musa else 512
     post_reorder_triton_kernel[(hidden_states_shape[0],)](
         runner_output.hidden_states,
         output,
@@ -641,7 +827,7 @@ def post_permute_deep_gemm_to_standard(
         topk_weights,
         runner_config.top_k,
         hidden_states_shape[1],
-        BLOCK_SIZE=512,
+        BLOCK_SIZE=block_size,
     )
 
     dispose_tensor(runner_output.hidden_states)
@@ -712,7 +898,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
         topk_weights,
         num_recv_tokens_per_expert,
     ) = dispatch_output
-    assert runner_config.activation == "silu"
+    assert runner_config.activation in ("silu", "gelu")
 
     all_tokens = sum(num_recv_tokens_per_expert)
     running_state["all_tokens"] = all_tokens
@@ -825,6 +1011,7 @@ def _varlen_deep_gemm_silu_mul_quant(
     topk: int,
     swiglu_limit: Optional[float] = None,
     swizzle: bool = False,
+    activation: str = "silu",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd
     from sglang.srt.layers.quantization.fp8_kernel import (
@@ -863,7 +1050,24 @@ def _varlen_deep_gemm_silu_mul_quant(
         dtype=torch.float8_e4m3fn,
     )
 
-    if envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get():
+    if _is_musa:
+        assert swiglu_limit is None
+        assert not swizzle
+        down_input_scale = torch.empty(
+            (E, N, G),
+            device=hidden_states_device,
+            dtype=torch.float32,
+        )
+        act_and_mul_masked_post_quant_fwd(
+            gateup_output,
+            down_input,
+            down_input_scale,
+            group_size,
+            masked_m,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            activation=activation,
+        )
+    elif envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get():
         assert N % 4 == 0 and G % 4 == 0
         packed_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         down_input_scale = torch.empty(

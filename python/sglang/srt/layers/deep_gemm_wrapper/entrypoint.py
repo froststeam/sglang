@@ -8,6 +8,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper import compile_utils
 from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     DEEPGEMM_BLACKWELL,
+    DEEPGEMM_BLOCK_M,
     DEEPGEMM_NEED_TMA_ALIGNED_SCALES,
     DEEPGEMM_SCALE_LAYOUT_COLUMN_MAJOR,
     DEEPGEMM_SCALE_TMA_ALIGNED,
@@ -15,8 +16,10 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     ENABLE_JIT_DEEPGEMM,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import is_musa
 
 logger = logging.getLogger(__name__)
+_is_musa = is_musa()
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
@@ -118,6 +121,7 @@ def grouped_gemm_nt_f8f8bf16_contig(
     m_indices: torch.Tensor,
     recipe_a: Optional[Tuple[int, int]] = None,
     recipe_b: Optional[Tuple[int, int]] = None,
+    alignment_m: Optional[int] = None,
 ):
     m, k = lhs[0].shape
     num_groups, n, _ = rhs[0].shape
@@ -136,20 +140,30 @@ def grouped_gemm_nt_f8f8bf16_contig(
         fp4_kwargs["recipe_b"] = recipe_b
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        if alignment_m is None:
+            alignment_m = DEEPGEMM_BLOCK_M
+        kwargs = {"alignment_m": alignment_m} if _is_musa else {}
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-            lhs, rhs, out, m_indices, **fp4_kwargs
+            lhs, rhs, out, m_indices, **fp4_kwargs, **kwargs
         )
 
 
 def grouped_gemm_nt_bf16_contig(
-    a: torch.Tensor, b: torch.Tensor, d: torch.Tensor, m_indices: torch.Tensor
+    a: torch.Tensor,
+    b: torch.Tensor,
+    d: torch.Tensor,
+    m_indices: torch.Tensor,
+    alignment_m: Optional[int] = None,
 ):
     m, k = a.shape
     num_groups, n, _ = b.shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
-        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, m_indices)
+        if alignment_m is None:
+            alignment_m = DEEPGEMM_BLOCK_M
+        kwargs = {"alignment_m": alignment_m} if _is_musa else {}
+        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, m_indices, **kwargs)
 
 
 def gemm_nt_f8f8bf16(

@@ -31,6 +31,12 @@ def _compute_enable_deep_gemm():
 
 ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 
+if _is_musa and not envs.SGLANG_DEEP_GEMM_BLOCK_M.is_set():
+    # XXX (MUSA): Use a larger default block M for MUSA DeepGEMM MoE shapes,
+    # while preserving explicit user overrides and the default on other backends.
+    DEEPGEMM_BLOCK_M = 256
+else:
+    DEEPGEMM_BLOCK_M = envs.SGLANG_DEEP_GEMM_BLOCK_M.get()
 DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and is_blackwell_supported()
 DEEPGEMM_SCALE_UE8M0 = DEEPGEMM_BLACKWELL
 DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)

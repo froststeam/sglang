@@ -92,7 +92,7 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.utils import flatten_nested_list
+from sglang.srt.utils import flatten_nested_list, is_musa
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
 if TYPE_CHECKING:
@@ -112,6 +112,7 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
+_is_musa = is_musa()
 
 
 @lru_cache(maxsize=1)
@@ -1421,6 +1422,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For hybrid GDN prefix cache
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
+    # XXX (MUSA): CPU-side summary and compact indices avoid tensor.any() and
+    # nonzero() syncs in the GDN/Mamba prefix-cache tracking path.
+    mamba_track_mask_cpu: Optional[List[bool]] = None
+    mamba_track_mask_indices: torch.Tensor = None  # shape: [num_tracked], int64
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
 
     # For multimodal inputs
@@ -1967,6 +1972,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         if get_global_server_args().enable_mamba_extra_buffer():
+            if _is_musa:
+                # XXX (MUSA): Precompute tracked request indices on the CPU
+                # side to keep the model forward path free of nonzero().
+                self.mamba_track_mask_cpu = mamba_track_mask_cpu
+                self.mamba_track_mask_indices = torch.tensor(
+                    [
+                        i
+                        for i, need_track in enumerate(mamba_track_mask_cpu)
+                        if need_track
+                    ],
+                    dtype=torch.int64,
+                    device=self.device,
+                )
             self.mamba_track_indices = torch.tensor(
                 mamba_track_indices_cpu,
                 dtype=torch.int64,
@@ -2391,10 +2409,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
 
             # async H2D
-            self.mamba_track_mask = (
-                (self.seq_lens_cpu % get_global_server_args().mamba_track_interval == 0)
-                .pin_memory()
-                .to(device=self.device, non_blocking=True)
+            mamba_track_mask_cpu = (
+                self.seq_lens_cpu % get_global_server_args().mamba_track_interval == 0
+            )
+            if _is_musa:
+                # XXX (MUSA): Keep a CPU-side mask summary and compact GPU
+                # indices for the MUSA GDN/Mamba tracking fast path.
+                self.mamba_track_mask_cpu = mamba_track_mask_cpu.tolist()
+                self.mamba_track_mask_indices = torch.tensor(
+                    [
+                        i
+                        for i, need_track in enumerate(self.mamba_track_mask_cpu)
+                        if need_track
+                    ],
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+            self.mamba_track_mask = mamba_track_mask_cpu.pin_memory().to(
+                device=self.device, non_blocking=True
             )
 
     def maybe_wait_verify_done(self):
@@ -2618,6 +2650,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             has_grammar=self.has_grammar,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
+            mamba_track_mask_cpu=self.mamba_track_mask_cpu,
+            mamba_track_mask_indices=self.mamba_track_mask_indices,
             mamba_track_seqlens=self.mamba_track_seqlens,
         )
 
@@ -2645,6 +2679,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             enable_overlap=self.enable_overlap,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
+            mamba_track_mask_cpu=self.mamba_track_mask_cpu,
+            mamba_track_mask_indices=self.mamba_track_mask_indices,
             mamba_track_seqlens=self.mamba_track_seqlens,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
@@ -2853,4 +2889,10 @@ class ModelWorkerBatch:
     # For mamba state tracking
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
+    # XXX (MUSA): Optional CPU-side summary and compact tracked indices for the
+    # MUSA prefix-cache tracking fast path.
+    mamba_track_mask_cpu: Optional[List[bool]] = None
+    mamba_track_mask_indices: Optional[torch.Tensor] = (
+        None  # shape: [num_tracked], int64
+    )
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
