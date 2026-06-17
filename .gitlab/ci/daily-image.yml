@@ -26,6 +26,15 @@ daily:image-build:
         echo "IMAGE_BUILD_SCRIPT is required." >&2
         exit 2
       fi
+      force_image_build="${FORCE_IMAGE_BUILD:-0}"
+      case "${force_image_build}" in
+        0|1)
+          ;;
+        *)
+          echo "Invalid FORCE_IMAGE_BUILD=${force_image_build}; expected 0 or 1." >&2
+          exit 2
+          ;;
+      esac
       case "${requested_ref}" in
         -*|*..*|*~*|*^*|*:*|*\\*|*' '*|*'?'*|*'['*|*'//'*|*/.|*.lock|"" )
           echo "Invalid SGLANG ref: ${requested_ref}" >&2
@@ -282,6 +291,7 @@ daily:image-build:
       echo "Daily image build source inputs changed: ${source_inputs_changed}"
       echo "Daily image build musa-base inputs changed: ${musa_base_inputs_changed}"
       echo "Daily image build sglang musa-base inputs changed: ${sglang_musa_base_inputs_changed}"
+      echo "Daily image build force sglang image build: ${force_image_build}"
 
       mkdir -p ci_artifacts
       changelog_file="ci_artifacts/daily-image-changelog.txt"
@@ -318,6 +328,7 @@ daily:image-build:
         echo "Current musa-base fingerprint: ${musa_base_fingerprint}"
         echo "Musa-base inputs changed: ${musa_base_inputs_changed}"
         echo "SGLang musa-base inputs changed: ${sglang_musa_base_inputs_changed}"
+        echo "Force sglang image build: ${force_image_build}"
         echo "Optional overrides:${provided_build_inputs:- <none>}"
       } | tee "${changelog_file}"
 
@@ -340,7 +351,7 @@ daily:image-build:
       export DINGTALK_CHANGELOG_SUMMARY_FILE="${CI_PROJECT_DIR:-$(pwd)}/${changelog_summary_file}"
       export DINGTALK_PIPELINE_URL="${CI_PIPELINE_URL:-}"
 
-      if [ "${source_inputs_changed}" = "0" ] && [ "${sglang_musa_base_inputs_changed}" = "0" ]; then
+      if [ "${force_image_build}" != "1" ] && [ "${source_inputs_changed}" = "0" ] && [ "${sglang_musa_base_inputs_changed}" = "0" ]; then
         echo "No source or musa-base input update since last successful image build. Skip."
         printf '%s\n' "${current_sha}" > "${state_file}"
         printf '%s\n' "${build_fingerprint}" > "${fingerprint_file}"
@@ -348,6 +359,9 @@ daily:image-build:
         printf '%s\n' "${current_musa_base_inputs}" > "${musa_base_inputs_file}"
         printf '%s\n' "${current_musa_base_inputs}" > "${sglang_musa_base_inputs_file}"
         exit 0
+      fi
+      if [ "${force_image_build}" = "1" ] && [ "${source_inputs_changed}" = "0" ] && [ "${sglang_musa_base_inputs_changed}" = "0" ]; then
+        echo "FORCE_IMAGE_BUILD=1; build sglang image even without source or musa-base input updates."
       fi
 
       build_date="$(TZ=Asia/Shanghai date +%Y%m%d)"
