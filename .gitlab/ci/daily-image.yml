@@ -309,8 +309,8 @@ daily:image-build:
           echo "Commits:"
           GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o StrictHostKeyChecking=accept-new}" \
             git fetch --no-tags "${SGLANG_SOURCE_REPO}" \
-              "${previous_sha}:refs/ci-daily-image-changelog/previous" \
-              "${current_sha}:refs/ci-daily-image-changelog/current"
+              "${previous_sha}" \
+              "${current_sha}"
           git log --oneline "${previous_sha}..${current_sha}"
           echo
           echo "Changed files:"
