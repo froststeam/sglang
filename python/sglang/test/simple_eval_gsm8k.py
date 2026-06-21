@@ -81,6 +81,7 @@ class GSM8KEval(Eval):
 
             extracted_answer = get_answer_value(response_text)
             score = float(extracted_answer == correct_answer)
+            response_text_stripped = response_text.strip()
 
             html = common.jinja_env.from_string(HTML_JINJA).render(
                 prompt_messages=prompt_messages,
@@ -91,7 +92,16 @@ class GSM8KEval(Eval):
             )
             convo = prompt_messages + [dict(content=response_text, role="assistant")]
 
-            return SingleEvalResult(html=html, score=score, convo=convo)
+            return SingleEvalResult(
+                html=html,
+                score=score,
+                convo=convo,
+                metrics={
+                    "empty_response": float(not response_text_stripped),
+                    "invalid_answer": float(extracted_answer == INVALID),
+                    "response_chars": len(response_text),
+                },
+            )
 
         results = common.map_with_progress(
             fn, list(range(len(self._lines))), num_threads=self._num_threads
