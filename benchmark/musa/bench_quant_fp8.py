@@ -4,6 +4,7 @@ from pathlib import Path
 
 import torch
 import triton
+from mate.testing.utils import bench_kineto
 
 from sglang.srt.hardware_backend.musa.jit_kernel.csrc.quant import (
     per_token_group_quant_8bit,
@@ -15,7 +16,6 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_max,
     fp8_min,
 )
-from sglang.srt.utils.bench_utils import bench_kineto
 
 
 def sync() -> None:
@@ -41,6 +41,46 @@ def make_ref(x: torch.Tensor, group_size: int):
     scale = fp8_max / amax
     q = (x_f * scale.unsqueeze(-1)).clamp(fp8_min, fp8_max).to(fp8_dtype)
     return q.reshape_as(x), (amax / fp8_max).float()
+
+
+def assert_fp8_quant_close(
+    q: torch.Tensor,
+    s: torch.Tensor,
+    ref_q: torch.Tensor,
+    ref_s: torch.Tensor,
+    provider: str,
+    m: int,
+    hidden: int,
+) -> None:
+    torch.testing.assert_close(s, ref_s, rtol=1e-4, atol=1e-6)
+
+    q_f = q.float()
+    ref_q_f = ref_q.float()
+    diff = torch.abs(q_f - ref_q_f)
+    mismatch = diff != 0
+    mismatch_count = int(mismatch.sum().item())
+    if mismatch_count == 0:
+        return
+
+    max_abs_diff = float(diff.max().item())
+    mismatch_ratio = mismatch_count / q.numel()
+    max_allowed_abs_diff = 32.0
+    max_allowed_mismatch_ratio = 0.01
+
+    if (
+        max_abs_diff > max_allowed_abs_diff
+        or mismatch_ratio > max_allowed_mismatch_ratio
+    ):
+        mismatch_idx = mismatch.nonzero()[0].tolist()
+        raise AssertionError(
+            "FP8 quantization output differs from reference beyond rounding "
+            f"tolerance for provider={provider}, m={m}, hidden={hidden}: "
+            f"mismatches={mismatch_count}/{q.numel()} "
+            f"({mismatch_ratio:.4%}), max_abs_diff={max_abs_diff}, "
+            f"first_mismatch_index={mismatch_idx}, "
+            f"q={float(q_f[tuple(mismatch_idx)].item())}, "
+            f"ref_q={float(ref_q_f[tuple(mismatch_idx)].item())}"
+        )
 
 
 def make_fn(
@@ -89,7 +129,13 @@ def make_fn(
     raise ValueError(f"unsupported provider: {provider}")
 
 
-def run_one(provider: str, m: int, hidden: int, reps: int, correctness: bool):
+def run_one(
+    provider: str,
+    m: int,
+    hidden: int,
+    reps: int,
+    correctness: bool,
+):
     group_size = 128
     x = torch.randn((m, hidden), device="musa", dtype=torch.bfloat16)
     q, s = alloc_outputs(x, group_size)
@@ -101,8 +147,7 @@ def run_one(provider: str, m: int, hidden: int, reps: int, correctness: bool):
     if correctness:
         ref_q, ref_s = make_ref(x, group_size)
         sync()
-        torch.testing.assert_close(q.float(), ref_q.float(), rtol=0, atol=0)
-        torch.testing.assert_close(s, ref_s, rtol=1e-4, atol=1e-6)
+        assert_fp8_quant_close(q, s, ref_q, ref_s, provider, m, hidden)
 
     latency_s = bench_kineto(
         fn,

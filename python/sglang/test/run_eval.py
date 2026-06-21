@@ -181,10 +181,23 @@ def run_eval(args):
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
 
+    requested_num_examples = getattr(args, "num_examples", None)
+    actual_num_examples = None
+    if hasattr(eval_obj, "_lines"):
+        try:
+            actual_num_examples = len(eval_obj._lines)
+        except TypeError:
+            actual_num_examples = None
+
     if getattr(args, "repeat", 1) == 1:
         result, latency, sampler = run_eval_once(args, base_url, eval_obj)
         metrics = result.metrics | {"score": result.score}
         metrics["latency"] = latency
+        metrics["num_examples_requested"] = requested_num_examples
+        metrics["num_examples_actual"] = actual_num_examples
+        metrics["num_threads"] = getattr(args, "num_threads", None)
+        metrics["num_shots"] = getattr(args, "num_shots", None)
+        metrics["max_tokens"] = getattr(args, "max_tokens", None)
         print(f"Total latency: {latency:.3f} s")
         print(f"Score: {metrics['score']:.3f}")
 
@@ -237,6 +250,11 @@ def run_eval(args):
         metrics = result.metrics | {"scores": scores_repeat}
         metrics = metrics | {"mean_score": mean_score}
         metrics["latency"] = mean_latency
+        metrics["num_examples_requested"] = requested_num_examples
+        metrics["num_examples_actual"] = actual_num_examples
+        metrics["num_threads"] = getattr(args, "num_threads", None)
+        metrics["num_shots"] = getattr(args, "num_shots", None)
+        metrics["max_tokens"] = getattr(args, "max_tokens", None)
 
         if total_completion_tokens > 0 and total_latency > 0:
             metrics["output_throughput"] = total_completion_tokens / total_latency
@@ -256,13 +274,15 @@ def run_eval(args):
         executor.shutdown()
 
     # Dump reports
+    report_dir = os.environ.get("SGLANG_EVAL_REPORT_DIR", "/tmp")
+    os.makedirs(report_dir, exist_ok=True)
     file_stem = f"{args.eval_name}_{sampler.model.replace('/', '_')}"
-    report_filename = f"/tmp/{file_stem}.html"
+    report_filename = os.path.join(report_dir, f"{file_stem}.html")
     print(f"Writing report to {report_filename}")
     with open(report_filename, "w") as fh:
         fh.write(make_report(result))
     print(metrics)
-    result_filename = f"/tmp/{file_stem}.json"
+    result_filename = os.path.join(report_dir, f"{file_stem}.json")
     with open(result_filename, "w") as f:
         f.write(json.dumps(metrics, indent=2))
     print(f"Writing results to {result_filename}")
@@ -309,6 +329,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-examples", type=int)
     parser.add_argument("--num-threads", type=int, default=512)
     parser.add_argument("--max-tokens", type=int, default=2048)
+    parser.add_argument("--stop", nargs="+", default=None)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument(

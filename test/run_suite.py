@@ -19,6 +19,7 @@ HW_MAPPING = {
     "cpu": HWBackend.CPU,
     "cuda": HWBackend.CUDA,
     "amd": HWBackend.AMD,
+    "musa": HWBackend.MUSA,
     "npu": HWBackend.NPU,
 }
 
@@ -37,6 +38,14 @@ PER_COMMIT_SUITES = {
         "stage-c-test-4-gpu-amd",
         "stage-c-test-large-8-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
+    ],
+    HWBackend.MUSA: [
+        "stage-a-test-1-gpu-musa-smoke",
+        "stage-a-test-2-gpu-musa-smoke",
+        "stage-a-test-4-gpu-musa-smoke",
+        "stage-a-test-4-gpu-musa-joyai-llm-flash-smoke",
+        "stage-a-test-4-gpu-musa-gemma4-26b-a4b-smoke",
+        "stage-a-test-4-gpu-musa-qwen3-vl-32b-smoke",
     ],
     HWBackend.CUDA: [
         "stage-a-test-1-gpu-small",
@@ -111,6 +120,13 @@ NIGHTLY_SUITES = {
         # MI35x 8-GPU suite (different model configs)
         "nightly-amd-8-gpu-mi35x",
     ],
+    HWBackend.MUSA: [
+        "nightly-musa-1-gpu",
+        "nightly-musa-2-gpu",
+        "nightly-musa-4-gpu",
+        "nightly-musa-vlm",
+        "nightly-musa-qwen35",
+    ],
     HWBackend.CPU: [],
     HWBackend.NPU: [
         "nightly-1-npu-a3",
@@ -138,7 +154,7 @@ OTHER_SUITES = {
 }
 
 
-_SUITE_CHECKED_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
+_SUITE_CHECKED_BACKENDS = {HWBackend.CUDA, HWBackend.CPU, HWBackend.MUSA}
 
 
 def _valid_suites_by_backend() -> dict:

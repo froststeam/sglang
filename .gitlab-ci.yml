@@ -15,9 +15,11 @@ workflow:
 
 stages:
   - daily-image
+  - mr-setup
   - stage-a
   - stage-b
   - nightly
+  - mr-summary
 
 variables:
   SGLANG_IS_IN_CI: "true"

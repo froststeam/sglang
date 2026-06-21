@@ -18,6 +18,35 @@
     - if: '$CI_PIPELINE_SOURCE == "web" && $DAILY_IMAGE_BUILD == "1"'
     - when: never
 
+.rules-merge-request:
+  rules:
+    # Add target branches to this regex when enabling MR pipelines for more branches.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^musa\/v0\.5\.10\.post1$/'
+      changes:
+        - .gitlab-ci.yml
+        - .gitlab/ci/**/*
+        - scripts/ci/**/*
+        - benchmark/musa/**/*
+        - python/sglang/**/*
+        - sgl-kernel/**/*
+        - test/**/*
+    - when: never
+
+.rules-merge-request-always:
+  rules:
+    # Add target branches to this regex when enabling MR pipelines for more branches.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^musa\/v0\.5\.10\.post1$/'
+      changes:
+        - .gitlab-ci.yml
+        - .gitlab/ci/**/*
+        - scripts/ci/**/*
+        - benchmark/musa/**/*
+        - python/sglang/**/*
+        - sgl-kernel/**/*
+        - test/**/*
+      when: always
+    - when: never
+
 .rules-stage-a:
   rules:
     - when: never
@@ -41,27 +70,106 @@
 .cpu-job:
   extends: .musa-test-job
   tags:
-    - cpu-musa
+    - cpu-runner
 
 .musa-1gpu-job:
   extends: .musa-test-job
   tags:
-    - 1-gpu-musa
+    - 1-gpu-runner
 
 .musa-1gpu-test-job:
   extends: .musa-test-job
   tags:
-    - 1-gpu-musa
+    - 1-gpu-runner
 
 .musa-2gpu-test-job:
   extends: .musa-test-job
   tags:
-    - 2-gpu-musa
+    - 2-gpu-runner
 
 .musa-4gpu-test-job:
   extends: .musa-test-job
   tags:
-    - 4-gpu-musa
+    - 4-gpu-runner
+
+.musa-install-dependency-job:
+  stage: mr-setup
+  timeout: 30m
+  variables:
+    PYTHONUSERBASE: "/data/gitlab-ci/python-user-base/${CI_PROJECT_PATH_SLUG}/${CI_COMMIT_SHA}"
+  script:
+    - bash scripts/ci/musa/ci_install_dependency.sh
+
+.musa-benchmark-correctness-job:
+  stage: stage-a
+  timeout: 30m
+  variables:
+    MUSA_BENCH_REPS: "3"
+    PYTHONUSERBASE: "/data/gitlab-ci/python-user-base/${CI_PROJECT_PATH_SLUG}/${CI_COMMIT_SHA}"
+  script:
+    - source scripts/ci/musa/ci_setup_jit_cache.sh
+    - bash scripts/ci/musa/ci_install_dependency.sh --system-deps-only
+    - export PATH="${PYTHONUSERBASE}/bin:${PATH}"
+    - python benchmark/musa/bench_quant_fp8.py --m-values 1,16,256 --hidden-values 128,1024,4096 --providers csrc --reps "$MUSA_BENCH_REPS" --skip-correctness
+    - MS=1,8,64,512 TOPK=8 HIDDEN=7168 python benchmark/musa/moe/bench_moe_sum_reduce.py
+    - python benchmark/musa/bench_act_and_mul.py --quick --dtypes float16 bfloat16 --warmup 2 --repeat "$MUSA_BENCH_REPS"
+
+.musa-smoke-artifacts:
+  after_script:
+    - bash scripts/ci/musa/ci_collect_smoke_artifacts.sh
+  artifacts:
+    when: always
+    expire_in: 14 days
+    paths:
+      - ci_artifacts/musa-smoke/
+
+.musa-registered-suite-job:
+  extends:
+    - .musa-smoke-artifacts
+  stage: stage-a
+  timeout: 30m
+  variables:
+    PYTHONUSERBASE: "/data/gitlab-ci/python-user-base/${CI_PROJECT_PATH_SLUG}/${CI_COMMIT_SHA}"
+  script:
+    - source scripts/ci/musa/ci_setup_jit_cache.sh
+    - bash scripts/ci/musa/ci_install_dependency.sh --system-deps-only
+    - export PATH="${PYTHONUSERBASE}/bin:${PATH}"
+    - export MUSA_SMOKE_ARTIFACT_DIR="${CI_PROJECT_DIR:-$(pwd)}/ci_artifacts/musa-smoke/${CI_JOB_NAME_SLUG:-musa-smoke}"
+    - export SGLANG_EVAL_REPORT_DIR="${MUSA_SMOKE_ARTIFACT_DIR}"
+    - mkdir -p "${MUSA_SMOKE_ARTIFACT_DIR}"
+    - touch "${MUSA_SMOKE_ARTIFACT_DIR}/.start"
+    - cd test
+    - python3 run_suite.py --hw musa --suite "$MUSA_RUN_SUITE" --timeout-per-file "${MUSA_RUN_SUITE_TIMEOUT_PER_FILE:-1200}"
+
+.musa-registered-suite-python-overlay-job:
+  extends:
+    - .musa-smoke-artifacts
+  stage: stage-a
+  timeout: 30m
+  variables:
+    PYTHONUSERBASE: "/data/gitlab-ci/python-user-base/${CI_PROJECT_PATH_SLUG}/${CI_COMMIT_SHA}"
+  script:
+    - source scripts/ci/musa/ci_setup_jit_cache.sh
+    - bash scripts/ci/musa/ci_install_dependency.sh --system-deps-only
+    - export PATH="${PYTHONUSERBASE}/bin:${PATH}"
+    - export MUSA_SMOKE_ARTIFACT_DIR="${CI_PROJECT_DIR:-$(pwd)}/ci_artifacts/musa-smoke/${CI_JOB_NAME_SLUG:-musa-smoke}"
+    - export SGLANG_EVAL_REPORT_DIR="${MUSA_SMOKE_ARTIFACT_DIR}"
+    - mkdir -p "${MUSA_SMOKE_ARTIFACT_DIR}"
+    - touch "${MUSA_SMOKE_ARTIFACT_DIR}/.start"
+    - bash scripts/ci/musa/ci_python_overlay.sh
+    - source .musa_python_overlay.env
+    - export PYTHONPATH="${MUSA_PYTHON_OVERLAY_DIR}:${PYTHONPATH:-}"
+    - cd test
+    - python3 run_suite.py --hw musa --suite "$MUSA_RUN_SUITE" --timeout-per-file "${MUSA_RUN_SUITE_TIMEOUT_PER_FILE:-1200}"
+
+.musa-gemma4-26b-a4b-registered-suite-job:
+  extends:
+    - .musa-registered-suite-python-overlay-job
+  variables:
+    MUSA_RUN_SUITE: "stage-a-test-4-gpu-musa-gemma4-26b-a4b-smoke"
+    MUSA_PYTHON_OVERLAY_NAME: "gemma4-26b-a4b"
+    MUSA_PYTHON_OVERLAY_PACKAGES: "transformers==5.12.1 numpy<2 fsspec[http]<=2026.4.0,>=2023.1.0"
+    MUSA_PYTHON_OVERLAY_VERIFY_MODULES: "transformers numpy"
 
 .image-builder-job:
   extends: .ci-default
