@@ -76,11 +76,13 @@ from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
     is_cpu,
+    is_musa,
     is_npu,
     round_up,
 )
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
+_is_musa = is_musa()
 _is_npu = is_npu()
 graph_runners_dict = defaultdict(lambda: ViTCudaGraphRunner)
 if _is_npu:
@@ -220,8 +222,10 @@ class Qwen3_VisionBlock(nn.Module):
         self,
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        rotary_pos_emb_cos: torch.Tensor,
-        rotary_pos_emb_sin: torch.Tensor,
+        rotary_pos_emb_cos: Optional[torch.Tensor],
+        rotary_pos_emb_sin: Optional[torch.Tensor],
+        rotary_pos_emb_cache: Optional[torch.Tensor] = None,
+        rotary_pos_emb_positions: Optional[torch.Tensor] = None,
         output_ws: Optional[torch.Tensor] = None,
         max_seqlen: Optional[torch.Tensor] = None,
         sequence_lengths: Optional[torch.Tensor] = None,
@@ -233,6 +237,8 @@ class Qwen3_VisionBlock(nn.Module):
             cu_seqlens=cu_seqlens,
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
+            rotary_pos_emb_cache=rotary_pos_emb_cache,
+            rotary_pos_emb_positions=rotary_pos_emb_positions,
             output_ws=output_ws,
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
@@ -432,7 +438,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         return self.patch_embed.proj.weight.device
 
     def rot_pos_emb(
-        self, grid_thw: list[list[int]]
+        self, grid_thw: list[list[int]], return_musa_cache: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor]:
         pos_ids = []
         for t, h, w in grid_thw:
@@ -448,7 +454,16 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         cos_combined = cos[pos_ids].flatten(1)
         sin_combined = sin[pos_ids].flatten(1)
 
-        return cos_combined, sin_combined
+        if not return_musa_cache:
+            return cos_combined, sin_combined
+
+        cos_sin_cache = torch.cat([cos_combined, sin_combined], dim=-1).contiguous()
+        positions = torch.arange(
+            cos_sin_cache.size(0),
+            device=self.device,
+            dtype=torch.int64,
+        )
+        return cos_sin_cache, positions
 
     def _get_interpolation_indices(self, dim_size: int) -> torch.Tensor:
         """
@@ -769,7 +784,15 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         pos_embeds = self.fast_pos_embed_interpolate_from_list(grid_thw_list)
         x += pos_embeds
 
-        rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
+        rotary_pos_emb_cache = None
+        rotary_pos_emb_positions = None
+        if _is_musa and getattr(self, "use_musa_vision_rope", False):
+            rotary_pos_emb_cos, rotary_pos_emb_sin = None, None
+            rotary_pos_emb_cache, rotary_pos_emb_positions = self.rot_pos_emb(
+                grid_thw_list, return_musa_cache=True
+            )
+        else:
+            rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
 
         # ---- build token indptr (B+1,) ----
         token_cu_seqlens = np.repeat(
@@ -840,6 +863,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 cu_seqlens=cu_seqlens,
                 rotary_pos_emb_cos=rotary_pos_emb_cos,
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
+                rotary_pos_emb_cache=rotary_pos_emb_cache,
+                rotary_pos_emb_positions=rotary_pos_emb_positions,
                 max_seqlen=max_seqlen,
                 sequence_lengths=sequence_lengths,
             )

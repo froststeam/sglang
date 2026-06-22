@@ -2475,6 +2475,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         Warmup and tune kernels before cuda graph capture.
         Covers framework-level warmups and optional model-specific warmups.
         """
+        if self.device == "musa":
+            from sglang.srt.layers.moe.auto_tune import (
+                maybe_autotune_musa_moe_deepgemm_threshold,
+            )
+
+            maybe_autotune_musa_moe_deepgemm_threshold(
+                self.model,
+                rank=self.tp_rank,
+            )
+
         if self.device != "cuda":
             return
 
@@ -3305,6 +3315,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        # XXX (MUSA): Draft worker should not record expert distribution, which maybe cause hang
+        if self.is_draft_worker:
+            return self._forward_raw(
+                forward_batch,
+                skip_attn_backend_init,
+                pp_proxy_tensors,
+                reinit_attn_backend,
+                split_forward_count,
+            )
+
         self.forward_pass_id += 1
 
         # Try msprob debugger

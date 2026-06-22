@@ -2,9 +2,10 @@
 
 from sglang.srt.hardware_backend.musa.jit_kernel.csrc import (
     act_and_mul,
-    act_and_mul_masked_post_quant,
+    act_and_mul_masked,
     act_and_mul_masked_post_quant_fwd,
     deep_gemm_contig_preprocess,
+    deep_gemm_ep_preprocess,
     fused_add_rmsnorm,
     fused_share_gate_sigmoid_mul,
     gemma_fused_add_rmsnorm,
@@ -35,9 +36,10 @@ __all__ = [
     "gemma_fused_add_rmsnorm",
     "gemma_rmsnorm",
     "deep_gemm_contig_preprocess",
+    "deep_gemm_ep_preprocess",
     "moe_align_block_size",
     "act_and_mul",
-    "act_and_mul_masked_post_quant",
+    "act_and_mul_masked",
     "act_and_mul_masked_post_quant_fwd",
     "moe_sum_reduce",
     "layernorm_fn",

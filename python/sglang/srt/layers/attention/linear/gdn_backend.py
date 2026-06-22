@@ -21,6 +21,8 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.utils import is_cpu, is_cuda, is_musa, is_npu
 from sglang.srt.utils.common import rank0_log
 
+_is_musa = is_musa()
+
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,

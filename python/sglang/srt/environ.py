@@ -406,6 +406,7 @@ class Envs:
     SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE = EnvBool(False)
     SGLANG_DG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/deep_gemm"))
     SGLANG_DG_USE_NVRTC = EnvBool(False)
+    SGLANG_DEEP_GEMM_BLOCK_M = EnvInt(128)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
     SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
 
@@ -431,6 +432,7 @@ class Envs:
     SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
     SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
+    SGLANG_DEEPEP_LL_USE_NVLINK = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
@@ -645,8 +647,6 @@ class Envs:
     # Aiter
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
 
-    # MUSA MoE
-    SGLANG_MUSA_CONTIG_DEEPGEMM_TOKEN_THRESHOLD = EnvInt(16384)
     # fmt: on
 
     # EPD

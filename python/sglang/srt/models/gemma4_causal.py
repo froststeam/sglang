@@ -835,9 +835,6 @@ class Gemma4TextModel(PreTrainedModel):
         num_layers = len(self.layers)
 
         for layer_idx, layer in enumerate(self.layers):
-            if layer_idx in self.layers_to_capture:
-                aux_hidden_states.append(hidden_states)
-
             if per_layer_inputs is not None:
                 per_layer_input = per_layer_inputs[:, layer_idx, :]
             else:
@@ -940,9 +937,6 @@ class Gemma4ForCausalLM(PreTrainedModel):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
-    def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.model.embed_tokens.weight, self.lm_head.weight
-
     def get_attention_sliding_window_size(self):
         return get_attention_sliding_window_size(self.config)
 
@@ -973,7 +967,7 @@ class Gemma4ForCausalLM(PreTrainedModel):
             hidden_states, aux_hidden_states = hidden_states
 
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+            input_ids, hidden_states, self.lm_head, forward_batch
         )
 
     def _get_k_eq_v_layers(self) -> set:

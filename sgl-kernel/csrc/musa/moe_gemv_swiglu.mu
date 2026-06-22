@@ -596,7 +596,7 @@ void musa_fused_gemv(
     int expert_offset_stride = reduce_size * hidden_size;
     int half_n_idx = reduce_size / 2;
     int scale_k_len = 1;
-    int scale_k_group_tile = 128;
+    int scale_k_group_tile = 1;
 
     if (use_int4_w4a16 || is_fp8) {
         scale_k_len = B_scale->size(1);
@@ -751,7 +751,7 @@ void fused_moe_gemv(
     int expert_offset_stride = reduce_size * hidden_size;
     int half_n_idx = reduce_size / 2;
     int scale_k_len = 1;
-    int scale_k_group_tile = 128;
+    int scale_k_group_tile = 1;
 
     bool is_pergroup_scale = false;
     if (use_int4_w4a16 || is_fp8) {
@@ -772,6 +772,7 @@ void fused_moe_gemv(
         {16, 8, 0.f, false},
         {32, 4, 0.f, false},
         {4, 32, 0.f, false},
+        {16, 4, 0.f, false},
     };
 
     constexpr int iobit = 128;
@@ -806,6 +807,16 @@ void fused_moe_gemv(
         }
     }
 
+    if (!use_int4_w4a16 && !is_fp8 && B.scalar_type() == at::ScalarType::BFloat16) {
+        if (use_swigelu && nr_n == 768 && hidden_size == 2048) {
+            best_config_storage = {8, 16, 2.0f, true};
+            best_config = &best_config_storage;
+        } else if (mul_routed_weight && nr_n == 2048 && hidden_size == 768) {
+            best_config_storage = {16, 4, 2.0f, true};
+            best_config = &best_config_storage;
+        }
+    }
+
     switch (best_config->block_n) {
         case 4:
             switch (best_config->block_k) {
@@ -822,6 +833,7 @@ void fused_moe_gemv(
         case 16:
             switch (best_config->block_k) {
                 case 8: GEN_LAUNCH_KERN(16, 8); break;
+                case 4: GEN_LAUNCH_KERN(16, 4); break;
                 default: TORCH_CHECK(false, "Unsupported block_k for block_n=16");
             }
             break;
@@ -830,12 +842,6 @@ void fused_moe_gemv(
                 case 4: GEN_LAUNCH_KERN(32, 4); break;
                 case 1: GEN_LAUNCH_KERN(32, 1); break;
                 default: TORCH_CHECK(false, "Unsupported block_k for block_n=32");
-            }
-            break;
-        case 128:
-            switch (best_config->block_k) {
-                case 1: GEN_LAUNCH_KERN(128, 1); break;
-                default: TORCH_CHECK(false, "Unsupported block_k for block_n=128");
             }
             break;
         default:

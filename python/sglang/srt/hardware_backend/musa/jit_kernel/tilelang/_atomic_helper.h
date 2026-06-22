@@ -24,3 +24,11 @@ __device__ __forceinline__ void sgl_tl_copy_bf16x8(bfloat16_t *dst,
   const int4 value = *reinterpret_cast<const int4 *>(src + src_offset);
   *reinterpret_cast<int4 *>(dst + dst_offset) = value;
 }
+
+__device__ __forceinline__ void sgl_tl_copy_fp8x16(fp8_e4_t *dst,
+                                                   const fp8_e4_t *src,
+                                                   int dst_offset,
+                                                   int src_offset) {
+  const int4 value = *reinterpret_cast<const int4 *>(src + src_offset);
+  *reinterpret_cast<int4 *>(dst + dst_offset) = value;
+}

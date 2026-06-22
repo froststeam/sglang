@@ -18,6 +18,8 @@ from typing import Dict, Tuple
 
 import torch
 
+from sglang.srt.utils import is_musa
+
 _cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}
 
 

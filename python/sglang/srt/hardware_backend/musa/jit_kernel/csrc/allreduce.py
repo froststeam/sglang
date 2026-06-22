@@ -132,26 +132,6 @@ def use_push_in_graph() -> bool:
     return value.lower() in ("1", "true", "yes", "on")
 
 
-def eager_staging_threshold_bytes() -> int:
-    return int(
-        os.environ.get(
-            "SGLANG_CUSTOM_AR_EAGER_STAGING_THRESHOLD_BYTES",
-            os.environ.get("SGL_CUSTOM_AR_EAGER_STAGING_THRESHOLD_BYTES", "0"),
-        )
-    )
-
-
-def use_eager_staging(world_size: int, nbytes: int, shot: int) -> bool:
-    staging_threshold = eager_staging_threshold_bytes()
-    if staging_threshold > 0:
-        return nbytes >= staging_threshold
-    return (
-        world_size == 2
-        and shot == SHOT_TWO_STAGE_512
-        and 512 * 1024 < nbytes <= 1024 * 1024
-    )
-
-
 def _default_threads_blocks(world_size: int, shot: int) -> tuple[int, int]:
     if shot == SHOT_PUSH:
         return 512, 14

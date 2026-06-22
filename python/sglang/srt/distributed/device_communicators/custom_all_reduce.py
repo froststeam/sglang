@@ -384,11 +384,6 @@ class MusaJitCustomAllreduce:
         self._last_rank_data: Optional[torch.Tensor] = None
         self._graph_inputs: dict[int, torch.Tensor] = {}
         self._shot_decision_cache: dict[tuple[int, bool, bool], int] = {}
-        self._eager_staging_cache: dict[tuple[int, int], bool] = {}
-        self._eager_graph_cache: dict[tuple[int, int, torch.dtype, int], list[dict]] = (
-            {}
-        )
-        self._eager_graph_cursor: dict[tuple[int, int, torch.dtype, int], int] = {}
         self._launch_context_enabled = _env_flag(
             ("SGLANG_CUSTOM_AR_LAUNCH_CONTEXT", "SGL_CUSTOM_AR_LAUNCH_CONTEXT"),
             True,
@@ -451,48 +446,6 @@ class MusaJitCustomAllreduce:
         self.signal_ptrs_cpu = torch.tensor(self.meta_ptrs, dtype=torch.int64)
         self.disabled = False
         self.original_disabled = False
-
-    def _use_eager_graph_cache(self, input: torch.Tensor, shot: int) -> bool:
-        if not _env_flag(
-            ("SGLANG_CUSTOM_AR_EAGER_GRAPH_CACHE", "SGL_CUSTOM_AR_EAGER_GRAPH_CACHE"),
-            False,
-        ):
-            return False
-        if self._IS_CAPTURING:
-            return False
-        if shot in (self._jit_ar.SHOT_PUSH, self._jit_ar.SHOT_PUSH_WIDE):
-            return False
-        # Keep tiny packets on the normal path; graph replay only pays off once
-        # launch overhead becomes a meaningful fraction of the all-reduce.
-        return input.numel() * input.element_size() >= 512 * 1024
-
-    def _eager_graph_cache_size(self) -> int:
-        return max(
-            1,
-            int(
-                os.environ.get("SGLANG_CUSTOM_AR_EAGER_GRAPH_CACHE_SIZE")
-                or os.environ.get("SGL_CUSTOM_AR_EAGER_GRAPH_CACHE_SIZE", "2")
-            ),
-        )
-
-    def _launch_registered_eager_graph(
-        self, input: torch.Tensor, rank_data: torch.Tensor, shot: int
-    ) -> torch.Tensor:
-        key = (int(input.data_ptr()), int(input.numel()), input.dtype, int(shot))
-        entries = self._eager_graph_cache.setdefault(key, [])
-        cursor = self._eager_graph_cursor.get(key, 0)
-        if len(entries) < self._eager_graph_cache_size():
-            out = torch.empty_like(input)
-            graph = torch.musa.MUSAGraph()
-            with torch.musa.graph(graph):
-                self._launch_registered(rank_data, out, shot)
-            entry = {"graph": graph, "out": out}
-            entries.append(entry)
-        else:
-            entry = entries[cursor % len(entries)]
-        self._eager_graph_cursor[key] = (cursor + 1) % max(1, len(entries))
-        entry["graph"].replay()
-        return entry["out"]
 
     @contextmanager
     def capture(self):
@@ -714,15 +667,6 @@ class MusaJitCustomAllreduce:
         self._shot_decision_cache[key] = shot
         return shot
 
-    def _use_eager_staging_cached(self, input_bytes: int, shot: int) -> bool:
-        key = (int(input_bytes), int(shot))
-        cached = self._eager_staging_cache.get(key)
-        if cached is not None:
-            return cached
-        value = self._jit_ar.use_eager_staging(self.world_size, input_bytes, shot)
-        self._eager_staging_cache[key] = value
-        return value
-
     def _launch_unregistered(
         self, input: torch.Tensor, out: torch.Tensor, shot: int
     ) -> None:
@@ -852,31 +796,20 @@ class MusaJitCustomAllreduce:
                 self._launch_unregistered(input, out, shot)
         else:
             out = torch.empty_like(input)
-            if self._use_eager_staging_cached(input_bytes, shot):
-                if self._pybind_unregistered_enabled:
-                    self._launch_unregistered_pybind(input, out, shot)
-                else:
-                    self._launch_unregistered(input, out, shot)
-                return out
-            if self._use_launch_context(shot):
-                context_ptr = self._context_for_input(input, shot)
-                if self._use_torchop_context(shot):
-                    self._launch_registered_context_torchop(context_ptr, out, shot)
-                elif self._use_pybind_context(shot):
-                    self._launch_registered_context_pybind(context_ptr, out, shot)
-                else:
-                    self._launch_registered_context(context_ptr, out, shot)
+            # Match the sgl custom AR eager path: stage through the shared
+            # buffer instead of launching from an opaque registered input
+            # pointer. The unregistered launch takes `input` as an explicit
+            # tensor argument and orders a same-stream D2D copy before AR,
+            # preserving producer/lifetime dependencies under serving buffer
+            # reuse. Graph capture still uses the registered path above.
+            if self._pybind_unregistered_enabled:
+                self._launch_unregistered_pybind(input, out, shot)
             else:
-                rank_data = self._rank_data_for_input(input)
-                if self._use_eager_graph_cache(input, shot):
-                    return self._launch_registered_eager_graph(input, rank_data, shot)
-                self._launch_registered(rank_data, out, shot)
+                self._launch_unregistered(input, out, shot)
         return out
 
     def close(self):
         if not self.disabled and dist.is_initialized():
-            self._eager_graph_cache.clear()
-            self._eager_graph_cursor.clear()
             for (_, shot), context_ptr in tuple(self._rank_data_context_cache.items()):
                 self._jit_ar.dispose_context(context_ptr, self.world_size, shot)
             self._rank_data_context_cache.clear()

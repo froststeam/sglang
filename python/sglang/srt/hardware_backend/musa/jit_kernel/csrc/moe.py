@@ -205,6 +205,20 @@ def _act_and_mul_impl(
     )
 
 
+def _act_and_mul_masked_impl(
+    gateup_output: torch.Tensor,
+    down_input: torch.Tensor,
+    masked_m: torch.Tensor,
+    activation_type: int,
+) -> None:
+    _act_and_mul_module().sgl_musa_act_and_mul_masked(
+        gateup_output,
+        down_input,
+        masked_m,
+        int(activation_type),
+    )
+
+
 @register_custom_op(
     op_name="musa_act_and_mul",
     mutates_args=["down_input"],
@@ -224,6 +238,24 @@ def _act_and_mul_custom(
         expert_step,
         activation_type,
         skip_expert_check,
+    )
+
+
+@register_custom_op(
+    op_name="musa_act_and_mul_masked",
+    mutates_args=["down_input"],
+)
+def _act_and_mul_masked_custom(
+    gateup_output: torch.Tensor,
+    down_input: torch.Tensor,
+    masked_m: torch.Tensor,
+    activation_type: int,
+) -> None:
+    _act_and_mul_masked_impl(
+        gateup_output,
+        down_input,
+        masked_m,
+        activation_type,
     )
 
 
@@ -272,6 +304,21 @@ def act_and_mul(
     if return_output:
         return down_input
     return None
+
+
+def act_and_mul_masked(
+    gateup_output: torch.Tensor,
+    down_input: torch.Tensor,
+    masked_m: torch.Tensor,
+    activation: str = "silu",
+) -> None:
+    """MUSA JIT masked gated activation-and-multiply op for [E, M, 2N]."""
+    _act_and_mul_masked_custom(
+        gateup_output,
+        down_input,
+        masked_m,
+        _activation_type_id(activation),
+    )
 
 
 @cache_once
@@ -584,6 +631,59 @@ def deep_gemm_contig_preprocess(
         cursor,
         num_local_experts,
         block_m,
+    )
+
+
+def deep_gemm_ep_preprocess(
+    topk_ids: torch.Tensor,
+    hidden_states: torch.Tensor,
+    masked_m: torch.Tensor,
+    src2dst: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor | None,
+    num_local_experts: int,
+    use_fp8_quant: bool,
+) -> None:
+    from sglang.srt.hardware_backend.musa.jit_kernel.tilelang.deep_gemm_ep_preprocess import (
+        can_use_ep_bf16_tilelang,
+        can_use_ep_fp8_tilelang,
+        deep_gemm_ep_preprocess_bf16_tilelang,
+        deep_gemm_ep_preprocess_fp8_tilelang,
+    )
+
+    if use_fp8_quant:
+        if output_scale is None:
+            raise ValueError("output_scale must be provided for fp8 EP preprocess")
+        if not can_use_ep_fp8_tilelang(hidden_states, topk_ids, num_local_experts):
+            raise RuntimeError(
+                "MUSA DeepGEMM fp8 EP preprocess requires hidden_size to be a "
+                "supported multiple of 128, topk<=16, int32 topk_ids, and "
+                "num_local_experts>0."
+            )
+        deep_gemm_ep_preprocess_fp8_tilelang(
+            topk_ids,
+            hidden_states,
+            masked_m,
+            src2dst,
+            output,
+            output_scale,
+            num_local_experts,
+        )
+        return
+
+    if not can_use_ep_bf16_tilelang(hidden_states, topk_ids, num_local_experts):
+        raise RuntimeError(
+            "MUSA DeepGEMM bf16 EP preprocess requires hidden_size to be a "
+            "supported multiple of 128, topk<=16, int32 topk_ids, and "
+            "num_local_experts>0."
+        )
+    deep_gemm_ep_preprocess_bf16_tilelang(
+        topk_ids,
+        hidden_states,
+        masked_m,
+        src2dst,
+        output,
+        num_local_experts,
     )
 
 

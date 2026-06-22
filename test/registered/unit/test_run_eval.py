@@ -11,6 +11,7 @@ from unittest.mock import patch
 def register_cpu_ci(*args, **kwargs):
     return None
 
+
 register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
 
 
