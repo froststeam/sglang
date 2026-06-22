@@ -27,6 +27,7 @@ class MusaSmokeCase:
     default_gsm8k_min_score: float = 0.85
     default_gsm8k_chat_template_kwargs: Optional[str] = None
     default_gsm8k_reasoning_effort: Optional[str] = None
+    default_gsm8k_stop: Optional[tuple[str, ...]] = None
     extra_args_env: Optional[str] = None
 
 
@@ -95,10 +96,12 @@ def _env_optional_float(name: str) -> Optional[float]:
     return float(value) if value is not None else None
 
 
-def _env_optional_str_list(name: str) -> Optional[list[str]]:
+def _env_optional_str_list(
+    name: str, default: Optional[list[str]] = None
+) -> Optional[list[str]]:
     value = os.getenv(name)
     if value is None:
-        return None
+        return default
 
     parsed = json.loads(value)
     if isinstance(parsed, str):
@@ -166,7 +169,10 @@ def _run_gsm8k_eval(
         top_p=_env_float("MUSA_SMOKE_GSM8K_TOP_P", 1.0),
         top_k=_env_optional_int("MUSA_SMOKE_GSM8K_TOP_K"),
         min_p=_env_optional_float("MUSA_SMOKE_GSM8K_MIN_P"),
-        stop=_env_optional_str_list("MUSA_SMOKE_GSM8K_STOP"),
+        stop=_env_optional_str_list(
+            "MUSA_SMOKE_GSM8K_STOP",
+            list(case.default_gsm8k_stop) if case.default_gsm8k_stop else None,
+        ),
         chat_template_kwargs=os.getenv(
             "MUSA_SMOKE_GSM8K_CHAT_TEMPLATE_KWARGS",
             case.default_gsm8k_chat_template_kwargs,
@@ -190,6 +196,7 @@ def _run_gsm8k_eval(
                 "num_shots": args.num_shots,
                 "num_threads": args.num_threads,
                 "reasoning_effort": args.reasoning_effort,
+                "stop": args.stop,
                 "temperature": args.temperature,
             },
             sort_keys=True,
