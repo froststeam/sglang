@@ -22,7 +22,9 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import is_cpu
+from sglang.srt.utils import is_cpu, is_musa
+
+_is_musa = is_musa()
 
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
@@ -62,7 +64,7 @@ def track_mamba_state_if_needed_kernel(
     track_mask = tl.load(mamba_track_mask_ptr + batch_idx)
 
     # Early exit if we don't need to track
-    if not track_mask:
+    if track_mask == 0:
         return
 
     # Load source and destination indices
@@ -203,9 +205,15 @@ class MambaAttnBackendBase(AttentionBackend):
                     forward_batch.extend_start_loc[-1]
                     + forward_batch.extend_seq_lens[-1]
                 )
-                if (
-                    forward_batch.mamba_track_mask is not None
-                    and forward_batch.mamba_track_mask.any()
+                if forward_batch.mamba_track_mask is not None and (
+                    (
+                        _is_musa
+                        and forward_batch.mamba_track_mask_cpu is not None
+                        # XXX (MUSA): Use the CPU-side mask summary to avoid
+                        # synchronizing on tensor.any() during extend setup.
+                        and any(forward_batch.mamba_track_mask_cpu)
+                    )
+                    or (not _is_musa and forward_batch.mamba_track_mask.any())
                 ):
                     track_conv_indices = self._init_track_conv_indices(
                         query_start_loc, forward_batch
@@ -273,7 +281,14 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
         aligned_len = (lens_to_track // mamba_cache_chunk_size) * mamba_cache_chunk_size
         start_indices = query_start_loc[:-1] + aligned_len - conv_state_len
-        start_indices = start_indices[forward_batch.mamba_track_mask]
+        if _is_musa and forward_batch.mamba_track_mask_indices is not None:
+            # XXX (MUSA): Reuse precomputed tracked request indices instead of
+            # materializing them with nonzero() on the device.
+            start_indices = start_indices.index_select(
+                0, forward_batch.mamba_track_mask_indices
+            )
+        else:
+            start_indices = start_indices[forward_batch.mamba_track_mask]
 
         # Create indices: [batch_size, conv_state_len]
         indices = start_indices.unsqueeze(-1) + torch.arange(

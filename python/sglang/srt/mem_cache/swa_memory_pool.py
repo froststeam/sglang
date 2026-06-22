@@ -12,9 +12,10 @@ from sglang.srt.mem_cache.allocator import (
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_musa, is_npu
 from sglang.srt.utils.common import get_num_new_pages
 
+_is_musa = is_musa()
 _is_npu = is_npu()
 
 if _is_npu:
@@ -160,6 +161,8 @@ class SWAKVPool(BaseSWAKVPool):
             return self.full_kv_pool.get_kv_buffer(layer_id_pool)
 
     def set_swa_loc(self, loc: torch.Tensor):
+        if _is_musa and loc.dtype != torch.long:
+            loc = loc.to(torch.long)
         self.swa_loc = loc
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import os
 import shlex
 import subprocess
@@ -45,22 +46,25 @@ def _normalize_musa_arch(arch: str) -> str:
     return f"mp_{arch}"
 
 
-def _musa_arch_flags() -> list[str]:
+@functools.cache
+def _musa_arch_names() -> tuple[str, ...]:
     arch_list = os.environ.get("SGLANG_MUSA_ARCH_LIST") or os.environ.get(
         "MATE_MUSA_ARCH_LIST"
     )
     if arch_list:
-        return [
-            f"--offload-arch={_normalize_musa_arch(arch)}" for arch in arch_list.split()
-        ]
+        return tuple(_normalize_musa_arch(arch) for arch in arch_list.split())
     try:
         import torch_musa
 
         props = torch_musa.get_device_properties(torch_musa.current_device())
         arch = f"{int(props.major)}{int(props.minor)}"
-        return [f"--offload-arch={_normalize_musa_arch(arch)}"]
+        return (_normalize_musa_arch(arch),)
     except Exception:
-        return ["--offload-arch=mp_31"]
+        return ("mp_31",)
+
+
+def _musa_arch_flags() -> list[str]:
+    return [f"--offload-arch={arch}" for arch in _musa_arch_names()]
 
 
 def _escape(path: Path) -> str:
@@ -79,8 +83,22 @@ def _object_path(build_dir: Path, source: Path) -> Path:
     return build_dir / f"{source.parent.name}_{source.stem}{suffix}"
 
 
+def _sources_digest(sources: Sequence[Path]) -> str:
+    digest = hashlib.sha256()
+    for source in sources:
+        digest.update(source.as_posix().encode())
+        digest.update(b"\0")
+        digest.update(source.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()[:16]
+
+
+def _musa_arch_cache_dir() -> Path:
+    return _CACHE_DIR / "_".join(_musa_arch_names())
+
+
 def musa_jit_build_dir(name: str) -> Path:
-    return _CACHE_DIR / name
+    return _musa_arch_cache_dir() / name
 
 
 def _ninja_content(
@@ -90,6 +108,7 @@ def _ninja_content(
     extra_musa_cflags: Sequence[str],
     extra_ldflags: Sequence[str],
 ) -> str:
+    source_digest_flag = f"-DSGLANG_MUSA_JIT_SOURCE_HASH=0x{_sources_digest(sources)}"
     include_flags = [
         f"-I{find_include_path()}",
         f"-I{find_dlpack_include_path()}",
@@ -99,6 +118,7 @@ def _ninja_content(
         "-std=c++17",
         "-fPIC",
         "-O3",
+        source_digest_flag,
         *extra_cflags,
         *_parse_env_flags("SGLANG_MUSA_EXTRA_CFLAGS"),
         *include_flags,
@@ -109,6 +129,7 @@ def _ninja_content(
         "-O3",
         "-ffast-math",
         *_musa_arch_flags(),
+        source_digest_flag,
         *extra_musa_cflags,
         *_parse_env_flags("SGLANG_MUSA_EXTRA_MUSAFLAGS"),
         *include_flags,
@@ -125,7 +146,7 @@ def _ninja_content(
         *_parse_env_flags("SGLANG_MUSA_EXTRA_LDFLAGS"),
     ]
 
-    build_dir = _CACHE_DIR / name
+    build_dir = musa_jit_build_dir(name)
     lines = [
         "ninja_required_version = 1.3",
         f"cxx = {os.environ.get('CXX', 'c++')}",
@@ -173,10 +194,10 @@ def load_musa_jit(
     extra_ldflags: tuple[str, ...] = (),
 ):
     resolved_sources = tuple((_CSRC_DIR / source).resolve() for source in sources)
-    build_dir = _CACHE_DIR / name
+    build_dir = musa_jit_build_dir(name)
     ninja_path = build_dir / "build.ninja"
     so_path = build_dir / f"{name}.so"
-    lock_path = _CACHE_DIR / "tmp" / f"{name}.lock"
+    lock_path = _musa_arch_cache_dir() / "tmp" / f"{name}.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with FileLock(str(lock_path)):
         build_dir.mkdir(parents=True, exist_ok=True)
@@ -211,7 +232,7 @@ def load_musa_pybind(
 
     resolved_sources = tuple(str((_CSRC_DIR / source).resolve()) for source in sources)
     build_dir = musa_jit_build_dir(name)
-    lock_path = _CACHE_DIR / "tmp" / f"{name}.lock"
+    lock_path = _musa_arch_cache_dir() / "tmp" / f"{name}.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     build_dir.mkdir(parents=True, exist_ok=True)
     libtvm = Path(find_libtvm_ffi())

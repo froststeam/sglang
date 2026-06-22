@@ -453,6 +453,55 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return adapted_request, request
 
+    @staticmethod
+    def _clean_gemma4_output(text: str) -> str:
+        """Clean Gemma4 structural tokens from assistant output.
+
+        Gemma4 uses special tokens (<turn|>, <channel|>, etc.) for internal
+        message structuring. These should not be exposed to end users in
+        standard chat completions.
+        """
+        if not text:
+            return text
+        import re
+
+        # Step 1: Truncate at first turn end or tool_response marker.
+        # These mark the end of the current assistant message.
+        text = re.split(r"<turn\|>|<\|tool_response>", text, maxsplit=1)[0]
+
+        # Step 2: Remove thinking blocks.
+        # When skip_special_tokens=True, <|channel> and </channel|> are stripped,
+        # leaving behind "thought\n...". Remove the whole block including the
+        # bare "thought" prefix that may remain.
+        text = re.sub(
+            r"<\|channel>\s*thought\s*\n.*?</channel\|>", "", text, flags=re.DOTALL
+        )
+        text = re.sub(r"\(?thought\)?\s*\n\s*<channel\|>", "", text)
+        # Also remove bare "thought\n" lines that leak through when special
+        # tokens are skipped but the content between them remains.
+        text = re.sub(r"\bthought\s*\n", "", text)
+
+        # Step 3: Remove tool call blocks
+        text = re.sub(r"<\|tool_call>.*?</tool_call\|>", "", text, flags=re.DOTALL)
+
+        # Step 4: Remove remaining structural tokens and their bare text
+        # counterparts that may appear when skip_special_tokens strips the
+        # surrounding special tokens but leaves inner text.
+        text = re.sub(
+            r"<\|turn>|<channel\|>|<\|channel>|<\|think\|>|<\|end_of_text\|>",
+            "",
+            text,
+        )
+
+        # Step 5: Remove empty channel markers that may appear as bare text
+        text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+
+        # Step 6: Clean up extra whitespace
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        text = re.sub(r" {2,}", " ", text)
+        text = text.strip()
+        return text
+
     def _process_messages(
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
@@ -460,6 +509,13 @@ class OpenAIServingChat(OpenAIServingBase):
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss or self.is_gemma4:
             request.skip_special_tokens = False
+        elif self.is_gemma4:
+            # For Gemma4, keep special tokens only when tool calls or
+            # reasoning extraction are needed. Standard chat can skip them.
+            needs_special_tokens = (
+                request.tools and request.tool_choice != "none"
+            ) or (self.reasoning_parser and request.separate_reasoning)
+            request.skip_special_tokens = not needs_special_tokens
 
         self._patch_mistral_skip_special_tokens(request)
 
@@ -509,6 +565,20 @@ class OpenAIServingChat(OpenAIServingBase):
             result = self._apply_jinja_template(request, tools, is_multimodal)
         else:
             result = self._apply_conversation_template(request, is_multimodal)
+
+        # For Gemma4 standard chat (no tools, no reasoning extraction), add
+        # structural stop strings so the model halts before emitting internal
+        # template markers that would leak into user-facing output.
+        if self.is_gemma4 and not (
+            (request.tools and request.tool_choice != "none")
+            or (self.reasoning_parser and request.separate_reasoning)
+        ):
+            gemma4_stops = ["<turn|>", "<|tool_response>", "<|turn>"]
+            stops = list(result.stop) if result.stop else []
+            for s in gemma4_stops:
+                if s not in stops:
+                    stops.append(s)
+            result.stop = stops
 
         result.tool_call_constraint = tool_call_constraint
         return result
@@ -1142,6 +1212,10 @@ class OpenAIServingChat(OpenAIServingBase):
 
             finish_reason = ret_item["meta_info"]["finish_reason"]
             text = ret_item["text"]
+
+            # Clean Gemma4 structural tokens from standard chat output
+            if self.is_gemma4 and not (request.tools and request.tool_choice != "none"):
+                text = self._clean_gemma4_output(text)
 
             # Handle reasoning content
             reasoning_text = None

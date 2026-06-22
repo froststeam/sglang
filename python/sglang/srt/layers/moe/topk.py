@@ -124,11 +124,10 @@ _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 _is_npu = is_npu()
-_is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
-if _is_cuda or _is_musa:
+if _is_cuda:
     from sgl_kernel import moe_fused_gate
 
     try:
@@ -171,7 +170,7 @@ if _is_cuda or _is_musa:
     except ImportError as e:
         pass
 
-if _is_cuda or _is_hip or _is_xpu or _is_musa:
+if _is_cuda or _is_hip or _is_xpu:
     from sgl_kernel import topk_softmax
 
     try:
@@ -220,7 +219,6 @@ class TopKConfig:
 
 
 class TopKOutputChecker:
-
     @staticmethod
     def format_is_standard(topk_output: TopKOutput) -> TypeGuard[StandardTopKOutput]:
         return isinstance(topk_output, StandardTopKOutput)
@@ -651,6 +649,7 @@ def fused_topk(
                 gating_output,
                 renormalize,
             )
+
     elif scoring_func == "sigmoid":
         if _use_aiter and correction_bias is not None:
             aiter_biased_grouped_topk(
@@ -1077,7 +1076,7 @@ def biased_grouped_topk_gpu(
         return topk_weights, topk_ids
 
     elif (
-        (_is_cuda or _is_musa)
+        _is_cuda
         # moe_fused_gate kernel ensures that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
         and experts_per_group <= 32
         and is_power_of_two(num_experts)
@@ -1094,7 +1093,29 @@ def biased_grouped_topk_gpu(
         )
 
         return topk_weights, topk_ids
+    elif (
+        _is_musa
+        and (
+            gating_output.shape[1] // num_expert_group <= 32
+            or (
+                num_expert_group == 1 and gating_output.shape[1] in {160, 256, 384}
+            )  # XXX (MUSA): will support more cases in the future
+        )
+        and is_power_of_two(correction_bias.shape[0])
+    ):
+        topk_weights, topk_ids = moe_fused_gate(
+            gating_output.to(dtype=torch.float32),
+            correction_bias,
+            num_expert_group,
+            topk_group,
+            topk,
+            num_fused_shared_experts,
+            routed_scaling_factor if routed_scaling_factor is not None else 1.0,
+            renormalize,
+            apply_routed_scaling_factor_on_output,
+        )
 
+        return topk_weights, topk_ids
     elif _use_aiter:
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         token = gating_output.shape[0]

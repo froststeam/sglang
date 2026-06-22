@@ -128,6 +128,11 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "moe_softcapping, Tensor? correction_bias) -> ()");
   m.impl("topk_softmax", torch::kMUSA, &topk_softmax);
 
+  m.def(
+      "topk_sigmoid(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, Tensor? "
+      "correction_bias) -> ()");
+  m.impl("topk_sigmoid", torch::kMUSA, &topk_sigmoid);
+
   m.def("moe_sum_reduce(Tensor input, Tensor output, float routed_scaling_factor) -> ()");
   m.impl("moe_sum_reduce", torch::kMUSA, &moe_sum_reduce);
 
@@ -316,7 +321,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "musa_fused_moe_gemv(Tensor! A, Tensor! B, Tensor! C, Tensor? A_scale, Tensor? B_scale,"
       "Tensor! topk_weights, Tensor! topk_ids, bool mul_routed_weight, int topk, bool use_int4_w4a16,"
       "bool use_swigelu) -> ()");
-  m.impl("fused_moe_gemv", torch::kMUSA, &fused_moe_gemv);
+  m.impl("musa_fused_moe_gemv", torch::kMUSA, &fused_moe_gemv);
 
   m.def(
       "musa_fused_gemv(Tensor! A, Tensor! B, Tensor! C, Tensor? A_scale, Tensor? B_scale,"

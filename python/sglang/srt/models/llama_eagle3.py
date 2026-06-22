@@ -80,6 +80,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         )
 
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm_before_residual = getattr(config, "norm_before_residual", False)
 
     def forward(
         self,
@@ -322,6 +323,9 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
 
             if "t2d" in name:
                 continue
+
+            if name.startswith("layers.0."):
+                name = name.replace("layers.0.", "midlayer.", 1)
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:

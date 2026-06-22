@@ -20,6 +20,7 @@ from sglang.srt.layers.moe import (
     MoeRunnerConfig,
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    select_musa_moe_runner,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import (
@@ -54,9 +55,6 @@ _is_musa = is_musa()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_MUSA_CONTIG_DEEPGEMM_TOKEN_THRESHOLD = (
-    envs.SGLANG_MUSA_CONTIG_DEEPGEMM_TOKEN_THRESHOLD.get()
-)
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -176,6 +174,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     ):
         super().__init__()
         self.use_flashinfer_cutlass = get_moe_runner_backend().is_flashinfer_cutlass()
+        self.use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
         self.use_triton_kernels = use_triton_kernels
         self.with_bias = False
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
@@ -391,6 +390,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+
         self.moe_runner_config = moe_runner_config
         if (
             not self.use_flashinfer_cutlass
@@ -398,8 +398,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             and not self.use_triton_kernels
             and self.is_musa_contig_deepgemm_hybrid_enabled()
         ):
-            # BF16 standard MoE follows the same MUSA hybrid policy as FP8:
-            # small batches stay on Triton, large batches use contiguous DeepGEMM.
+            # MUSA BF16 standard MoE hybrid policy: small batches stay on
+            # Triton, large batches use DeepGEMM. DeepGEMM's standard
+            # pre-permute selects contiguous GEMM for TP-only and masked GEMM
+            # for TP+EP.
             self.use_musa_contig_deepgemm = True
             self.triton_runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
             self.deep_gemm_runner = MoeRunner(
@@ -427,6 +429,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             backend = MoeRunnerBackend.TRITON_KERNELS
         else:
             backend = MoeRunnerBackend.TRITON
+
         self.runner = MoeRunner(backend, moe_runner_config)
 
         # Separate runner so CK-shape errors fall back to self.runner on every call.
@@ -469,10 +472,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         runner = self.runner
         if self.use_musa_contig_deepgemm:
-            runner = (
-                self.deep_gemm_runner
-                if x.shape[0] > _MUSA_CONTIG_DEEPGEMM_TOKEN_THRESHOLD
-                else self.triton_runner
+            runner = select_musa_moe_runner(
+                x.shape[0], self.triton_runner, self.deep_gemm_runner
             )
 
         backend = runner.runner_backend
@@ -506,8 +507,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             topk_output = dispatch_output.topk_output
             output = flashinfer_cutlass_fused_moe(
                 input=x,
-                token_selected_experts=topk_output.topk_ids,
-                token_final_scales=topk_output.topk_weights,
+                token_selected_experts=dispatch_output.topk_output.topk_ids,
+                token_final_scales=dispatch_output.topk_output.topk_weights,
                 fc1_expert_weights=layer.w13_weight,
                 fc2_expert_weights=layer.w2_weight,
                 output_dtype=x.dtype,

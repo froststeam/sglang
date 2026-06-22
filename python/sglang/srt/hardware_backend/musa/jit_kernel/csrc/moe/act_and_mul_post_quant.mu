@@ -20,6 +20,7 @@ constexpr int kGeluTanhActivation = 2;
 constexpr int kGroupSize = 128;
 constexpr int kThreadsPerGroup = 32;
 constexpr int kElemsPerThread = 4;
+constexpr int kMaskedRowsPerBlock = 8;
 constexpr float kFp8E4M3Max = 448.0f;
 constexpr float kLocalAbsMaxMin = 1.0e-10f;
 
@@ -76,59 +77,68 @@ __global__ void act_and_mul_masked_post_quant_kernel(
   const int subwarp_id = threadIdx.x / kThreadsPerGroup;
   const int lane_id = threadIdx.x - subwarp_id * kThreadsPerGroup;
   const int hidden_group = blockIdx.x * SUBWARPS_PER_BLOCK + subwarp_id;
-  const int token = blockIdx.y;
+  const int token_base = blockIdx.y * kMaskedRowsPerBlock;
   const int expert = blockIdx.z;
-  if (hidden_group >= hidden_groups || token >= masked_m[expert]) {
+  if (hidden_group >= hidden_groups || token_base >= masked_m[expert]) {
     return;
   }
 
   const int hidden = hidden_groups * kGroupSize;
   const int elem_offset = lane_id * kElemsPerThread;
-  const int64_t input_base =
-      (static_cast<int64_t>(expert) * tokens_per_expert + token) *
-          hidden * 2 +
-      hidden_group * kGroupSize + elem_offset;
-  const int64_t output_base =
-      (static_cast<int64_t>(expert) * tokens_per_expert + token) * hidden +
-      hidden_group * kGroupSize + elem_offset;
-
-  uint64_t gate_u64 = *reinterpret_cast<const uint64_t*>(input + input_base);
-  uint64_t up_u64 = *reinterpret_cast<const uint64_t*>(input + input_base + hidden);
-  auto gate_vec = reinterpret_cast<__mt_bfloat16*>(&gate_u64);
-  auto up_vec = reinterpret_cast<__mt_bfloat16*>(&up_u64);
-
-  float values[kElemsPerThread];
-  float local_absmax = kLocalAbsMaxMin;
+  const int valid_m = masked_m[expert];
 #pragma unroll
-  for (int i = 0; i < kElemsPerThread; ++i) {
-    __mt_bfloat16 gate_lowprec =
-        __float2bfloat16_rn(apply_activation_musa<ACTIVATION_TYPE>(__bfloat162float(gate_vec[i])));
-    __mt_bfloat16 val_lowprec = gate_lowprec * up_vec[i];
-    const float val = __bfloat162float(val_lowprec);
-    values[i] = val;
-    local_absmax = fmaxf(local_absmax, fabsf(val));
+  for (int r = 0; r < kMaskedRowsPerBlock; ++r) {
+    const int token = token_base + r;
+    if (token < tokens_per_expert && token < valid_m) {
+      const int64_t input_base =
+          (static_cast<int64_t>(expert) * tokens_per_expert + token) *
+              hidden * 2 +
+          hidden_group * kGroupSize + elem_offset;
+      const int64_t output_base =
+          (static_cast<int64_t>(expert) * tokens_per_expert + token) * hidden +
+          hidden_group * kGroupSize + elem_offset;
+
+      uint64_t gate_u64 = *reinterpret_cast<const uint64_t*>(input + input_base);
+      uint64_t up_u64 =
+          *reinterpret_cast<const uint64_t*>(input + input_base + hidden);
+      auto gate_vec = reinterpret_cast<__mt_bfloat16*>(&gate_u64);
+      auto up_vec = reinterpret_cast<__mt_bfloat16*>(&up_u64);
+
+      float values[kElemsPerThread];
+      float local_absmax = kLocalAbsMaxMin;
+#pragma unroll
+      for (int i = 0; i < kElemsPerThread; ++i) {
+        __mt_bfloat16 gate_lowprec = __float2bfloat16_rn(
+            apply_activation_musa<ACTIVATION_TYPE>(__bfloat162float(gate_vec[i])));
+        __mt_bfloat16 val_lowprec = gate_lowprec * up_vec[i];
+        const float val = __bfloat162float(val_lowprec);
+        values[i] = val;
+        local_absmax = fmaxf(local_absmax, fabsf(val));
+      }
+
+      local_absmax = GroupReduceMax<kThreadsPerGroup>(local_absmax, lane_id);
+      const float scale_inv = local_absmax / kFp8E4M3Max;
+      const float scale = kFp8E4M3Max / local_absmax;
+
+      if (lane_id == 0) {
+        const int64_t scale_offset =
+            (static_cast<int64_t>(expert) * tokens_per_expert + token) *
+                hidden_groups +
+            hidden_group;
+        output_scale[scale_offset] = scale_inv;
+      }
+
+      float4 out4 = {
+          values[0] * scale,
+          values[1] * scale,
+          values[2] * scale,
+          values[3] * scale,
+      };
+      const uint32_t packed =
+          __musa_cvt_float4_to_fp8x4(out4, __MT_SATFINITE, __MT_E4M3);
+      *reinterpret_cast<uint32_t*>(output + output_base) = packed;
+    }
   }
-
-  local_absmax = GroupReduceMax<kThreadsPerGroup>(local_absmax, lane_id);
-  const float scale_inv = local_absmax / kFp8E4M3Max;
-  const float scale = kFp8E4M3Max / local_absmax;
-
-  if (lane_id == 0) {
-    const int64_t scale_offset =
-        (static_cast<int64_t>(expert) * tokens_per_expert + token) *
-            hidden_groups +
-        hidden_group;
-    output_scale[scale_offset] = scale_inv;
-  }
-
-  float4 out4 = {
-      values[0] * scale,
-      values[1] * scale,
-      values[2] * scale,
-      values[3] * scale,
-  };
-  const uint32_t packed = __musa_cvt_float4_to_fp8x4(out4, __MT_SATFINITE, __MT_E4M3);
-  *reinterpret_cast<uint32_t*>(output + output_base) = packed;
 }
 
 template <int ACTIVATION_TYPE>
@@ -145,7 +155,12 @@ void launch_act_and_mul_masked_post_quant(
   const int subwarps_per_block =
       (hidden_groups % 8 == 0) ? 8 : ((hidden_groups % 4 == 0) ? 4 : ((hidden_groups % 2 == 0) ? 2 : 1));
 
-  dim3 grid((hidden_groups + subwarps_per_block - 1) / subwarps_per_block, tokens_per_expert, experts);
+  const int row_tiles =
+      (tokens_per_expert + kMaskedRowsPerBlock - 1) / kMaskedRowsPerBlock;
+  dim3 grid(
+      (hidden_groups + subwarps_per_block - 1) / subwarps_per_block,
+      row_tiles,
+      experts);
   dim3 block(subwarps_per_block * kThreadsPerGroup);
 
   if (subwarps_per_block == 8) {

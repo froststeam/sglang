@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 from urllib.parse import unquote
 
-
 ARTIFACT_ROOT = Path("ci_artifacts/musa-smoke")
 SUMMARY_ROOT = Path("ci_artifacts/musa-smoke-summary")
 
@@ -113,9 +112,7 @@ def main() -> None:
         lines.append(
             "| Model | Examples | Score | Throughput(tok/s) | Empty | Invalid |"
         )
-        lines.append(
-            "| --- | ---: | ---: | ---: | ---: | ---: |"
-        )
+        lines.append("| --- | ---: | ---: | ---: | ---: | ---: |")
         for row in rows:
             metrics = row["metrics"]
             lines.append(

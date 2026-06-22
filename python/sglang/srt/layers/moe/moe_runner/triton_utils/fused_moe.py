@@ -71,13 +71,15 @@ elif _is_xpu:
     from sgl_kernel import moe_sum_reduce, silu_and_mul
 elif _is_musa:
     from sglang.srt.hardware_backend.musa.jit_kernel import (
-        moe_act_and_mul,
+        act_and_mul as moe_act_and_mul,
+    )
+    from sglang.srt.hardware_backend.musa.jit_kernel import (
         moe_sum_reduce,
     )
 
 # Try to import vllm_ops for non-CUDA/HIP/XPU platforms
 _has_vllm_ops = False
-if not _is_cuda and not _is_hip and not _is_xpu:
+if not _is_cuda and not _is_hip and not _is_xpu and not _is_musa:
     try:
         from vllm import _custom_ops as vllm_ops
 

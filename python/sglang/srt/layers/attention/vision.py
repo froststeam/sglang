@@ -46,15 +46,12 @@ if _is_cuda:
     )
 
 if _is_musa:
+    from flash_attn_interface import flash_attn_varlen_func
+    from sgl_kernel import musa_rotary_embedding_contiguous
 
     def flash_attn_func(*args, ver: int = 3, **kwargs):
-        from flash_attn_interface import flash_attn_varlen_func
-
         return flash_attn_varlen_func(*args, **kwargs)
 
-
-if _is_musa:
-    from flash_attn_interface import flash_attn_varlen_func
 
 if _is_npu:
     import torch_npu
@@ -76,7 +73,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_bool_env_var
+from sglang.srt.utils import add_prefix
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -440,7 +437,10 @@ class VisionFlash3Attention(nn.Module):
             cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
             cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
             seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            max_seqlen = seq_lens.max().item()
+            if _is_musa:
+                max_seqlen = int(seq_lens.detach().cpu().max().item())
+            else:
+                max_seqlen = seq_lens.max().item()
 
             fa_kwargs = dict(
                 cu_seqlens_q=cu_seqlens,
@@ -1037,6 +1037,8 @@ class VisionAttention(nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         rotary_pos_emb_cos: Optional[torch.Tensor] = None,
         rotary_pos_emb_sin: Optional[torch.Tensor] = None,
+        rotary_pos_emb_cache: Optional[torch.Tensor] = None,
+        rotary_pos_emb_positions: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         full_attn: bool = True,
         **kwargs,
@@ -1127,9 +1129,19 @@ class VisionAttention(nn.Module):
             q = q.view(-1, head, self.head_size)
             k = k.view(-1, kv_head, self.head_size)
 
-            if cos.size(-1) * 2 == self.head_size:
-                cos = torch.cat([cos, cos], dim=-1)
-                sin = torch.cat([sin, sin], dim=-1)
+            if rotary_pos_emb_cache is not None:
+                musa_rotary_embedding_contiguous(
+                    rotary_pos_emb_positions,
+                    q,
+                    k,
+                    self.head_size,
+                    rotary_pos_emb_cache,
+                    True,
+                )
+            else:
+                if cos.size(-1) * 2 == self.head_size:
+                    cos = torch.cat([cos, cos], dim=-1)
+                    sin = torch.cat([sin, sin], dim=-1)
 
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
             q = q.view(original_q_shape)

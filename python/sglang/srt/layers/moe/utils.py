@@ -3,8 +3,9 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -18,6 +19,48 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class MusaMoeBucket:
+    max_tokens: int
+    backend: str
+    block_m: Optional[int] = None
+
+
+_MUSA_MOE_BUCKET_POLICY: tuple[MusaMoeBucket, ...] | None = None
+
+
+def get_musa_moe_bucket_policy() -> tuple[MusaMoeBucket, ...] | None:
+    return _MUSA_MOE_BUCKET_POLICY
+
+
+def set_musa_moe_bucket_policy(policy: tuple[MusaMoeBucket, ...] | None) -> None:
+    global _MUSA_MOE_BUCKET_POLICY
+    _MUSA_MOE_BUCKET_POLICY = policy
+
+
+def select_musa_moe_runner(
+    num_tokens: int,
+    triton_runner: Any,
+    deep_gemm_runner: Any,
+) -> Any:
+    if _MUSA_MOE_BUCKET_POLICY is not None:
+        for bucket in _MUSA_MOE_BUCKET_POLICY:
+            if num_tokens <= bucket.max_tokens:
+                if bucket.backend == "triton":
+                    return triton_runner
+                if bucket.block_m is not None:
+                    deep_gemm_runner.contiguous_gemm_block_m = bucket.block_m
+                return deep_gemm_runner
+        last_bucket = _MUSA_MOE_BUCKET_POLICY[-1]
+        if last_bucket.backend == "triton":
+            return triton_runner
+        if last_bucket.block_m is not None:
+            deep_gemm_runner.contiguous_gemm_block_m = last_bucket.block_m
+        return deep_gemm_runner
+
+    return triton_runner
 
 
 class MoeA2ABackend(Enum):

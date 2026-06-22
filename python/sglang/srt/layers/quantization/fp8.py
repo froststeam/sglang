@@ -34,6 +34,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_padding_size,
     get_moe_runner_backend,
     get_moe_weight_sizes,
+    select_musa_moe_runner,
 )
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
@@ -111,14 +112,6 @@ _is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
-# XXX (MUSA): Standard FP8 MoE uses Triton for small batches and contiguous
-# DeepGEMM for larger batches on MUSA. These cutoffs are selected from the
-# Qwen3.5-35B-A3B FP8 TP1 measurements on MTT S5000.
-_MUSA_TRITON_MOE_MAX_TOKENS = 8192
-_MUSA_CONTIG_BLOCK_M_256_MIN_TOKENS = 32768
-_MUSA_CONTIG_DEEPGEMM_BLOCK_M_SMALL = 128
-_MUSA_CONTIG_DEEPGEMM_BLOCK_M_LARGE = 256
-
 if _use_aiter or _use_hip_int4:
     from aiter.ops.shuffle import shuffle_weight
 
@@ -875,23 +868,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             and get_moe_a2a_backend().is_none()
             and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
         )
-
-    @staticmethod
-    def select_musa_moe_runner(
-        num_tokens: int, triton_runner: MoeRunner, deep_gemm_runner: MoeRunner
-    ) -> MoeRunner:
-        if num_tokens < _MUSA_TRITON_MOE_MAX_TOKENS:
-            return triton_runner
-
-        if num_tokens < _MUSA_CONTIG_BLOCK_M_256_MIN_TOKENS:
-            deep_gemm_runner.contiguous_gemm_block_m = (
-                _MUSA_CONTIG_DEEPGEMM_BLOCK_M_SMALL
-            )
-        else:
-            deep_gemm_runner.contiguous_gemm_block_m = (
-                _MUSA_CONTIG_DEEPGEMM_BLOCK_M_LARGE
-            )
-        return deep_gemm_runner
 
     def create_weights(
         self,
@@ -1674,7 +1650,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         if self.is_musa_contig_deepgemm_hybrid_enabled():
             # XXX (MUSA): Keep the default small-token path on Triton, but switch
-            # large standard MoE batches to contiguous DeepGEMM.
+            # large standard MoE batches to DeepGEMM. DeepGEMM's standard
+            # pre-permute selects contiguous GEMM for TP-only and masked GEMM
+            # for TP+EP.
             self.use_musa_contig_deepgemm = True
             self.triton_runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
             self.deep_gemm_runner = MoeRunner(
@@ -1824,7 +1802,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         runner = self.runner
         if self.use_musa_contig_deepgemm:
-            runner = self.select_musa_moe_runner(
+            runner = select_musa_moe_runner(
                 x.shape[0], self.triton_runner, self.deep_gemm_runner
             )
 

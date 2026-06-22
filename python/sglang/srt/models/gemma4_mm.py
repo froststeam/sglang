@@ -221,7 +221,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         # Create logits processor for the multimodal model
         self.logits_processor = LogitsProcessor(config.text_config)
-        self.capture_aux_hidden_states = False
 
         self.post_init()
 
@@ -256,11 +255,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
-
-    def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Gemma 4 multimodal ties its LM head to the text embed_tokens
-        embed = self.language_model.embed_tokens.weight
-        return embed, embed
 
     def get_attention_sliding_window_size(self):
         return getattr(self.config.text_config, "sliding_window", -1) - 1
@@ -602,11 +596,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         # Process hidden states through logits processor
         return self.logits_processor(
-            input_ids,
-            hidden_states,
-            self.language_model.embed_tokens,
-            forward_batch,
-            aux_hidden_states,
+            input_ids, hidden_states, self.language_model.embed_tokens, forward_batch
         )
 
     def tie_weights(self, recompute_mapping=False):

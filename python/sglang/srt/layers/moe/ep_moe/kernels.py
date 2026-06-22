@@ -3,6 +3,7 @@ import logging
 import torch
 import triton
 
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import ceil_div, is_cuda, is_musa
 
 logger = logging.getLogger(__name__)
@@ -505,7 +506,16 @@ def silu_and_mul_masked_fwd(
     assert input.shape[0] == masked_m.shape[0]
     assert input.shape[-1] % 2 == 0
 
+    if _is_musa:
+        from sglang.srt.hardware_backend.musa.jit_kernel.csrc.moe import (
+            act_and_mul_masked,
+        )
+
+        act_and_mul_masked(input, output, masked_m, activation="silu")
+        return output
+
     size_n = input.shape[-1] // 2
+
     expert_num = len(masked_m)
 
     if expert_num < 4:
@@ -956,7 +966,9 @@ def ep_scatter(
     output_index: torch.Tensor,
     scale_ue8m0: bool = False,
 ):
-    BLOCK_E = 128  # token num of per expert is aligned to 128
+    BLOCK_E = (
+        deep_gemm_wrapper.DEEPGEMM_BLOCK_M
+    )  # token num of per expert is aligned to 128
     BLOCK_D = 128  # block size of quantization
     num_warps = 8
     num_experts = num_recv_tokens_per_expert.shape[0]
@@ -1249,6 +1261,7 @@ def fill_gateup_input_triton_kernel(
     hidden_size,
     scale_size,
     BLOCK_SIZE: tl.constexpr,
+    IS_FP8: tl.constexpr,
 ):
 
     src_idx_int32 = tl.program_id(0)
@@ -1256,7 +1269,8 @@ def fill_gateup_input_triton_kernel(
     src2dst_ptr = src2dst_ptr + src_idx * topk
     topk_ids_ptr = topk_ids_ptr + src_idx * topk
     src_ptr = input_ptr + src_idx * hidden_size
-    scale_src_ptr = scale_ptr + src_idx * scale_size
+    if IS_FP8:
+        scale_src_ptr = scale_ptr + src_idx * scale_size
 
     vec = tl.arange(0, BLOCK_SIZE)
     for idx in range(topk):
@@ -1270,12 +1284,14 @@ def fill_gateup_input_triton_kernel(
                 mask = offset < hidden_size
                 in_data = tl.load(src_ptr + offset, mask=mask)
                 tl.store(dst_ptr + offset, in_data, mask=mask)
-            scale_dst_ptr = gateup_input_scale_ptr + dst_idx * scale_size
-            for start_offset in tl.range(0, scale_size, BLOCK_SIZE):
-                offset = start_offset + vec
-                mask = offset < scale_size
-                in_scale = tl.load(scale_src_ptr + offset, mask=mask)
-                tl.store(scale_dst_ptr + offset, in_scale, mask=mask)
+
+            if IS_FP8:
+                scale_dst_ptr = gateup_input_scale_ptr + dst_idx * scale_size
+                for start_offset in tl.range(0, scale_size, BLOCK_SIZE):
+                    offset = start_offset + vec
+                    mask = offset < scale_size
+                    in_scale = tl.load(scale_src_ptr + offset, mask=mask)
+                    tl.store(scale_dst_ptr + offset, in_scale, mask=mask)
 
 
 def moe_ep_deepgemm_preprocess(
@@ -1286,6 +1302,73 @@ def moe_ep_deepgemm_preprocess(
     block_shape,
     output_dtype: torch.dtype = torch.float8_e4m3fn,
 ):
+    if block_shape is None:
+        block_shape = [128, 128]
+    assert len(block_shape) == 2
+    block_n, block_k = block_shape[0], block_shape[1]
+    is_fp8 = output_dtype == torch.float8_e4m3fn
+
+    expected_m = (topk_ids.numel() - 1) // num_local_experts + 1
+
+    can_use_musa_fused_preprocess = (
+        _is_musa
+        and hidden_states.dtype == torch.bfloat16
+        and topk_ids.dtype == torch.int32
+        and topk_ids.dim() == 2
+        and top_k == topk_ids.shape[-1]
+        and top_k <= 16
+        and hidden_states.size(1) % 128 == 0
+        and block_n == 128
+        and block_k == 128
+        and (is_fp8 or output_dtype == torch.bfloat16)
+    )
+    if can_use_musa_fused_preprocess:
+        from sglang.srt.hardware_backend.musa.jit_kernel.csrc.moe import (
+            deep_gemm_ep_preprocess,
+        )
+
+        # For masked grouped GEMM, shape M should be a multiple of the block M.
+        # Use expected_m as the per-expert buffer bound so EP+topk paths are not
+        # capped by the original token count.
+        m_max = ceil_div(expected_m, 256) * 256
+        masked_m = torch.empty(
+            num_local_experts, device=topk_ids.device, dtype=torch.int32
+        )
+        src2dst = torch.empty(
+            topk_ids.numel(), device=topk_ids.device, dtype=torch.int32
+        )
+        gateup_input = torch.empty(
+            (num_local_experts, m_max, hidden_states.size(1)),
+            device=hidden_states.device,
+            dtype=output_dtype,
+        )
+        if is_fp8:
+            gateup_input_scale = torch.empty(
+                (num_local_experts, m_max, hidden_states.size(1) // block_k),
+                device=hidden_states.device,
+                dtype=torch.float32,
+            )
+        else:
+            gateup_input_scale = None
+
+        deep_gemm_ep_preprocess(
+            topk_ids,
+            hidden_states,
+            masked_m,
+            src2dst,
+            gateup_input,
+            gateup_input_scale,
+            num_local_experts,
+            is_fp8,
+        )
+        return (
+            masked_m,
+            expected_m,
+            src2dst,
+            gateup_input,
+            gateup_input_scale,
+        )
+
     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
     seg_indptr = torch.zeros(
         num_local_experts + 1, device=topk_ids.device, dtype=torch.int64
@@ -1300,9 +1383,8 @@ def moe_ep_deepgemm_preprocess(
     grid = lambda meta: (triton.cdiv(topk_ids.numel(), meta["BLOCK_SIZE"]),)
     compute_masked_m_triton_kernel[(num_local_experts,)](seg_indptr, masked_m)
 
-    # For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m}) https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/jit_kernels/m_grouped_gemm.py#L165
+    # Keep the original fallback sizing for non-MUSA / unsupported shapes.
     m_max = (hidden_states.size(0) // 256 + 1) * 256
-    expected_m = (topk_ids.numel() - 1) // num_local_experts + 1
     gateup_input = torch.empty(
         (num_local_experts, m_max, hidden_states.size(1)),
         device=hidden_states.device,
@@ -1319,19 +1401,18 @@ def moe_ep_deepgemm_preprocess(
         BLOCK_SIZE=256,
     )
 
-    if block_shape is None:
-        block_shape = [128, 128]
-    assert len(block_shape) == 2
-    block_n, block_k = block_shape[0], block_shape[1]
+    if is_fp8:
+        # TODO: fuse this with the preprocess
+        hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
 
-    # TODO: fuse this with the preprocess
-    hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
-
-    gateup_input_scale = torch.empty(
-        (gateup_input.size(0), gateup_input.size(1), scale.size(1)),
-        device=hidden_states.device,
-        dtype=scale.dtype,
-    )
+        gateup_input_scale = torch.empty(
+            (gateup_input.size(0), gateup_input.size(1), scale.size(1)),
+            device=hidden_states.device,
+            dtype=scale.dtype,
+        )
+    else:
+        scale = None
+        gateup_input_scale = None
 
     fill_gateup_input_triton_kernel[(hidden_states.shape[0],)](
         hidden_states,
@@ -1342,8 +1423,9 @@ def moe_ep_deepgemm_preprocess(
         topk_ids,
         top_k,
         hidden_states.size(1),
-        scale.size(1),
+        scale.size(1) if is_fp8 else 0,
         BLOCK_SIZE=1024,
+        IS_FP8=is_fp8,
     )
 
     return (

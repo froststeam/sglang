@@ -47,8 +47,8 @@ def grouped_gemm_nt_f8f8bf16_masked(
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
 
-    lhs = _ensure_cuda(lhs)
-    rhs = _ensure_cuda(rhs)
+    lhs = _ensure_device(lhs, out.device)
+    rhs = _ensure_device(rhs, out.device)
 
     with compile_utils.deep_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
@@ -82,12 +82,13 @@ def grouped_gemm_nt_f8f8bf16_masked(
             )
 
 
-def _ensure_cuda(
+def _ensure_device(
     pair: Tuple[torch.Tensor, torch.Tensor],
+    device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     return (
-        pair[0].cuda() if not pair[0].is_cuda else pair[0],
-        pair[1].cuda() if not pair[1].is_cuda else pair[1],
+        pair[0].to(device=device) if pair[0].device != device else pair[0],
+        pair[1].to(device=device) if pair[1].device != device else pair[1],
     )
 
 

@@ -59,8 +59,6 @@ if _is_cuda:
     )
 elif _is_xpu:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
-elif _is_hip:
-    from sgl_kernel import gelu_and_mul, gelu_quick, gelu_tanh_and_mul, silu_and_mul
 elif _is_musa:
     from sglang.srt.hardware_backend.musa.jit_kernel import act_and_mul
     from sglang.srt.utils.patch_torch import register_fake_if_exists
@@ -71,6 +69,8 @@ elif _is_musa:
         output_shape = x.shape[:-1] + (d,)
         return torch.empty(output_shape, dtype=x.dtype, device=x.device)
 
+elif _is_hip:
+    from sgl_kernel import gelu_and_mul, gelu_quick, gelu_tanh_and_mul, silu_and_mul
 
 
 if is_npu():

@@ -1,7 +1,7 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_musa_ci
 from sglang.test import musa_server_smoke
+from sglang.test.ci.ci_register import register_musa_ci
 
 register_musa_ci(est_time=600, suite="stage-a-test-4-gpu-musa-smoke")
 

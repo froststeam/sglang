@@ -32,6 +32,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
     is_hip,
+    is_musa,
     is_npu,
 )
 
@@ -39,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 global _use_multi_stream
 _is_cuda = is_cuda()
+_is_musa = is_musa()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -211,7 +213,7 @@ class Indexer(MultiPlatformOp):
         else:
             self.cp_size = None
             self.cp_rank = None
-        if _is_cuda:
+        if _is_cuda or _is_musa:
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
             pp_size = get_global_server_args().pp_size
@@ -1044,7 +1046,7 @@ class Indexer(MultiPlatformOp):
 
         # Fast path: JIT fused store (CUDA, page_size=64, non-fnuz)
         if (
-            _is_cuda
+            (_is_cuda or _is_musa)
             and (not _is_fp8_fnuz)
             and can_use_nsa_fused_store(
                 key.dtype,
@@ -1160,6 +1162,8 @@ class Indexer(MultiPlatformOp):
                 max_kv_len = forward_batch.seq_lens_cpu.max().item()
                 skip_logits_computation = max_kv_len <= self.index_topk
 
+        # XXX (MUSA): always use nsa indexer
+        skip_logits_computation = False
         # Optimization: fast path when skipping topk computation
         if skip_logits_computation and (not self.nsa_enable_prefill_cp):
             return maybe_capture_indexer_topk(
@@ -1263,7 +1267,7 @@ class Indexer(MultiPlatformOp):
 
             weights = self._get_logits_head_gate(x_for_gate, q_scale)
 
-        if _is_cuda or _is_hip:
+        if _is_cuda or _is_hip or _is_musa:
             assert forward_batch.seq_lens_cpu is not None
             if len(forward_batch.seq_lens_cpu) == 0:
                 # this seems b/c max-pad, no worries?
