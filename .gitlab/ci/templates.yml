@@ -21,7 +21,7 @@
 .rules-merge-request:
   rules:
     # Add target branches to this regex when enabling MR pipelines for more branches.
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^musa\/v0\.5\.10\.post1$/'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^musa\/(v0\.5\.10\.post1|0\.5\.12\.post1)$/'
       changes:
         - .gitlab-ci.yml
         - .gitlab/ci/**/*
@@ -35,7 +35,7 @@
 .rules-merge-request-always:
   rules:
     # Add target branches to this regex when enabling MR pipelines for more branches.
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^musa\/v0\.5\.10\.post1$/'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^musa\/(v0\.5\.10\.post1|0\.5\.12\.post1)$/'
       changes:
         - .gitlab-ci.yml
         - .gitlab/ci/**/*
