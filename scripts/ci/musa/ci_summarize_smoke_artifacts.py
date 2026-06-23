@@ -75,6 +75,8 @@ def main() -> None:
                 rows.append(
                     {
                         "model": display_model_name(manifest.get("smoke_model", "")),
+                        "tp": manifest.get("smoke_tp", ""),
+                        "ep": manifest.get("smoke_ep", ""),
                         "suite": manifest.get("musa_run_suite", ""),
                         "file": "",
                         "metrics": {},
@@ -94,6 +96,8 @@ def main() -> None:
                 rows.append(
                     {
                         "model": model_name(metrics, manifest, json_file),
+                        "tp": manifest.get("smoke_tp", ""),
+                        "ep": manifest.get("smoke_ep", ""),
                         "suite": manifest.get("musa_run_suite", ""),
                         "file": str(json_file),
                         "metrics": metrics,
@@ -110,14 +114,18 @@ def main() -> None:
         lines.append("No MUSA smoke artifacts were found.")
     else:
         lines.append(
-            "| Model | Examples | Score | Throughput(tok/s) | Empty | Invalid |"
+            "| Model | TP | EP | Examples | Score | Throughput(tok/s) | Empty | Invalid |"
         )
-        lines.append("| --- | ---: | ---: | ---: | ---: | ---: |")
+        lines.append(
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        )
         for row in rows:
             metrics = row["metrics"]
             lines.append(
-                "| `{}` | {} | {} | {} | {} | {} |".format(
+                "| `{}` | {} | {} | {} | {} | {} | {} | {} |".format(
                     row["model"],
+                    row.get("tp", ""),
+                    row.get("ep", ""),
                     fmt_int(metrics.get("num_examples_actual")),
                     fmt(metrics.get("score")),
                     fmt(metrics.get("output_throughput")),
