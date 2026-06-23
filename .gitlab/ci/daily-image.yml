@@ -406,7 +406,7 @@ daily:image-build:
       musa_version="${MUSA_VERSION:-4.3.5}"
       torch_version="${TORCH_VERSION:-2.9.0}"
       sglang_image_tag="${SGLANG_IMAGE_TAG:-${sglang_version}-${gpu_tag}${cpu_arch_tag_part}-${musa_version}-torch${torch_version}-${BUILD_TS}}"
-      sglang_channel_tag="${SGLANG_SYNC_CHANNEL_TAG:-offline-sync-candidate}"
+      sglang_channel_tag="${SGLANG_SYNC_CHANNEL_TAG:-${sglang_version}-${gpu_tag}${cpu_arch_tag_part}-${musa_version}-torch${torch_version}-latest}"
       sglang_channel_repo="${SGLANG_SYNC_CHANNEL_REPO:-${primary_sglang_repo}}"
 
       write_nightly_dotenv() {
