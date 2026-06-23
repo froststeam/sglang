@@ -6,7 +6,10 @@ daily:image-build:
   artifacts:
     when: always
     expire_in: 30 days
+    reports:
+      dotenv: ci_artifacts/daily-image.env
     paths:
+      - ci_artifacts/daily-image.env
       - ci_artifacts/daily-image-changelog.txt
       - ci_artifacts/daily-image-changelog-summary.txt
   script:
@@ -296,6 +299,7 @@ daily:image-build:
       mkdir -p ci_artifacts
       changelog_file="ci_artifacts/daily-image-changelog.txt"
       changelog_summary_file="ci_artifacts/daily-image-changelog-summary.txt"
+      nightly_dotenv_file="ci_artifacts/daily-image.env"
       {
         echo "SGLang daily image changelog"
         echo "Ref: ${SGLANG_REF}"
@@ -351,8 +355,74 @@ daily:image-build:
       export DINGTALK_CHANGELOG_SUMMARY_FILE="${CI_PROJECT_DIR:-$(pwd)}/${changelog_summary_file}"
       export DINGTALK_PIPELINE_URL="${CI_PIPELINE_URL:-}"
 
+      build_date="$(TZ=Asia/Shanghai date +%Y%m%d)"
+      short_sha="${current_sha:0:8}"
+      if [ "${CI_PIPELINE_SOURCE}" = "schedule" ]; then
+        export BUILD_TS="${build_date}"
+      else
+        export BUILD_TS="${build_date}-${short_sha}"
+      fi
+      echo "Daily image build timestamp: ${BUILD_TS}"
+
+      primary_sglang_repo="${SGLANG_NIGHTLY_IMAGE_REPO:-registry.mthreads.com/mcconline/inference/sglang}"
+      if [ -n "${SGLANG_IMAGE_REPOS:-}" ]; then
+        primary_sglang_repo="$(printf '%s\n' "${SGLANG_IMAGE_REPOS}" | awk '{ print $1; exit }')"
+      fi
+      sglang_version="${SGLANG_VERSION:-v0.5.12.post1}"
+      gpu_tag="${GPU_TAG:-ph1}"
+      cpu_arch="${CPU_ARCH:-auto}"
+      if [ "${cpu_arch}" = "auto" ]; then
+        machine="$(uname -m 2>/dev/null || true)"
+        cpu_info=""
+        if command -v lscpu >/dev/null 2>&1; then
+          cpu_info="$(lscpu 2>/dev/null || true)"
+        elif [ -r /proc/cpuinfo ]; then
+          cpu_info="$(cat /proc/cpuinfo 2>/dev/null || true)"
+        fi
+        case "${machine}" in
+          x86_64|amd64)
+            if printf '%s\n' "${cpu_info}" | grep -qi 'Hygon'; then
+              cpu_arch="hygon"
+            else
+              cpu_arch="amd64"
+            fi
+            ;;
+          aarch64|arm64)
+            if printf '%s\n' "${cpu_info}" | grep -qi 'Phytium'; then
+              cpu_arch="phytium"
+            else
+              cpu_arch="arm64"
+            fi
+            ;;
+          *)
+            cpu_arch="$(printf '%s' "${machine}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_.-' '-')"
+            ;;
+        esac
+      fi
+      cpu_arch_tag_part=""
+      if [ -n "${cpu_arch}" ] && [ "${cpu_arch}" != "amd64" ]; then
+        cpu_arch_tag_part="-${cpu_arch}"
+      fi
+      musa_version="${MUSA_VERSION:-4.3.5}"
+      torch_version="${TORCH_VERSION:-2.9.0}"
+      sglang_image_tag="${SGLANG_IMAGE_TAG:-${sglang_version}-${gpu_tag}${cpu_arch_tag_part}-${musa_version}-torch${torch_version}-${BUILD_TS}}"
+      sglang_channel_tag="${SGLANG_SYNC_CHANNEL_TAG:-offline-sync-candidate}"
+      sglang_channel_repo="${SGLANG_SYNC_CHANNEL_REPO:-${primary_sglang_repo}}"
+
+      write_nightly_dotenv() {
+        image="$1"
+        {
+          printf 'SGLANG_NIGHTLY_REF=%s\n' "${SGLANG_REF}"
+          printf 'SGLANG_NIGHTLY_SOURCE_SHA=%s\n' "${current_sha}"
+          printf 'SGLANG_NIGHTLY_IMAGE=%s\n' "${image}"
+          printf 'SGLANG_NIGHTLY_SHORT_SHA_IMAGE=%s:%s\n' "${primary_sglang_repo}" "${short_sha}"
+          printf 'SGLANG_NIGHTLY_CHANNEL_IMAGE=%s:%s\n' "${sglang_channel_repo}" "${sglang_channel_tag}"
+        } > "${nightly_dotenv_file}"
+      }
+
       if [ "${force_image_build}" != "1" ] && [ "${source_inputs_changed}" = "0" ] && [ "${sglang_musa_base_inputs_changed}" = "0" ]; then
         echo "No source or musa-base input update since last successful image build. Skip."
+        write_nightly_dotenv "${primary_sglang_repo}:${short_sha}"
         printf '%s\n' "${current_sha}" > "${state_file}"
         printf '%s\n' "${build_fingerprint}" > "${fingerprint_file}"
         printf '%s\n' "${musa_base_fingerprint}" > "${musa_base_fingerprint_file}"
@@ -363,15 +433,6 @@ daily:image-build:
       if [ "${force_image_build}" = "1" ] && [ "${source_inputs_changed}" = "0" ] && [ "${sglang_musa_base_inputs_changed}" = "0" ]; then
         echo "FORCE_IMAGE_BUILD=1; build sglang image even without source or musa-base input updates."
       fi
-
-      build_date="$(TZ=Asia/Shanghai date +%Y%m%d)"
-      short_sha="${current_sha:0:8}"
-      if [ "${CI_PIPELINE_SOURCE}" = "schedule" ]; then
-        export BUILD_TS="${build_date}"
-      else
-        export BUILD_TS="${build_date}-${short_sha}"
-      fi
-      echo "Daily image build timestamp: ${BUILD_TS}"
 
       export BUILD_BASE=0
       export BUILD_MUSA_BASE="${musa_base_inputs_changed}"
@@ -398,3 +459,4 @@ daily:image-build:
       printf '%s\n' "${musa_base_fingerprint}" > "${musa_base_fingerprint_file}"
       printf '%s\n' "${current_musa_base_inputs}" > "${musa_base_inputs_file}"
       printf '%s\n' "${current_musa_base_inputs}" > "${sglang_musa_base_inputs_file}"
+      write_nightly_dotenv "${primary_sglang_repo}:${sglang_image_tag}"

@@ -35,3 +35,31 @@ nightly:4gpu-musa:
   script:
     - cd test
     - python3 run_suite.py --hw "$MUSA_RUN_SUITE_HW" --suite nightly-4-gpu-musa --nightly --timeout-per-file 3600 --continue-on-error
+
+nightly:smart-launcher-regression:
+  stage: nightly
+  tags:
+    - e2e-runner
+  timeout: 12h
+  needs:
+    - job: daily:image-build
+      artifacts: true
+      optional: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $NIGHTLY_E2E == "1"'
+    - if: '$CI_PIPELINE_SOURCE == "web" && $NIGHTLY_E2E == "1"'
+    - when: never
+  variables:
+    SGLANG_TEST_REF: "origin/master"
+    SMART_LAUNCHER_SUITE: "remote_jingdong_best_baseline"
+    SMART_LAUNCHER_REMOTE: "ci_env"
+    TEST_CONTAINER_NODES: "mccxadmin@10.20.35.95 mccxadmin@10.20.35.96"
+    TEST_IMAGE: "$SGLANG_NIGHTLY_IMAGE"
+  script:
+    - bash ci/run_smart_launcher_nightly.sh
+  artifacts:
+    when: always
+    expire_in: 14 days
+    expose_as: "Smart Launcher report"
+    paths:
+      - ci_artifacts/smart_launcher/
