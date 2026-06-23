@@ -49,7 +49,8 @@ def _build_server_args(case: MusaSmokeCase) -> list[str]:
         _split_args(
             os.getenv(
                 "MUSA_SMOKE_COMMON_EXTRA_ARGS",
-                "--disable-cuda-graph --disable-piecewise-cuda-graph",
+                "--disable-cuda-graph --disable-piecewise-cuda-graph "
+                "--attention-backend fa3 --disable-overlap-schedule",
             )
         )
     )
