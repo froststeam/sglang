@@ -73,6 +73,7 @@ mr:musa-server-smoke:1gpu:
     - .musa-registered-suite-job
   variables:
     MUSA_RUN_SUITE: "stage-a-test-1-gpu-musa-smoke"
+    MUSA_SMOKE_COMMON_EXTRA_ARGS: "--disable-piecewise-cuda-graph --attention-backend fa3 --disable-overlap-schedule"
     MUSA_SMOKE_QWEN_DENSE_MODEL: "/data/models/Qwen3-8B"
     MUSA_SMOKE_GSM8K_DATA_PATH: "/data/eval/gsm8k/test.jsonl"
     MUSA_SMOKE_GSM8K_NUM_EXAMPLES: "16"
@@ -89,7 +90,7 @@ mr:musa-server-smoke:2gpu:
     - .musa-registered-suite-job
   variables:
     MUSA_RUN_SUITE: "stage-a-test-2-gpu-musa-smoke"
-    MUSA_SMOKE_COMMON_EXTRA_ARGS: "--disable-piecewise-cuda-graph"
+    MUSA_SMOKE_COMMON_EXTRA_ARGS: "--disable-piecewise-cuda-graph --attention-backend fa3 --disable-overlap-schedule"
     MUSA_SMOKE_QWEN_DENSE_TP_MODEL: "/data/models/Qwen3-32B"
     MUSA_SMOKE_QWEN_DENSE_TP_EXTRA_ARGS: "--disable-radix-cache --max-running-requests 128 --cuda-graph-bs 1 2 4 8 16 32 64 128"
     MUSA_SMOKE_GSM8K_DATA_PATH: "/data/eval/gsm8k/test.jsonl"
@@ -109,7 +110,7 @@ mr:musa-server-smoke:joyai-llm-flash-4gpu:
   variables:
     MUSA_RUN_SUITE: "stage-a-test-4-gpu-musa-joyai-llm-flash-smoke"
     MUSA_RUN_SUITE_TIMEOUT_PER_FILE: "1800"
-    MUSA_SMOKE_COMMON_EXTRA_ARGS: "--disable-piecewise-cuda-graph"
+    MUSA_SMOKE_COMMON_EXTRA_ARGS: "--disable-piecewise-cuda-graph --attention-backend fa3 --disable-overlap-schedule"
     MUSA_SMOKE_JOYAI_LLM_FLASH_MODEL: "/data/models/JoyAI-LLM-Flash"
     MUSA_SMOKE_JOYAI_LLM_FLASH_EXTRA_ARGS: "--ep 4 --moe-runner-backend triton --chunked-prefill-size 2048 --max-running-requests 64 --cuda-graph-bs 1 2 4 8 16 32 48 64 --watchdog-timeout 900"
     MUSA_SMOKE_GSM8K_DATA_PATH: "/data/eval/gsm8k/test.jsonl"
@@ -130,7 +131,7 @@ mr:musa-server-smoke:qwen35-35b-a3b-fp8-4gpu:
     MUSA_RUN_SUITE: "stage-a-test-4-gpu-musa-smoke"
     MUSA_RUN_SUITE_TIMEOUT_PER_FILE: "1800"
     MUSA_SMOKE_SERVER_TIMEOUT: "900"
-    MUSA_SMOKE_COMMON_EXTRA_ARGS: "--disable-piecewise-cuda-graph"
+    MUSA_SMOKE_COMMON_EXTRA_ARGS: "--disable-piecewise-cuda-graph --attention-backend fa3 --disable-overlap-schedule"
     MUSA_SMOKE_QWEN_MOE_MODEL: "/data/models/Qwen3.5-35B-A3B-FP8"
     MUSA_SMOKE_QWEN_MOE_EXTRA_ARGS: "--ep 4 --linear-attn-prefill-backend flashinfer --linear-attn-decode-backend flashinfer --moe-runner-backend triton --mamba-scheduler-strategy extra_buffer --mamba-track-interval 128 --chunked-prefill-size 2048 --max-running-requests 128 --mem-fraction-static 0.70 --cuda-graph-bs 1 2 4 8 16 32 64 128"
     MUSA_SMOKE_GSM8K_DATA_PATH: "/data/eval/gsm8k/test.jsonl"
@@ -147,7 +148,7 @@ mr:musa-server-smoke:gemma4-26b-a4b-4gpu:
     - .rules-merge-request
     - .musa-gemma4-26b-a4b-registered-suite-job
   variables:
-    MUSA_SMOKE_COMMON_EXTRA_ARGS: "--disable-piecewise-cuda-graph"
+    MUSA_SMOKE_COMMON_EXTRA_ARGS: "--disable-piecewise-cuda-graph --attention-backend fa3 --disable-overlap-schedule"
     MUSA_SMOKE_GEMMA4_26B_A4B_MODEL: "/data/models/gemma-4-26B-A4B"
     MUSA_SMOKE_GSM8K_DATA_PATH: "/data/eval/gsm8k/test.jsonl"
     MUSA_SMOKE_GSM8K_API: "completion"
@@ -166,7 +167,7 @@ mr:musa-server-smoke:qwen3-vl-32b-4gpu:
   variables:
     MUSA_RUN_SUITE: "stage-a-test-4-gpu-musa-qwen3-vl-32b-smoke"
     MUSA_RUN_SUITE_TIMEOUT_PER_FILE: "1200"
-    MUSA_SMOKE_COMMON_EXTRA_ARGS: "--disable-piecewise-cuda-graph"
+    MUSA_SMOKE_COMMON_EXTRA_ARGS: "--disable-piecewise-cuda-graph --attention-backend fa3 --disable-overlap-schedule"
     MUSA_SMOKE_QWEN3_VL_32B_MODEL: "/data/models/Qwen3-VL-32B-Instruct"
     MUSA_SMOKE_GSM8K_DATA_PATH: "/data/eval/gsm8k/test.jsonl"
     MUSA_SMOKE_GSM8K_NUM_EXAMPLES: "1319"
