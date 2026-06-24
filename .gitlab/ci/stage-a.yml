@@ -76,8 +76,11 @@ mr:musa-server-smoke:1gpu:
     MUSA_SMOKE_COMMON_EXTRA_ARGS: "--disable-piecewise-cuda-graph --attention-backend fa3 --disable-overlap-schedule --chunked-prefill-size 2048"
     MUSA_SMOKE_QWEN_DENSE_MODEL: "/data/models/Qwen3-8B"
     MUSA_SMOKE_GSM8K_DATA_PATH: "/data/eval/gsm8k/test.jsonl"
-    MUSA_SMOKE_GSM8K_NUM_EXAMPLES: "16"
-    MUSA_SMOKE_GSM8K_NUM_THREADS: "2"
+    MUSA_SMOKE_GSM8K_NUM_EXAMPLES: "200"
+    MUSA_SMOKE_GSM8K_NUM_THREADS: "32"
+    MUSA_SMOKE_GSM8K_MIN_SCORE: "0.92"
+    MUSA_SMOKE_GSM8K_CHAT_TEMPLATE_KWARGS: '{"enable_thinking": false}'
+    MUSA_SMOKE_GSM8K_REASONING_EFFORT: "none"
 
 mr:musa-server-smoke:2gpu:
   rules:
