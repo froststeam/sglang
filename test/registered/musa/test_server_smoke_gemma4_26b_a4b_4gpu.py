@@ -24,7 +24,7 @@ class TestMusaServerSmokeGemma426BA4B4GPU(musa_server_smoke.MusaServerSmokeTest)
             "<|turn>",
         ),
         default_extra_args=(
-            "--ep 4 --moe-runner-backend triton --skip-server-warmup "
+            "--ep 4 --moe-runner-backend auto --skip-server-warmup "
             "--max-running-requests 128 --mem-fraction-static 0.70 "
             "--cuda-graph-bs 1 2 4 8 16 32 64 128 "
             "--watchdog-timeout 900"
