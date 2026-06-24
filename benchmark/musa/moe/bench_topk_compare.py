@@ -20,6 +20,9 @@ compiled_fused_topk_torch_native = torch.compile(
     backend=get_compiler_backend(),
 )
 
+DEFAULT_MS = "1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384,32768,65536"
+DEFAULT_SHARED_CASES = "128:8,128:10,256:8,256:10,512:8,512:10"
+
 
 def bench_one(
     fn: Callable[[], None],
@@ -39,6 +42,58 @@ def bench_one(
     return sum(ret) if isinstance(ret, tuple) else ret
 
 
+def parse_ms() -> list[int]:
+    return [int(v) for v in os.environ.get("MS", DEFAULT_MS).split(",") if v]
+
+
+def parse_shared_cases() -> list[tuple[int, int]]:
+    cases = []
+    for item in os.environ.get("CASES", DEFAULT_SHARED_CASES).split(","):
+        if not item:
+            continue
+        experts, topk = item.split(":")
+        cases.append((int(experts), int(topk)))
+    return cases
+
+
+def get_dtype() -> torch.dtype:
+    dtype_name = os.environ.get("DTYPE", "bf16").lower()
+    if dtype_name in ("fp16", "float16", "half"):
+        return torch.float16
+    if dtype_name in ("fp32", "float32"):
+        return torch.float32
+    return torch.bfloat16
+
+
+def dtype_nbytes(dtype: torch.dtype) -> int:
+    return torch.finfo(dtype).bits // 8
+
+
+def topk_shared_bytes_lower_bound(
+    num_tokens: int,
+    num_experts: int,
+    topk: int,
+    dtype: torch.dtype,
+) -> int:
+    output_topk = topk + 1
+    return (
+        num_tokens * num_experts * dtype_nbytes(dtype)
+        + num_tokens * dtype_nbytes(dtype)
+        + num_tokens * output_topk * (4 + 4)
+    )
+
+
+def branch_name(num_tokens: int) -> str:
+    onewarp_max_tokens = int(
+        os.environ.get("SGLANG_TOPK_SHARED_ONEWARP_MAX_TOKENS", "128")
+    )
+    if num_tokens <= onewarp_max_tokens:
+        return "onewarp"
+    if num_tokens <= 8192:
+        return "warp4"
+    return "halfwarp"
+
+
 def max_weight_diff(
     gating_output: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -48,15 +103,73 @@ def max_weight_diff(
     return (topk_weights - ref).abs().max().item()
 
 
-def main() -> None:
-    ms = [int(v) for v in os.environ.get("MS", "1,2,4,8,16,32,64").split(",")]
+def run_shared_matrix() -> None:
+    ms = parse_ms()
+    cases = parse_shared_cases()
+    dtype = get_dtype()
+    num_tests = int(os.environ.get("NUM_TESTS", "8"))
+
+    print("device", torch.musa.current_device(), torch.musa.get_device_name())
+    print(
+        "fused shared-expert topk matrix: "
+        f"cases={cases}, dtype={dtype}, num_tests={num_tests}"
+    )
+    print("Each cell is `time_us / lower-bound GB/s`.")
+
+    results: dict[tuple[int, int], dict[int, tuple[float, float]]] = {}
+    for experts, topk in cases:
+        case_results = {}
+        for m in ms:
+            torch.manual_seed(20260622 + experts * 100000 + topk * 1000 + m)
+            gating_output = torch.randn((m, experts), device="musa", dtype=dtype)
+            shared_gate = torch.randn((m, 1), device="musa", dtype=dtype)
+            topk_weights = torch.empty(
+                (m, topk + 1), device="musa", dtype=torch.float32
+            )
+            topk_ids = torch.empty((m, topk + 1), device="musa", dtype=torch.int32)
+
+            def run_csrc() -> None:
+                sglang_musa_topk_softmax(
+                    topk_weights,
+                    topk_ids,
+                    gating_output,
+                    True,
+                    shared_expert_gate_output=shared_gate,
+                    num_fused_shared_experts=1,
+                )
+
+            run_csrc()
+            torch.musa.synchronize()
+            seconds = bench_one(run_csrc, "shared1", num_tests=num_tests)
+            time_us = seconds * 1e6
+            bytes_lb = topk_shared_bytes_lower_bound(m, experts, topk, dtype)
+            bandwidth = bytes_lb / time_us / 1000.0
+            case_results[m] = (time_us, bandwidth)
+        results[(experts, topk)] = case_results
+
+    header = ["M", "branch"]
+    for experts, topk in cases:
+        header.append(f"E{experts} K{topk}")
+    print(
+        " | ".join(
+            f"{col:>16}" if i >= 2 else f"{col:>8}" for i, col in enumerate(header)
+        )
+    )
+    print("-+-".join("-" * (16 if i >= 2 else 8) for i in range(len(header))))
+    for m in ms:
+        row = [f"{m:>8}", f"{branch_name(m):>8}"]
+        for case in cases:
+            time_us, bandwidth = results[case][m]
+            row.append(f"{time_us:7.3f} / {bandwidth:6.2f}")
+        print(" | ".join(row))
+
+
+def run_compare() -> None:
+    ms = parse_ms()
     experts = int(os.environ.get("EXPERTS", "256"))
     topk = int(os.environ.get("TOPK", "8"))
-    dtype_name = os.environ.get("DTYPE", "bf16").lower()
     num_tests = int(os.environ.get("NUM_TESTS", "8"))
-    dtype = (
-        torch.float16 if dtype_name in ("fp16", "float16", "half") else torch.bfloat16
-    )
+    dtype = get_dtype()
 
     if topk != 8:
         raise ValueError("This bench currently compares the Qwen path with topk=8.")
@@ -133,6 +246,16 @@ def main() -> None:
             f"{compile_s * 1e6:.2f}\t{sgl_s / csrc_s:.2f}x\t"
             f"{compile_s / csrc_s:.2f}x\t{diff:.3g}"
         )
+
+
+def main() -> None:
+    mode = os.environ.get("MODE", "shared-matrix").lower()
+    if mode in ("shared", "shared-matrix", "matrix"):
+        run_shared_matrix()
+    elif mode == "compare":
+        run_compare()
+    else:
+        raise ValueError(f"Unknown MODE={mode!r}; expected compare or shared-matrix")
 
 
 if __name__ == "__main__":

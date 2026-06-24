@@ -182,7 +182,9 @@ class StandardDispatcher(BaseDispatcher):
                     0, self.num_local_routed_experts, dtype=torch.int32, device=device
                 )
 
-                if self.num_local_shared_experts > 0:
+                # Shared experts are replicated across EP ranks; compute them once
+                # per MoE TP shard so the outer TP all-reduce does not duplicate them.
+                if self.num_local_shared_experts > 0 and self.moe_ep_rank == 0:
                     self.local_expert_mapping[-self.num_local_shared_experts :] = (
                         torch.arange(
                             self.num_local_routed_experts,
