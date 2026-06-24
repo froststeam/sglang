@@ -271,8 +271,11 @@ def _rms_norm_gated_impl(
         )
 
     hidden_size = x.shape[-1]
-    if cta_threads is None and hidden_size >= 4096:
-        cta_threads = 512
+    if cta_threads is None:
+        if 2048 <= hidden_size < 3072:
+            cta_threads = 512 if hidden_size == 2048 and x.shape[0] < 128 else 256
+        elif hidden_size >= 3072:
+            cta_threads = 512
     if cta_threads is not None:
         if cta_threads not in (128, 256, 512):
             raise RuntimeError("cta_threads must be one of 128, 256, 512.")

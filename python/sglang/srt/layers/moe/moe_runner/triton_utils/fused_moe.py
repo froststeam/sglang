@@ -523,14 +523,41 @@ def _fused_moe_kernel_sequence(
             topk_ids,
         )
 
-    intermediate_cache2 = torch.empty(
-        (total_tokens, N // 2),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
+    fused_a2_scale = None
+    use_musa_fused_silu_quant = (
+        _is_musa
+        and activation == "silu"
+        and is_gated
+        and use_fp8_w8a8
+        and block_shape is not None
+        and gemm1_alpha is None
+        and gemm1_limit is None
+        and swiglu_limit is None
     )
 
     # Activation function with multiplication
-    if activation == "silu" and is_gated:
+    if use_musa_fused_silu_quant:
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_8bit,
+        )
+
+        intermediate_cache2, fused_a2_scale = sglang_per_token_group_quant_8bit(
+            x=intermediate_cache1.view(-1, N),
+            dst_dtype=torch.float8_e4m3fn,
+            group_size=block_shape[1],
+            fuse_silu_and_mul=True,
+            enable_v2=True,
+        )
+    else:
+        intermediate_cache2 = torch.empty(
+            (total_tokens, N // 2),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+
+    if use_musa_fused_silu_quant:
+        assert intermediate_cache2 is not None
+    elif activation == "silu" and is_gated:
         # - gemm1_alpha != None: GPT-OSS-style swiglu(alpha, limit)
         # - gemm1_alpha == None and gemm1_limit != None: silu+clamp+mul(limit-only)
         # - swiglu_limit != None: DeepSeek V4 swiglu clamp + silu_and_mul (CUDA/HIP only)
@@ -699,7 +726,7 @@ def _fused_moe_kernel_sequence(
                 else out_hidden_states.unsqueeze(0)
             )
         ),
-        a2_scale,
+        fused_a2_scale if fused_a2_scale is not None else a2_scale,
         w2_scale,
         w2_zp,
         topk_weights,

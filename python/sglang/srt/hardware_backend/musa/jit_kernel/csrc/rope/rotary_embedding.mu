@@ -19,6 +19,10 @@
 #define SGLANG_MUSA_ROPE_STORE_HINT 0
 #endif
 
+#ifndef SGLANG_MUSA_ROPE_ARCH_MP31
+#define SGLANG_MUSA_ROPE_ARCH_MP31 0
+#endif
+
 __device__ __forceinline__ void store_half2(half2 *ptr, half2 value) {
 #if SGLANG_MUSA_ROPE_STORE_HINT == 1
   __stwb(ptr, value);
@@ -70,9 +74,18 @@ inline bool can_use_neox_h2_qk(int seq_len, int rot_dim, int query_stride,
 inline bool is_32x8_hs128_layout(int num_heads, int num_kv_heads,
                                  int query_stride, int key_stride,
                                  int query_head_stride, int key_head_stride) {
-  return SGLANG_MUSA_ARCH_MP31 && num_heads == 32 && num_kv_heads == 8 &&
+  return SGLANG_MUSA_ROPE_ARCH_MP31 && num_heads == 32 && num_kv_heads == 8 &&
          query_stride == 4096 && key_stride == 1024 &&
          query_head_stride == 128 && key_head_stride == 128;
+}
+
+inline bool is_hs128_contiguous_layout(int num_heads, int num_kv_heads,
+                                       int query_stride, int key_stride,
+                                       int query_head_stride,
+                                       int key_head_stride) {
+  return SGLANG_MUSA_ROPE_ARCH_MP31 && query_head_stride == 128 &&
+         key_head_stride == 128 && query_stride == (num_heads << 7) &&
+         key_stride == (num_kv_heads << 7);
 }
 
 inline int prefill_block_pairs(int num_tokens, int num_heads,
@@ -411,6 +424,30 @@ __global__ void rotary_embedding_decode_neox_fp16_h2_32x8_hs128_kernel(
   }
 }
 
+template <int ROT_DIM, int Q_HEADS, int KV_HEADS>
+__global__ void rotary_embedding_decode_neox_fp16_h2_hs128_fixed_kernel(
+    const int64_t *__restrict__ positions, half *__restrict__ query,
+    half *__restrict__ key, const half *__restrict__ cos_sin_cache) {
+  constexpr int HALF_ROT_DIM = ROT_DIM / 2;
+  constexpr int Q_PAIRS = Q_HEADS * HALF_ROT_DIM;
+  constexpr int K_PAIRS = KV_HEADS * HALF_ROT_DIM;
+  constexpr int Q_STRIDE = Q_HEADS << 7;
+  constexpr int K_STRIDE = KV_HEADS << 7;
+  const int token_idx = blockIdx.x;
+  const int pair_idx = (blockIdx.y * blockDim.x + threadIdx.x) * 2;
+  const int pos = static_cast<int>(positions[token_idx]);
+  const half *cache = cos_sin_cache + pos * ROT_DIM;
+  const int q_token_base = token_idx * Q_STRIDE;
+  const int k_token_base = token_idx * K_STRIDE;
+
+  if (pair_idx < Q_PAIRS) {
+    apply_neox_fp16_half2_hs128<ROT_DIM>(query, cache, q_token_base, pair_idx);
+  }
+  if (pair_idx < K_PAIRS) {
+    apply_neox_fp16_half2_hs128<ROT_DIM>(key, cache, k_token_base, pair_idx);
+  }
+}
+
 template <int ROT_DIM, bool HAS_KEY>
 __global__ void rotary_embedding_prefill_neox_bf16_h2_kernel(
     const int64_t *__restrict__ positions, __mt_bfloat16 *__restrict__ query,
@@ -497,6 +534,33 @@ __global__ void rotary_embedding_decode_neox_bf16_h2_32x8_hs128_kernel(
   }
 }
 
+template <int ROT_DIM, int Q_HEADS, int KV_HEADS>
+__global__ void rotary_embedding_decode_neox_bf16_h2_hs128_fixed_kernel(
+    const int64_t *__restrict__ positions, __mt_bfloat16 *__restrict__ query,
+    __mt_bfloat16 *__restrict__ key,
+    const __mt_bfloat16 *__restrict__ cos_sin_cache) {
+  constexpr int HALF_ROT_DIM = ROT_DIM / 2;
+  constexpr int Q_PAIRS = Q_HEADS * HALF_ROT_DIM;
+  constexpr int K_PAIRS = KV_HEADS * HALF_ROT_DIM;
+  constexpr int Q_STRIDE = Q_HEADS << 7;
+  constexpr int K_STRIDE = KV_HEADS << 7;
+  const int token_idx = blockIdx.x;
+  const int pair_idx = (blockIdx.y * blockDim.x + threadIdx.x) * 2;
+  const int pos = static_cast<int>(positions[token_idx]);
+  const __mt_bfloat16 *cache = cos_sin_cache + pos * ROT_DIM;
+  const int q_token_base = token_idx * Q_STRIDE;
+  const int k_token_base = token_idx * K_STRIDE;
+
+  if (pair_idx < Q_PAIRS) {
+    apply_neox_bf16_bfloat162_hs128<ROT_DIM>(query, cache, q_token_base,
+                                             pair_idx);
+  }
+  if (pair_idx < K_PAIRS) {
+    apply_neox_bf16_bfloat162_hs128<ROT_DIM>(key, cache, k_token_base,
+                                             pair_idx);
+  }
+}
+
 template <int ROT_DIM>
 __global__ void rotary_embedding_prefill_neox_fp16_q_h2x2_kernel(
     const int64_t *__restrict__ positions, half *__restrict__ query,
@@ -521,6 +585,69 @@ __global__ void rotary_embedding_prefill_neox_fp16_q_h2x2_kernel(
   }
 }
 
+template <int ROT_DIM>
+inline bool launch_fp16_hs128_fixed(
+    int num_heads, int num_kv_heads, dim3 grid, dim3 block,
+    musaStream_t stream, const int64_t *positions, half *query, half *key,
+    const half *cos_sin_cache) {
+#define SGLANG_MUSA_ROPE_TRY_FP16_HS128_FIXED(QH, KVH)                      \
+  if (num_heads == QH && num_kv_heads == KVH) {                             \
+    rotary_embedding_decode_neox_fp16_h2_hs128_fixed_kernel<ROT_DIM, QH,    \
+                                                            KVH>            \
+        <<<grid, block, 0, stream>>>(positions, query, key, cos_sin_cache);  \
+    return true;                                                            \
+  }
+
+  SGLANG_MUSA_ROPE_TRY_FP16_HS128_FIXED(16, 2)
+  SGLANG_MUSA_ROPE_TRY_FP16_HS128_FIXED(16, 4)
+  SGLANG_MUSA_ROPE_TRY_FP16_HS128_FIXED(28, 4)
+  SGLANG_MUSA_ROPE_TRY_FP16_HS128_FIXED(28, 8)
+  SGLANG_MUSA_ROPE_TRY_FP16_HS128_FIXED(32, 4)
+  SGLANG_MUSA_ROPE_TRY_FP16_HS128_FIXED(32, 8)
+  SGLANG_MUSA_ROPE_TRY_FP16_HS128_FIXED(40, 8)
+  SGLANG_MUSA_ROPE_TRY_FP16_HS128_FIXED(48, 8)
+  SGLANG_MUSA_ROPE_TRY_FP16_HS128_FIXED(56, 8)
+  SGLANG_MUSA_ROPE_TRY_FP16_HS128_FIXED(64, 4)
+  SGLANG_MUSA_ROPE_TRY_FP16_HS128_FIXED(64, 8)
+  SGLANG_MUSA_ROPE_TRY_FP16_HS128_FIXED(80, 8)
+  SGLANG_MUSA_ROPE_TRY_FP16_HS128_FIXED(96, 8)
+  SGLANG_MUSA_ROPE_TRY_FP16_HS128_FIXED(128, 8)
+
+#undef SGLANG_MUSA_ROPE_TRY_FP16_HS128_FIXED
+  return false;
+}
+
+template <int ROT_DIM>
+inline bool launch_bf16_hs128_fixed(
+    int num_heads, int num_kv_heads, dim3 grid, dim3 block,
+    musaStream_t stream, const int64_t *positions, __mt_bfloat16 *query,
+    __mt_bfloat16 *key, const __mt_bfloat16 *cos_sin_cache) {
+#define SGLANG_MUSA_ROPE_TRY_BF16_HS128_FIXED(QH, KVH)                         \
+  if (num_heads == QH && num_kv_heads == KVH) {                                \
+    rotary_embedding_decode_neox_bf16_h2_hs128_fixed_kernel<ROT_DIM, QH, KVH>  \
+        <<<grid, block, 0, stream>>>(positions, query, key, cos_sin_cache);     \
+    return true;                                                               \
+  }
+
+  SGLANG_MUSA_ROPE_TRY_BF16_HS128_FIXED(16, 2)
+  SGLANG_MUSA_ROPE_TRY_BF16_HS128_FIXED(16, 4)
+  SGLANG_MUSA_ROPE_TRY_BF16_HS128_FIXED(28, 4)
+  SGLANG_MUSA_ROPE_TRY_BF16_HS128_FIXED(28, 8)
+  SGLANG_MUSA_ROPE_TRY_BF16_HS128_FIXED(32, 4)
+  SGLANG_MUSA_ROPE_TRY_BF16_HS128_FIXED(32, 8)
+  SGLANG_MUSA_ROPE_TRY_BF16_HS128_FIXED(40, 8)
+  SGLANG_MUSA_ROPE_TRY_BF16_HS128_FIXED(48, 8)
+  SGLANG_MUSA_ROPE_TRY_BF16_HS128_FIXED(56, 8)
+  SGLANG_MUSA_ROPE_TRY_BF16_HS128_FIXED(64, 4)
+  SGLANG_MUSA_ROPE_TRY_BF16_HS128_FIXED(64, 8)
+  SGLANG_MUSA_ROPE_TRY_BF16_HS128_FIXED(80, 8)
+  SGLANG_MUSA_ROPE_TRY_BF16_HS128_FIXED(96, 8)
+  SGLANG_MUSA_ROPE_TRY_BF16_HS128_FIXED(128, 8)
+
+#undef SGLANG_MUSA_ROPE_TRY_BF16_HS128_FIXED
+  return false;
+}
+
 template <typename T, bool IS_NEOX, bool HAS_KEY>
 void launch_rotary_embedding(ffi::TensorView positions, ffi::TensorView query,
                              ffi::TensorView key, ffi::TensorView cos_sin_cache,
@@ -538,12 +665,13 @@ void launch_rotary_embedding(ffi::TensorView positions, ffi::TensorView query,
       if (can_use_neox_h2_qk(seq_len, rot_dim, query_stride, key_stride,
                              query_head_stride, key_head_stride,
                              query_dim_stride, key_dim_stride)) {
-        if (num_tokens <= 128) {
-          const int block_threads = num_tokens < 128 ? 128 : 256;
+        if (num_tokens <= 256) {
+          const int block_threads = num_tokens < 128 ? 64 : 128;
           const int h2_pairs = (max_head_pairs + 1) / 2;
           const dim3 grid(num_tokens,
                           (h2_pairs + block_threads - 1) / block_threads);
           const dim3 block(block_threads);
+          bool launched_hs128 = false;
           if (is_32x8_hs128_layout(num_heads, num_kv_heads, query_stride,
                                    key_stride, query_head_stride,
                                    key_head_stride)) {
@@ -562,7 +690,26 @@ void launch_rotary_embedding(ffi::TensorView positions, ffi::TensorView query,
                       static_cast<half *>(key.data_ptr()),
                       static_cast<const half *>(cos_sin_cache.data_ptr()));
             }
-          } else if (rot_dim == 64) {
+            launched_hs128 = true;
+          } else if (is_hs128_contiguous_layout(
+                         num_heads, num_kv_heads, query_stride, key_stride,
+                         query_head_stride, key_head_stride)) {
+            launched_hs128 =
+                rot_dim == 64
+                    ? launch_fp16_hs128_fixed<64>(
+                          num_heads, num_kv_heads, grid, block, stream,
+                          static_cast<const int64_t *>(positions.data_ptr()),
+                          static_cast<half *>(query.data_ptr()),
+                          static_cast<half *>(key.data_ptr()),
+                          static_cast<const half *>(cos_sin_cache.data_ptr()))
+                    : launch_fp16_hs128_fixed<128>(
+                          num_heads, num_kv_heads, grid, block, stream,
+                          static_cast<const int64_t *>(positions.data_ptr()),
+                          static_cast<half *>(query.data_ptr()),
+                          static_cast<half *>(key.data_ptr()),
+                          static_cast<const half *>(cos_sin_cache.data_ptr()));
+          }
+          if (!launched_hs128 && rot_dim == 64) {
             rotary_embedding_decode_neox_fp16_h2_split_kernel<64, true>
                 <<<grid, block, 0, stream>>>(
                     static_cast<const int64_t *>(positions.data_ptr()),
@@ -571,7 +718,7 @@ void launch_rotary_embedding(ffi::TensorView positions, ffi::TensorView query,
                     static_cast<const half *>(cos_sin_cache.data_ptr()),
                     num_heads, num_kv_heads, query_stride, key_stride,
                     query_head_stride, key_head_stride);
-          } else {
+          } else if (!launched_hs128) {
             rotary_embedding_decode_neox_fp16_h2_split_kernel<128, true>
                 <<<grid, block, 0, stream>>>(
                     static_cast<const int64_t *>(positions.data_ptr()),
@@ -584,7 +731,10 @@ void launch_rotary_embedding(ffi::TensorView positions, ffi::TensorView query,
           return;
         }
         const dim3 grid(num_tokens);
-        const dim3 block(num_tokens <= 256 ? 256 : 512);
+        const bool use_prefill_256_threads =
+            (rot_dim == 64 && num_tokens <= 4096) ||
+            (rot_dim == 128 && num_tokens >= 2048 && num_tokens <= 4096);
+        const dim3 block(use_prefill_256_threads ? 256 : 512);
         if (rot_dim == 64) {
           rotary_embedding_prefill_neox_fp16_h2_kernel<64, true>
               <<<grid, block, 0, stream>>>(
@@ -611,12 +761,13 @@ void launch_rotary_embedding(ffi::TensorView positions, ffi::TensorView query,
       if (can_use_neox_h2_qk(seq_len, rot_dim, query_stride, key_stride,
                              query_head_stride, key_head_stride,
                              query_dim_stride, key_dim_stride)) {
-        if (num_tokens <= 128) {
-          const int block_threads = num_tokens < 128 ? 128 : 256;
+        if (num_tokens <= 256) {
+          const int block_threads = num_tokens < 128 ? 64 : 128;
           const int h2_pairs = (max_head_pairs + 1) / 2;
           const dim3 grid(num_tokens,
                           (h2_pairs + block_threads - 1) / block_threads);
           const dim3 block(block_threads);
+          bool launched_hs128 = false;
           if (is_32x8_hs128_layout(num_heads, num_kv_heads, query_stride,
                                    key_stride, query_head_stride,
                                    key_head_stride)) {
@@ -637,7 +788,28 @@ void launch_rotary_embedding(ffi::TensorView positions, ffi::TensorView query,
                       static_cast<const __mt_bfloat16 *>(
                           cos_sin_cache.data_ptr()));
             }
-          } else if (rot_dim == 64) {
+            launched_hs128 = true;
+          } else if (is_hs128_contiguous_layout(
+                         num_heads, num_kv_heads, query_stride, key_stride,
+                         query_head_stride, key_head_stride)) {
+            launched_hs128 =
+                rot_dim == 64
+                    ? launch_bf16_hs128_fixed<64>(
+                          num_heads, num_kv_heads, grid, block, stream,
+                          static_cast<const int64_t *>(positions.data_ptr()),
+                          static_cast<__mt_bfloat16 *>(query.data_ptr()),
+                          static_cast<__mt_bfloat16 *>(key.data_ptr()),
+                          static_cast<const __mt_bfloat16 *>(
+                              cos_sin_cache.data_ptr()))
+                    : launch_bf16_hs128_fixed<128>(
+                          num_heads, num_kv_heads, grid, block, stream,
+                          static_cast<const int64_t *>(positions.data_ptr()),
+                          static_cast<__mt_bfloat16 *>(query.data_ptr()),
+                          static_cast<__mt_bfloat16 *>(key.data_ptr()),
+                          static_cast<const __mt_bfloat16 *>(
+                              cos_sin_cache.data_ptr()));
+          }
+          if (!launched_hs128 && rot_dim == 64) {
             rotary_embedding_decode_neox_bf16_h2_split_kernel<64, true>
                 <<<grid, block, 0, stream>>>(
                     static_cast<const int64_t *>(positions.data_ptr()),
@@ -647,7 +819,7 @@ void launch_rotary_embedding(ffi::TensorView positions, ffi::TensorView query,
                         cos_sin_cache.data_ptr()),
                     num_heads, num_kv_heads, query_stride, key_stride,
                     query_head_stride, key_head_stride);
-          } else {
+          } else if (!launched_hs128) {
             rotary_embedding_decode_neox_bf16_h2_split_kernel<128, true>
                 <<<grid, block, 0, stream>>>(
                     static_cast<const int64_t *>(positions.data_ptr()),
@@ -661,7 +833,10 @@ void launch_rotary_embedding(ffi::TensorView positions, ffi::TensorView query,
           return;
         }
         const dim3 grid(num_tokens);
-        const dim3 block(num_tokens <= 256 ? 256 : 512);
+        const bool use_prefill_256_threads =
+            (rot_dim == 64 && num_tokens <= 4096) ||
+            (rot_dim == 128 && num_tokens >= 2048 && num_tokens <= 4096);
+        const dim3 block(use_prefill_256_threads ? 256 : 512);
         if (rot_dim == 64) {
           rotary_embedding_prefill_neox_bf16_h2_kernel<64, true>
               <<<grid, block, 0, stream>>>(

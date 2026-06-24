@@ -165,9 +165,16 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_final_src = None
         track_ssm_final_dst = None
 
-        mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
-            forward_batch.req_pool_indices
-        )
+        mamba_cache_index_mapping = None
+        if not _is_musa:
+            mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
+                forward_batch.req_pool_indices
+            )
+        else:
+            mamba_cache_indices = forward_batch.req_pool_indices
+            mamba_cache_index_mapping = (
+                self.req_to_token_pool.req_index_to_mamba_index_mapping
+            )
 
         if forward_batch.forward_mode.is_decode_or_idle():
             query_start_loc = torch.arange(
@@ -218,13 +225,22 @@ class MambaAttnBackendBase(AttentionBackend):
                     track_conv_indices = self._init_track_conv_indices(
                         query_start_loc, forward_batch
                     )
+                    track_mamba_cache_indices = (
+                        torch.index_select(
+                            mamba_cache_index_mapping, 0, mamba_cache_indices
+                        )
+                        if mamba_cache_index_mapping is not None
+                        else mamba_cache_indices
+                    )
 
                     (
                         track_ssm_h_src,
                         track_ssm_h_dst,
                         track_ssm_final_src,
                         track_ssm_final_dst,
-                    ) = self._init_track_ssm_indices(mamba_cache_indices, forward_batch)
+                    ) = self._init_track_ssm_indices(
+                        track_mamba_cache_indices, forward_batch
+                    )
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
 
@@ -236,6 +252,7 @@ class MambaAttnBackendBase(AttentionBackend):
         return ForwardMetadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=mamba_cache_indices,
+            mamba_cache_index_mapping=mamba_cache_index_mapping,
             retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=retrieve_next_sibling,
             retrieve_parent_token=retrieve_parent_token,

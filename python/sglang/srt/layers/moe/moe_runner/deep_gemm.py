@@ -182,6 +182,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         from sglang.srt.layers.moe.ep_moe.kernels import tma_align_input_scale
         from sglang.srt.layers.quantization.fp8_kernel import (
             create_per_token_group_quant_fp8_output_scale,
+            sglang_per_token_group_quant_8bit,
+            sglang_per_token_group_quant_fp8,
         )
 
         hidden_states = runner_input.hidden_states
@@ -230,7 +232,19 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
+        if _is_musa and self.config.activation == "silu":
+            down_input_fp8, down_input_scale = sglang_per_token_group_quant_8bit(
+                x=gateup_output.view(-1, N),
+                dst_dtype=torch.float8_e4m3fn,
+                group_size=scale_block_size,
+                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                fuse_silu_and_mul=True,
+                enable_v2=True,
+            )
+            del gateup_output
+        elif envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
 
             down_input_fp8 = torch.empty(
@@ -261,10 +275,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             # Hacky byte-equal fallback that reproduces the optimize-branch
             # code path exactly: bf16 silu_and_mul then a separate per-token
             # group fp8 quant. Kept behind the mega-moe-memory flag.
-            from sglang.srt.layers.quantization.fp8_kernel import (
-                sglang_per_token_group_quant_fp8,
-            )
-
             if self.swiglu_limit is not None:
                 gateup_output = _apply_swiglu_limit(
                     gateup_output, swiglu_limit=self.swiglu_limit
@@ -1161,6 +1171,21 @@ def _varlen_deep_gemm_silu_mul_quant(
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_8bit,
     )
+
+    if _is_musa and activation == "silu":
+        assert swiglu_limit is None
+        assert not swizzle
+        return sglang_per_token_group_quant_8bit(
+            x=gateup_output,
+            dst_dtype=torch.float8_e4m3fn,
+            group_size=group_size,
+            masked_m=masked_m,
+            column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            fuse_silu_and_mul=True,
+            enable_v2=True,
+        )
 
     if _MASKED_GEMM_FAST_ACT:
         assert not swizzle, (

@@ -87,6 +87,52 @@ constexpr float LOCAL_ABSMAX_ABS = 1e-10;
 constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
 constexpr uint32_t FP8_FAST_VEC_ELEMS = 4;
 constexpr int BF16_FP8_G128_THREADS_PER_GROUP = 16;
+constexpr int kSiluActivation = 0;
+constexpr int kGeluActivation = 1;
+constexpr int kGeluTanhActivation = 2;
+
+__device__ __forceinline__ float fast_erf_musa(float x) {
+  constexpr float kP = 0.3275911f;
+  constexpr float kA1 = 0.254829592f;
+  constexpr float kA2 = -0.284496736f;
+  constexpr float kA3 = 1.421413741f;
+  constexpr float kA4 = -1.453152027f;
+  constexpr float kA5 = 1.061405429f;
+  const float sign = x < 0.0f ? -1.0f : 1.0f;
+  const float ax = fabsf(x);
+  const float t = 1.0f / (1.0f + kP * ax);
+  const float poly =
+      (((((kA5 * t + kA4) * t + kA3) * t + kA2) * t + kA1) * t);
+  return sign * (1.0f - poly * expf(-ax * ax));
+}
+
+__device__ __forceinline__ float gelu_exact_musa(float x) {
+  return 0.5f * x * (1.0f + fast_erf_musa(x * 0.7071067811865475f));
+}
+
+__device__ __forceinline__ float gelu_tanh_musa(float x) {
+  constexpr float kSqrt2OverPi = 0.7978845608028654f;
+  constexpr float kCoeff = 0.044715f;
+  return 0.5f * x *
+      (1.0f + tanhf(kSqrt2OverPi * (x + kCoeff * x * x * x)));
+}
+
+__device__ __forceinline__ float fast_silu_musa(float x) {
+  const float half_x = 0.5f * x;
+  return half_x * (1.0f + tanhf(half_x));
+}
+
+__device__ __forceinline__ float apply_fused_activation(
+    float x,
+    int activation_type) {
+  if (activation_type == kGeluActivation) {
+    return gelu_exact_musa(x);
+  }
+  if (activation_type == kGeluTanhActivation) {
+    return gelu_tanh_musa(x);
+  }
+  return fast_silu_musa(x);
+}
 
 struct RowScheduler {
   static void compute_exec_config(
@@ -139,7 +185,6 @@ struct RowScheduler {
 struct MaskedLayoutScheduler {
   // TODO can be dynamically determined (which may be good when num rank is small)
   static constexpr int TOKEN_DIM_BLOCK_NUM_PER_EXPERT = 1024;
-  static constexpr int SUBWARPS_PER_BLOCK = 16;
 
   static void compute_exec_config(
       int threads_per_subwarp,
@@ -149,7 +194,18 @@ struct MaskedLayoutScheduler {
       int& subwarps_per_block,
       dim3& grid,
       dim3& block) {
-    subwarps_per_block = SUBWARPS_PER_BLOCK;
+    subwarps_per_block = ([=]() -> int {
+      if (hidden_dim_num_groups % 16 == 0) {
+        return 16;
+      } else if (hidden_dim_num_groups % 8 == 0) {
+        return 8;
+      } else if (hidden_dim_num_groups % 4 == 0) {
+        return 4;
+      } else if (hidden_dim_num_groups % 2 == 0) {
+        return 2;
+      }
+      return 1;
+    })();
     TORCH_CHECK(hidden_dim_num_groups % subwarps_per_block == 0);
     grid = dim3(hidden_dim_num_groups / subwarps_per_block, TOKEN_DIM_BLOCK_NUM_PER_EXPERT, num_local_experts);
     block = dim3(subwarps_per_block * threads_per_subwarp);
@@ -168,7 +224,7 @@ struct MaskedLayoutScheduler {
     const int expert_idx = blockIdx.z;
     const int token_idx_start = blockIdx.y;
 
-    const int64_t hidden_dim_group_idx = blockIdx.x * SUBWARPS_PER_BLOCK + subwarp_id;
+    const int64_t hidden_dim_group_idx = blockIdx.x * subwarps_per_block + subwarp_id;
 
     const int curr_expert_token_num = masked_m[expert_idx];
 
@@ -202,7 +258,8 @@ __global__ void per_token_group_quant_8bit_kernel(
     // TODO can this be removed?
     const int scale_expert_stride,
     const int scale_hidden_stride,
-    const int num_tokens_per_expert) {
+    const int num_tokens_per_expert,
+    const int fused_activation_type) {
   using dst_dtype_info = DtypeInfo<DST_DTYPE>;
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
 
@@ -276,7 +333,10 @@ __global__ void per_token_group_quant_8bit_kernel(
           float val;
           if constexpr (FUSE_SILU_AND_MUL) {
             // TODO maybe vectorize
-            T val_lowprec = static_cast<T>(silu(static_cast<float>(input_primary_vec[j]))) * input_secondary_vec[j];
+            T val_lowprec = static_cast<T>(apply_fused_activation(
+                                static_cast<float>(input_primary_vec[j]),
+                                fused_activation_type)) *
+                            input_secondary_vec[j];
             val = static_cast<float>(val_lowprec);
             input_primary_vec[j] = val_lowprec;
           } else {
@@ -354,7 +414,8 @@ __global__ void per_token_group_quant_8bit_fast_kernel(
     float* __restrict__ output_s,
     const int hidden_dim_num_groups,
     const int scale_hidden_stride,
-    const int num_tokens_per_expert) {
+    const int num_tokens_per_expert,
+    const int fused_activation_type) {
   const int subwarp_id = threadIdx.x / THREADS_PER_GROUP;
   const int lane_id = threadIdx.x - subwarp_id * THREADS_PER_GROUP;
   const int subwarps_per_block = blockDim.x / THREADS_PER_GROUP;
@@ -382,7 +443,8 @@ __global__ void per_token_group_quant_8bit_fast_kernel(
   for (uint32_t j = 0; j < FP8_FAST_VEC_ELEMS; ++j) {
     float val;
     if constexpr (FUSE_SILU_AND_MUL) {
-      half val_lowprec = static_cast<half>(silu(static_cast<float>(input_primary_vec[j]))) * input_secondary_vec[j];
+      half val_lowprec = static_cast<half>(fast_silu_musa(static_cast<float>(input_primary_vec[j]))) *
+                         input_secondary_vec[j];
       val = static_cast<float>(val_lowprec);
       values[j] = val;
     } else {
@@ -406,6 +468,59 @@ __global__ void per_token_group_quant_8bit_fast_kernel(
 
   const int output_offset = (token_idx * hidden_dim_num_groups + hidden_dim_group_idx) * GROUP_SIZE + elem_offset;
   const uint32_t output_buf = pack_quant4<DST_DTYPE>(values, y_scale);
+  *reinterpret_cast<uint32_t*>(output_q + output_offset) = output_buf;
+}
+
+template <int GROUP_SIZE, int THREADS_PER_GROUP, int HIDDEN_GROUPS_PER_BLOCK, int TOKEN_GROUPS_PER_BLOCK>
+__global__ void per_token_group_quant_8bit_i8_fused_tiled_kernel(
+    const half* __restrict__ input,
+    int8_t* __restrict__ output_q,
+    float* __restrict__ output_s,
+    const int hidden_dim_num_groups,
+    const int num_tokens_per_expert) {
+  const int subwarp_id = threadIdx.x / THREADS_PER_GROUP;
+  const int lane_id = threadIdx.x - subwarp_id * THREADS_PER_GROUP;
+  const int token_tile_idx = subwarp_id / HIDDEN_GROUPS_PER_BLOCK;
+  const int hidden_tile_idx = subwarp_id - token_tile_idx * HIDDEN_GROUPS_PER_BLOCK;
+
+  const int token_idx = blockIdx.y * TOKEN_GROUPS_PER_BLOCK + token_tile_idx;
+  const int hidden_dim_group_idx = blockIdx.x * HIDDEN_GROUPS_PER_BLOCK + hidden_tile_idx;
+  if (token_idx >= num_tokens_per_expert || hidden_dim_group_idx >= hidden_dim_num_groups) {
+    return;
+  }
+
+  const int hidden_size = hidden_dim_num_groups * GROUP_SIZE;
+  const int input_group_start_offset = token_idx * hidden_size * 2 + hidden_dim_group_idx * GROUP_SIZE;
+  const int elem_offset = lane_id * FP8_FAST_VEC_ELEMS;
+
+  uint64_t input_primary_u64 = *reinterpret_cast<const uint64_t*>(input + input_group_start_offset + elem_offset);
+  half* input_primary_vec = reinterpret_cast<half*>(&input_primary_u64);
+  uint64_t input_secondary_u64 =
+      *reinterpret_cast<const uint64_t*>(input + input_group_start_offset + hidden_size + elem_offset);
+  half* input_secondary_vec = reinterpret_cast<half*>(&input_secondary_u64);
+
+  float values[FP8_FAST_VEC_ELEMS];
+  float local_absmax = LOCAL_ABSMAX_ABS;
+
+#pragma unroll
+  for (uint32_t j = 0; j < FP8_FAST_VEC_ELEMS; ++j) {
+    half val_lowprec = static_cast<half>(fast_silu_musa(static_cast<float>(input_primary_vec[j]))) *
+                       input_secondary_vec[j];
+    const float val = static_cast<float>(val_lowprec);
+    values[j] = val;
+    local_absmax = fmaxf(local_absmax, fabsf(val));
+  }
+
+  local_absmax = GroupReduceMax<THREADS_PER_GROUP>(local_absmax, lane_id);
+  const float y_scale_inv = local_absmax * (1.0f / DtypeInfo<int8_t>::MAX);
+  const float y_scale = DtypeInfo<int8_t>::MAX / local_absmax;
+
+  if (lane_id == 0) {
+    output_s[token_idx * hidden_dim_num_groups + hidden_dim_group_idx] = y_scale_inv;
+  }
+
+  const int output_offset = (token_idx * hidden_dim_num_groups + hidden_dim_group_idx) * GROUP_SIZE + elem_offset;
+  const uint32_t output_buf = pack_quant4<int8_t>(values, y_scale);
   *reinterpret_cast<uint32_t*>(output_q + output_offset) = output_buf;
 }
 
@@ -462,41 +577,68 @@ __global__ void per_token_group_quant_8bit_fp8_col_tiled_kernel(
   *reinterpret_cast<uint32_t*>(output_q + output_offset) = output_buf;
 }
 
-template <int THREADS_PER_GROUP>
+template <int THREADS_PER_GROUP, bool FUSE_SILU_AND_MUL>
 __device__ __forceinline__ void quantize_bf16_fp8_g128_group(
     const __mt_bfloat16* __restrict__ input,
     __mt_fp8_e4m3* __restrict__ output_q,
     float* __restrict__ output_s,
     const int hidden_dim_num_groups,
     const int token_idx,
-    const int hidden_dim_group_idx) {
+    const int hidden_dim_group_idx,
+    const int fused_activation_type) {
   constexpr int GROUP_SIZE = 128;
   constexpr int ELEMS_PER_THREAD = GROUP_SIZE / THREADS_PER_GROUP;
 
   const int hidden_size = hidden_dim_num_groups * GROUP_SIZE;
   const int lane_id = threadIdx.x % THREADS_PER_GROUP;
   const int elem_offset = lane_id * ELEMS_PER_THREAD;
-  const int input_offset = token_idx * hidden_size + hidden_dim_group_idx * GROUP_SIZE + elem_offset;
+  const int input_offset =
+      token_idx * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) + hidden_dim_group_idx * GROUP_SIZE + elem_offset;
 
   float values[ELEMS_PER_THREAD];
   if constexpr (ELEMS_PER_THREAD >= 8) {
     constexpr int INPUT_INT4_SIZE = ELEMS_PER_THREAD * sizeof(__mt_bfloat16) / sizeof(int4);
     int4 input_int4[INPUT_INT4_SIZE];
+    int4 input_secondary_int4[INPUT_INT4_SIZE];
     auto input_vec = reinterpret_cast<__mt_bfloat16*>(input_int4);
+    auto input_secondary_vec = reinterpret_cast<__mt_bfloat16*>(input_secondary_int4);
 #pragma unroll
     for (int j = 0; j < INPUT_INT4_SIZE; ++j) {
       input_int4[j] = ld_global_nc(reinterpret_cast<const int4*>(input + input_offset) + j);
+      if constexpr (FUSE_SILU_AND_MUL) {
+        input_secondary_int4[j] =
+            ld_global_nc(reinterpret_cast<const int4*>(input + input_offset + hidden_size) + j);
+      }
     }
 #pragma unroll
     for (int j = 0; j < ELEMS_PER_THREAD; ++j) {
-      values[j] = static_cast<float>(input_vec[j]);
+      if constexpr (FUSE_SILU_AND_MUL) {
+        __mt_bfloat16 val_lowprec = static_cast<__mt_bfloat16>(
+                                        fast_silu_musa(static_cast<float>(input_vec[j]))) *
+                                    input_secondary_vec[j];
+        values[j] = static_cast<float>(val_lowprec);
+      } else {
+        values[j] = static_cast<float>(input_vec[j]);
+      }
     }
   } else {
     uint64_t input_u64 = *reinterpret_cast<const uint64_t*>(input + input_offset);
     auto input_vec = reinterpret_cast<__mt_bfloat16*>(&input_u64);
+    uint64_t input_secondary_u64;
+    auto input_secondary_vec = reinterpret_cast<__mt_bfloat16*>(&input_secondary_u64);
+    if constexpr (FUSE_SILU_AND_MUL) {
+      input_secondary_u64 = *reinterpret_cast<const uint64_t*>(input + input_offset + hidden_size);
+    }
 #pragma unroll
     for (int j = 0; j < ELEMS_PER_THREAD; ++j) {
-      values[j] = static_cast<float>(input_vec[j]);
+      if constexpr (FUSE_SILU_AND_MUL) {
+        __mt_bfloat16 val_lowprec = static_cast<__mt_bfloat16>(
+                                        fast_silu_musa(static_cast<float>(input_vec[j]))) *
+                                    input_secondary_vec[j];
+        values[j] = static_cast<float>(val_lowprec);
+      } else {
+        values[j] = static_cast<float>(input_vec[j]);
+      }
     }
   }
 
@@ -541,27 +683,29 @@ __device__ __forceinline__ void quantize_bf16_fp8_g128_group(
   }
 }
 
-template <int THREADS_PER_GROUP>
+template <int THREADS_PER_GROUP, bool FUSE_SILU_AND_MUL>
 __global__ void per_token_group_quant_8bit_bf16_fp8_g128_row_kernel(
     const __mt_bfloat16* __restrict__ input,
     __mt_fp8_e4m3* __restrict__ output_q,
     float* __restrict__ output_s,
-    const int hidden_dim_num_groups) {
+    const int hidden_dim_num_groups,
+    const int fused_activation_type) {
   const int subwarp_id = threadIdx.x / THREADS_PER_GROUP;
   const int subwarps_per_block = blockDim.x / THREADS_PER_GROUP;
   const int token_idx = blockIdx.y;
   const int hidden_dim_group_idx = blockIdx.x * subwarps_per_block + subwarp_id;
-  quantize_bf16_fp8_g128_group<THREADS_PER_GROUP>(
-      input, output_q, output_s, hidden_dim_num_groups, token_idx, hidden_dim_group_idx);
+  quantize_bf16_fp8_g128_group<THREADS_PER_GROUP, FUSE_SILU_AND_MUL>(
+      input, output_q, output_s, hidden_dim_num_groups, token_idx, hidden_dim_group_idx, fused_activation_type);
 }
 
-template <int THREADS_PER_GROUP, int HIDDEN_GROUPS_PER_BLOCK, int TOKEN_GROUPS_PER_BLOCK>
+template <int THREADS_PER_GROUP, bool FUSE_SILU_AND_MUL, int HIDDEN_GROUPS_PER_BLOCK, int TOKEN_GROUPS_PER_BLOCK>
 __global__ void per_token_group_quant_8bit_bf16_fp8_g128_row_tiled_kernel(
     const __mt_bfloat16* __restrict__ input,
     __mt_fp8_e4m3* __restrict__ output_q,
     float* __restrict__ output_s,
     const int hidden_dim_num_groups,
-    const int num_tokens_per_expert) {
+    const int num_tokens_per_expert,
+    const int fused_activation_type) {
   const int subwarp_id = threadIdx.x / THREADS_PER_GROUP;
   const int token_tile_idx = subwarp_id / HIDDEN_GROUPS_PER_BLOCK;
   const int hidden_tile_idx = subwarp_id - token_tile_idx * HIDDEN_GROUPS_PER_BLOCK;
@@ -572,8 +716,8 @@ __global__ void per_token_group_quant_8bit_bf16_fp8_g128_row_tiled_kernel(
     return;
   }
 
-  quantize_bf16_fp8_g128_group<THREADS_PER_GROUP>(
-      input, output_q, output_s, hidden_dim_num_groups, token_idx, hidden_dim_group_idx);
+  quantize_bf16_fp8_g128_group<THREADS_PER_GROUP, FUSE_SILU_AND_MUL>(
+      input, output_q, output_s, hidden_dim_num_groups, token_idx, hidden_dim_group_idx, fused_activation_type);
 }
 
 inline int choose_subwarps_per_block(const int hidden_dim_num_groups) {
@@ -620,6 +764,7 @@ void launch_fp8_fast_kernel(
     int hidden_dim_num_groups,
     int scale_hidden_stride,
     int num_tokens_per_expert,
+    int fused_activation_type,
     musaStream_t stream) {
   constexpr int THREADS_PER_GROUP = FastQuantConfig<GROUP_SIZE>::THREADS_PER_GROUP;
   const int subwarps_per_block = choose_subwarps_per_block(hidden_dim_num_groups);
@@ -636,7 +781,8 @@ void launch_fp8_fast_kernel(
       static_cast<float*>(output_s.data_ptr()),
       hidden_dim_num_groups,
       scale_hidden_stride,
-      num_tokens_per_expert);
+      num_tokens_per_expert,
+      fused_activation_type);
 }
 
 template <bool IS_COLUMN_MAJOR, bool FUSE_SILU_AND_MUL>
@@ -648,23 +794,28 @@ void dispatch_fp8_fast_kernel(
     int hidden_dim_num_groups,
     int scale_hidden_stride,
     int num_tokens_per_expert,
+    int fused_activation_type,
     musaStream_t stream) {
   switch (group_size) {
     case 16:
       launch_fp8_fast_kernel<16, IS_COLUMN_MAJOR, FUSE_SILU_AND_MUL>(
-          input, output_q, output_s, hidden_dim_num_groups, scale_hidden_stride, num_tokens_per_expert, stream);
+          input, output_q, output_s, hidden_dim_num_groups, scale_hidden_stride,
+          num_tokens_per_expert, fused_activation_type, stream);
       break;
     case 32:
       launch_fp8_fast_kernel<32, IS_COLUMN_MAJOR, FUSE_SILU_AND_MUL>(
-          input, output_q, output_s, hidden_dim_num_groups, scale_hidden_stride, num_tokens_per_expert, stream);
+          input, output_q, output_s, hidden_dim_num_groups, scale_hidden_stride,
+          num_tokens_per_expert, fused_activation_type, stream);
       break;
     case 64:
       launch_fp8_fast_kernel<64, IS_COLUMN_MAJOR, FUSE_SILU_AND_MUL>(
-          input, output_q, output_s, hidden_dim_num_groups, scale_hidden_stride, num_tokens_per_expert, stream);
+          input, output_q, output_s, hidden_dim_num_groups, scale_hidden_stride,
+          num_tokens_per_expert, fused_activation_type, stream);
       break;
     case 128:
       launch_fp8_fast_kernel<128, IS_COLUMN_MAJOR, FUSE_SILU_AND_MUL>(
-          input, output_q, output_s, hidden_dim_num_groups, scale_hidden_stride, num_tokens_per_expert, stream);
+          input, output_q, output_s, hidden_dim_num_groups, scale_hidden_stride,
+          num_tokens_per_expert, fused_activation_type, stream);
       break;
     default:
       TORCH_CHECK(false, "Unsupported group_size");
@@ -714,16 +865,18 @@ void dispatch_fp8_col_nonfused_kernel(
   }
 
   dispatch_fp8_fast_kernel<true, false>(
-      group_size, input, output_q, output_s, hidden_dim_num_groups, scale_hidden_stride, num_tokens_per_expert, stream);
+      group_size, input, output_q, output_s, hidden_dim_num_groups,
+      scale_hidden_stride, num_tokens_per_expert, kSiluActivation, stream);
 }
 
-template <int THREADS_PER_GROUP>
+template <int THREADS_PER_GROUP, bool FUSE_SILU_AND_MUL>
 void launch_bf16_fp8_g128_row_kernel(
     ffi::TensorView input,
     ffi::TensorView output_q,
     ffi::TensorView output_s,
     int hidden_dim_num_groups,
     int num_tokens_per_expert,
+    int fused_activation_type,
     musaStream_t stream) {
   int subwarps_per_block = choose_subwarps_per_block(hidden_dim_num_groups);
   if constexpr (THREADS_PER_GROUP == 32) {
@@ -731,20 +884,23 @@ void launch_bf16_fp8_g128_row_kernel(
   }
   dim3 grid(hidden_dim_num_groups / subwarps_per_block, num_tokens_per_expert);
   dim3 block(subwarps_per_block * THREADS_PER_GROUP);
-  per_token_group_quant_8bit_bf16_fp8_g128_row_kernel<THREADS_PER_GROUP><<<grid, block, 0, stream>>>(
+  per_token_group_quant_8bit_bf16_fp8_g128_row_kernel<THREADS_PER_GROUP, FUSE_SILU_AND_MUL>
+      <<<grid, block, 0, stream>>>(
       static_cast<__mt_bfloat16*>(input.data_ptr()),
       static_cast<__mt_fp8_e4m3*>(output_q.data_ptr()),
       static_cast<float*>(output_s.data_ptr()),
-      hidden_dim_num_groups);
+      hidden_dim_num_groups,
+      fused_activation_type);
 }
 
-template <int THREADS_PER_GROUP, int HIDDEN_GROUPS_PER_BLOCK, int TOKEN_GROUPS_PER_BLOCK>
+template <int THREADS_PER_GROUP, bool FUSE_SILU_AND_MUL, int HIDDEN_GROUPS_PER_BLOCK, int TOKEN_GROUPS_PER_BLOCK>
 void launch_bf16_fp8_g128_row_tiled_kernel(
     ffi::TensorView input,
     ffi::TensorView output_q,
     ffi::TensorView output_s,
     int hidden_dim_num_groups,
     int num_tokens_per_expert,
+    int fused_activation_type,
     musaStream_t stream) {
   dim3 grid(
       (hidden_dim_num_groups + HIDDEN_GROUPS_PER_BLOCK - 1) / HIDDEN_GROUPS_PER_BLOCK,
@@ -752,68 +908,99 @@ void launch_bf16_fp8_g128_row_tiled_kernel(
   dim3 block(THREADS_PER_GROUP * HIDDEN_GROUPS_PER_BLOCK * TOKEN_GROUPS_PER_BLOCK);
   per_token_group_quant_8bit_bf16_fp8_g128_row_tiled_kernel<
       THREADS_PER_GROUP,
+      FUSE_SILU_AND_MUL,
       HIDDEN_GROUPS_PER_BLOCK,
       TOKEN_GROUPS_PER_BLOCK><<<grid, block, 0, stream>>>(
       static_cast<__mt_bfloat16*>(input.data_ptr()),
       static_cast<__mt_fp8_e4m3*>(output_q.data_ptr()),
       static_cast<float*>(output_s.data_ptr()),
       hidden_dim_num_groups,
-      num_tokens_per_expert);
+      num_tokens_per_expert,
+      fused_activation_type);
 }
 
-template <int THREADS_PER_GROUP>
+template <int THREADS_PER_GROUP, bool FUSE_SILU_AND_MUL>
 bool try_launch_bf16_fp8_g128_row_tiled_kernel(
     ffi::TensorView input,
     ffi::TensorView output_q,
     ffi::TensorView output_s,
     int hidden_dim_num_groups,
     int num_tokens_per_expert,
+    int fused_activation_type,
     musaStream_t stream) {
-  if (num_tokens_per_expert < 16 || hidden_dim_num_groups > 32) {
+  if (hidden_dim_num_groups > 32) {
     return false;
+  }
+  if (num_tokens_per_expert < 16) {
+    if constexpr (FUSE_SILU_AND_MUL) {
+      return false;
+    } else {
+      if (num_tokens_per_expert < 8 || hidden_dim_num_groups < 2 || hidden_dim_num_groups > 8) {
+        return false;
+      }
+    }
+  }
+
+  if constexpr (FUSE_SILU_AND_MUL) {
+    if (hidden_dim_num_groups <= 4) {
+      launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, FUSE_SILU_AND_MUL, 4, 2>(
+          input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, fused_activation_type, stream);
+    } else if (hidden_dim_num_groups <= 8) {
+      launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, FUSE_SILU_AND_MUL, 4, 2>(
+          input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, fused_activation_type, stream);
+    } else if (hidden_dim_num_groups <= 16) {
+      launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, FUSE_SILU_AND_MUL, 8, 2>(
+          input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, fused_activation_type, stream);
+    } else {
+      launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, FUSE_SILU_AND_MUL, 16, 1>(
+          input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, fused_activation_type, stream);
+    }
+    return true;
   }
 
   if (hidden_dim_num_groups <= 1) {
-    launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, 1, 8>(
-        input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+    launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, FUSE_SILU_AND_MUL, 1, 8>(
+        input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, fused_activation_type, stream);
   } else if (hidden_dim_num_groups <= 2) {
-    launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, 2, 4>(
-        input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+    launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, FUSE_SILU_AND_MUL, 2, 4>(
+        input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, fused_activation_type, stream);
   } else if (hidden_dim_num_groups <= 4) {
-    launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, 4, 4>(
-        input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+    launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, FUSE_SILU_AND_MUL, 4, 4>(
+        input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, fused_activation_type, stream);
   } else if (hidden_dim_num_groups <= 8) {
-    launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, 8, 2>(
-        input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+    launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, FUSE_SILU_AND_MUL, 8, 2>(
+        input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, fused_activation_type, stream);
   } else if (hidden_dim_num_groups <= 16) {
-    launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, 16, 1>(
-        input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+    launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, FUSE_SILU_AND_MUL, 16, 1>(
+        input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, fused_activation_type, stream);
   } else if (hidden_dim_num_groups % 4 == 0) {
     return false;
   } else if (hidden_dim_num_groups <= 24) {
-    launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, 8, 2>(
-        input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+    launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, FUSE_SILU_AND_MUL, 8, 2>(
+        input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, fused_activation_type, stream);
   } else {
-    launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, 16, 1>(
-        input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+    launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, FUSE_SILU_AND_MUL, 16, 1>(
+        input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, fused_activation_type, stream);
   }
   return true;
 }
 
+template <bool FUSE_SILU_AND_MUL>
 void dispatch_bf16_fp8_g128_row_kernel(
     ffi::TensorView input,
     ffi::TensorView output_q,
     ffi::TensorView output_s,
     int hidden_dim_num_groups,
     int num_tokens_per_expert,
+    int fused_activation_type,
     musaStream_t stream) {
   constexpr int THREADS_PER_GROUP = BF16_FP8_G128_THREADS_PER_GROUP;
-  if (try_launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP>(
-          input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream)) {
+  if (try_launch_bf16_fp8_g128_row_tiled_kernel<THREADS_PER_GROUP, FUSE_SILU_AND_MUL>(
+          input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, fused_activation_type, stream)) {
     return;
   }
-  launch_bf16_fp8_g128_row_kernel<THREADS_PER_GROUP>(
-      input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+  launch_bf16_fp8_g128_row_kernel<THREADS_PER_GROUP, FUSE_SILU_AND_MUL>(
+      input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, fused_activation_type, stream);
 }
 
 template <int GROUP_SIZE, bool FUSE_SILU_AND_MUL>
@@ -823,6 +1010,7 @@ void launch_i8_fast_kernel(
     ffi::TensorView output_s,
     int hidden_dim_num_groups,
     int num_tokens_per_expert,
+    int fused_activation_type,
     musaStream_t stream) {
   constexpr int THREADS_PER_GROUP = FastQuantConfig<GROUP_SIZE>::THREADS_PER_GROUP;
   const int subwarps_per_block = choose_subwarps_per_block(hidden_dim_num_groups);
@@ -835,7 +1023,77 @@ void launch_i8_fast_kernel(
           static_cast<float*>(output_s.data_ptr()),
           hidden_dim_num_groups,
           0,
-          num_tokens_per_expert);
+          num_tokens_per_expert,
+          fused_activation_type);
+}
+
+template <int GROUP_SIZE, int HIDDEN_GROUPS_PER_BLOCK, int TOKEN_GROUPS_PER_BLOCK>
+void launch_i8_fused_tiled_kernel(
+    ffi::TensorView input,
+    ffi::TensorView output_q,
+    ffi::TensorView output_s,
+    int hidden_dim_num_groups,
+    int num_tokens_per_expert,
+    musaStream_t stream) {
+  constexpr int THREADS_PER_GROUP = FastQuantConfig<GROUP_SIZE>::THREADS_PER_GROUP;
+  dim3 grid(
+      (hidden_dim_num_groups + HIDDEN_GROUPS_PER_BLOCK - 1) / HIDDEN_GROUPS_PER_BLOCK,
+      (num_tokens_per_expert + TOKEN_GROUPS_PER_BLOCK - 1) / TOKEN_GROUPS_PER_BLOCK);
+  dim3 block(THREADS_PER_GROUP * HIDDEN_GROUPS_PER_BLOCK * TOKEN_GROUPS_PER_BLOCK);
+  per_token_group_quant_8bit_i8_fused_tiled_kernel<
+      GROUP_SIZE,
+      THREADS_PER_GROUP,
+      HIDDEN_GROUPS_PER_BLOCK,
+      TOKEN_GROUPS_PER_BLOCK><<<grid, block, 0, stream>>>(
+      static_cast<half*>(input.data_ptr()),
+      static_cast<int8_t*>(output_q.data_ptr()),
+      static_cast<float*>(output_s.data_ptr()),
+      hidden_dim_num_groups,
+      num_tokens_per_expert);
+}
+
+bool try_launch_i8_fused_tiled_kernel(
+    int64_t group_size,
+    ffi::TensorView input,
+    ffi::TensorView output_q,
+    ffi::TensorView output_s,
+    int hidden_dim_num_groups,
+    int num_tokens_per_expert,
+    musaStream_t stream) {
+  if (num_tokens_per_expert >= 512) {
+    return false;
+  }
+
+  if (group_size == 64) {
+    if (hidden_dim_num_groups <= 2 && num_tokens_per_expert >= 128) {
+      launch_i8_fused_tiled_kernel<64, 2, 8>(
+          input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+    } else if (hidden_dim_num_groups <= 4 && num_tokens_per_expert >= 256) {
+      launch_i8_fused_tiled_kernel<64, 4, 4>(
+          input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+    } else {
+      return false;
+    }
+    return true;
+  }
+
+  if (group_size == 128) {
+    if (hidden_dim_num_groups <= 1 && num_tokens_per_expert >= 256) {
+      launch_i8_fused_tiled_kernel<128, 1, 8>(
+          input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+    } else if (hidden_dim_num_groups <= 2 && num_tokens_per_expert >= 256) {
+      launch_i8_fused_tiled_kernel<128, 2, 4>(
+          input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+    } else if (hidden_dim_num_groups <= 4 && num_tokens_per_expert >= 128 && num_tokens_per_expert <= 384) {
+      launch_i8_fused_tiled_kernel<128, 4, 2>(
+          input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+    } else {
+      return false;
+    }
+    return true;
+  }
+
+  return false;
 }
 
 template <bool FUSE_SILU_AND_MUL>
@@ -846,23 +1104,28 @@ void dispatch_i8_fast_kernel(
     ffi::TensorView output_s,
     int hidden_dim_num_groups,
     int num_tokens_per_expert,
+    int fused_activation_type,
     musaStream_t stream) {
   switch (group_size) {
     case 16:
       launch_i8_fast_kernel<16, FUSE_SILU_AND_MUL>(
-          input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+          input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert,
+          fused_activation_type, stream);
       break;
     case 32:
       launch_i8_fast_kernel<32, FUSE_SILU_AND_MUL>(
-          input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+          input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert,
+          fused_activation_type, stream);
       break;
     case 64:
       launch_i8_fast_kernel<64, FUSE_SILU_AND_MUL>(
-          input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+          input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert,
+          fused_activation_type, stream);
       break;
     case 128:
       launch_i8_fast_kernel<128, FUSE_SILU_AND_MUL>(
-          input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+          input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert,
+          fused_activation_type, stream);
       break;
     default:
       TORCH_CHECK(false, "Unsupported group_size");
@@ -882,6 +1145,7 @@ void sgl_per_token_group_quant_8bit_v2(
     double max_8bit,
     bool scale_ue8m0,
     bool fuse_silu_and_mul,
+    int64_t fused_activation_type,
     ffi::TensorView masked_m,
     bool has_masked_m) {
   CHECK_INPUT(input);
@@ -914,6 +1178,11 @@ void sgl_per_token_group_quant_8bit_v2(
   const int num_tokens_per_expert = static_cast<int>(output_q.size(-2));
   const int scale_expert_stride = masked_layout ? static_cast<int>(output_s.stride(0)) : 0;
   const int scale_hidden_stride = static_cast<int>(output_s.stride(-1));
+  const int fused_act = static_cast<int>(fused_activation_type);
+  TORCH_CHECK(
+      fused_act == kSiluActivation || fused_act == kGeluActivation ||
+      fused_act == kGeluTanhActivation,
+      "Unsupported fused activation type");
 
 #define LAUNCH_KERNEL_INNER(SCHEDULER, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, output_s_dtype, ...)           \
   do {                                                                                                               \
@@ -932,7 +1201,8 @@ void sgl_per_token_group_quant_8bit_v2(
             hidden_dim_num_groups,                                                                                   \
             scale_expert_stride,                                                                                     \
             scale_hidden_stride,                                                                                     \
-            num_tokens_per_expert);                                                                                  \
+            num_tokens_per_expert,                                                                                   \
+            fused_act);                                                                                              \
   } while (0)
 
 #define LAUNCH_KERNEL(GROUP_SIZE, T, DST_DTYPE)                                                                     \
@@ -955,22 +1225,46 @@ void sgl_per_token_group_quant_8bit_v2(
                 RowScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, uint32_t, true, true, true);           \
           }                                                                                                         \
         } else {                                                                                                    \
-          LAUNCH_KERNEL_INNER(RowScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, uint32_t, true, true);   \
+          if (masked_layout) {                                                                                      \
+            LAUNCH_KERNEL_INNER(                                                                                    \
+                MaskedLayoutScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, uint32_t, true, true);        \
+          } else {                                                                                                  \
+            LAUNCH_KERNEL_INNER(RowScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, uint32_t, true, true); \
+          }                                                                                                         \
         }                                                                                                           \
       } else {                                                                                                      \
         if (fuse_silu_and_mul) {                                                                                    \
-          LAUNCH_KERNEL_INNER(                                                                                      \
-              RowScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, true, false, true);               \
+          if (masked_layout) {                                                                                      \
+            LAUNCH_KERNEL_INNER(                                                                                    \
+                MaskedLayoutScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, true, false, true);    \
+          } else {                                                                                                  \
+            LAUNCH_KERNEL_INNER(                                                                                    \
+                RowScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, true, false, true);             \
+          }                                                                                                         \
         } else {                                                                                                    \
-          LAUNCH_KERNEL_INNER(RowScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, true);            \
+          if (masked_layout) {                                                                                      \
+            LAUNCH_KERNEL_INNER(                                                                                    \
+                MaskedLayoutScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, true);                 \
+          } else {                                                                                                  \
+            LAUNCH_KERNEL_INNER(RowScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, true);          \
+          }                                                                                                         \
         }                                                                                                           \
       }                                                                                                             \
     } else {                                                                                                        \
       if (fuse_silu_and_mul) {                                                                                      \
-        LAUNCH_KERNEL_INNER(                                                                                        \
-            RowScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, false, false, true);                \
+        if (masked_layout) {                                                                                        \
+          LAUNCH_KERNEL_INNER(                                                                                      \
+              MaskedLayoutScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, false, false, true);     \
+        } else {                                                                                                    \
+          LAUNCH_KERNEL_INNER(                                                                                      \
+              RowScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, false, false, true);              \
+        }                                                                                                           \
       } else {                                                                                                      \
-        LAUNCH_KERNEL_INNER(RowScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, false);             \
+        if (masked_layout) {                                                                                        \
+          LAUNCH_KERNEL_INNER(MaskedLayoutScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, false);  \
+        } else {                                                                                                    \
+          LAUNCH_KERNEL_INNER(RowScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, false);           \
+        }                                                                                                           \
       }                                                                                                             \
     }                                                                                                               \
   } while (0)
@@ -998,12 +1292,20 @@ void sgl_per_token_group_quant_8bit_v2(
     using scalar_t = half;
     if (dtype_equal(output_q.dtype(), dl_int8)) {
       if (!is_column_major && !scale_ue8m0 && !masked_layout) {
-        if (fuse_silu_and_mul && group_size <= 32) {
-          dispatch_i8_fast_kernel<true>(
-              group_size, input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+        const bool prefer_generic_for_large_hidden =
+            (group_size == 64 &&
+             ((hidden_dim_num_groups >= 32 && num_tokens_per_expert >= 2048) ||
+              (hidden_dim_num_groups >= 24 && num_tokens_per_expert >= 4096))) ||
+            (group_size == 128 && hidden_dim_num_groups >= 12 && num_tokens_per_expert >= 2048);
+        if (fuse_silu_and_mul && group_size <= 128 && !prefer_generic_for_large_hidden) {
+          if (!try_launch_i8_fused_tiled_kernel(
+                  group_size, input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream)) {
+            dispatch_i8_fast_kernel<true>(
+                group_size, input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, fused_act, stream);
+          }
         } else if (!fuse_silu_and_mul && group_size == 16) {
           dispatch_i8_fast_kernel<false>(
-              group_size, input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+              group_size, input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, fused_act, stream);
         } else {
           LAUNCH_KERNEL_OUTER(scalar_t, int8_t);
         }
@@ -1022,6 +1324,7 @@ void sgl_per_token_group_quant_8bit_v2(
                 hidden_dim_num_groups,
                 scale_hidden_stride,
                 num_tokens_per_expert,
+                fused_act,
                 stream);
           } else {
             dispatch_fp8_col_nonfused_kernel(
@@ -1044,6 +1347,7 @@ void sgl_per_token_group_quant_8bit_v2(
                 hidden_dim_num_groups,
                 scale_hidden_stride,
                 num_tokens_per_expert,
+                fused_act,
                 stream);
           } else {
             dispatch_fp8_fast_kernel<false, false>(
@@ -1054,6 +1358,7 @@ void sgl_per_token_group_quant_8bit_v2(
                 hidden_dim_num_groups,
                 scale_hidden_stride,
                 num_tokens_per_expert,
+                fused_act,
                 stream);
           }
         }
@@ -1068,9 +1373,14 @@ void sgl_per_token_group_quant_8bit_v2(
     if (dtype_equal(output_q.dtype(), dl_int8)) {
       LAUNCH_KERNEL_OUTER(scalar_t, int8_t);
     } else if (dtype_equal(output_q.dtype(), dl_float8_e4m3fn)) {
-      if (group_size == 128 && !is_column_major && !scale_ue8m0 && !fuse_silu_and_mul && !masked_layout) {
-        dispatch_bf16_fp8_g128_row_kernel(
-            input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, stream);
+      if (group_size == 128 && !is_column_major && !scale_ue8m0 && !masked_layout) {
+        if (fuse_silu_and_mul) {
+          dispatch_bf16_fp8_g128_row_kernel<true>(
+              input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, fused_act, stream);
+        } else {
+          dispatch_bf16_fp8_g128_row_kernel<false>(
+              input, output_q, output_s, hidden_dim_num_groups, num_tokens_per_expert, fused_act, stream);
+        }
       } else {
         LAUNCH_KERNEL_OUTER(scalar_t, __mt_fp8_e4m3);
       }

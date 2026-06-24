@@ -392,6 +392,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     ):
 
         self.moe_runner_config = moe_runner_config
+        # Keep fallback state defined even for paths that return before the
+        # optional HIP AITER runner setup below.
+        self._aiter_runner: Optional[MoeRunner] = None
         if (
             not self.use_flashinfer_cutlass
             and not self.use_flashinfer_trtllm_moe
@@ -433,7 +436,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self.runner = MoeRunner(backend, moe_runner_config)
 
         # Separate runner so CK-shape errors fall back to self.runner on every call.
-        self._aiter_runner: Optional[MoeRunner] = None
         if (
             _use_aiter
             and (

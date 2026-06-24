@@ -1969,12 +1969,18 @@ void launch_topk(ffi::TensorView topk_weights, ffi::TensorView topk_ids,
     if constexpr (IsSoftmax) {
       if (topk == 8 && !has_correction_bias && moe_softcapping <= 0.0f) {
         if (renormalize) {
-          const int halfwarp_rows_per_cta = kWarpsPerCta * 2;
-          const int halfwarp_blocks =
-              (num_tokens + halfwarp_rows_per_cta - 1) / halfwarp_rows_per_cta;
-          topk_softmax_no_bias_renorm_halfwarp_kernel_fixed_k<T, 128, 8>
-              <<<halfwarp_blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
-                  input_ptr, weights_ptr, ids_ptr, num_tokens);
+          if (num_tokens <= 2048) {
+            topk_softmax_no_bias_renorm_warp_kernel_fixed_k<T, 128, 4, 8>
+                <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                    input_ptr, weights_ptr, ids_ptr, num_tokens);
+          } else {
+            const int halfwarp_rows_per_cta = kWarpsPerCta * 2;
+            const int halfwarp_blocks =
+                (num_tokens + halfwarp_rows_per_cta - 1) / halfwarp_rows_per_cta;
+            topk_softmax_no_bias_renorm_halfwarp_kernel_fixed_k<T, 128, 8>
+                <<<halfwarp_blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                    input_ptr, weights_ptr, ids_ptr, num_tokens);
+          }
         } else {
           topk_softmax_no_bias_warp_kernel_fixed_k<T, 128, values_per_thread, 8>
               <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
@@ -2005,7 +2011,7 @@ void launch_topk(ffi::TensorView topk_weights, ffi::TensorView topk_ids,
           if (num_tokens <= 2048) {
             if constexpr (std::is_same_v<T, __mt_bfloat16>) {
 #if SGLANG_ENABLE_BF16_PACKED_TOPK
-              if (num_tokens == 1 || (num_tokens >= 16 && num_tokens <= 32)) {
+              if (num_tokens == 1 || (num_tokens >= 16 && num_tokens <= 128)) {
                 topk_softmax_bf16_e256_no_bias_renorm_onewarp_cta_kernel_fixed_k<
                     8>
                     <<<num_tokens, kWarpSize, 0, stream>>>(
@@ -2098,12 +2104,18 @@ void launch_topk(ffi::TensorView topk_weights, ffi::TensorView topk_ids,
     if constexpr (IsSoftmax) {
       if (topk == 8 && !has_correction_bias && moe_softcapping <= 0.0f) {
         if (renormalize) {
-          const int halfwarp_rows_per_cta = kWarpsPerCta * 2;
-          const int halfwarp_blocks =
-              (num_tokens + halfwarp_rows_per_cta - 1) / halfwarp_rows_per_cta;
-          topk_softmax_no_bias_renorm_halfwarp_kernel_fixed_k<T, 512, 8>
-              <<<halfwarp_blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
-                  input_ptr, weights_ptr, ids_ptr, num_tokens);
+          if (num_tokens <= 2048) {
+            topk_softmax_no_bias_renorm_warp_kernel_fixed_k<T, 512, 16, 8>
+                <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                    input_ptr, weights_ptr, ids_ptr, num_tokens);
+          } else {
+            const int halfwarp_rows_per_cta = kWarpsPerCta * 2;
+            const int halfwarp_blocks =
+                (num_tokens + halfwarp_rows_per_cta - 1) / halfwarp_rows_per_cta;
+            topk_softmax_no_bias_renorm_halfwarp_kernel_fixed_k<T, 512, 8>
+                <<<halfwarp_blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(
+                    input_ptr, weights_ptr, ids_ptr, num_tokens);
+          }
         } else {
           topk_softmax_no_bias_warp_kernel_fixed_k<T, 512, values_per_thread, 8>
               <<<blocks, kWarpsPerCta * kWarpSize, 0, stream>>>(

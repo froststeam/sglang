@@ -301,6 +301,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
+        if self.forward_metadata.mamba_cache_index_mapping is not None:
+            cache_indices = torch.index_select(
+                self.forward_metadata.mamba_cache_index_mapping, 0, cache_indices
+            )
 
         assert isinstance(mixed_qkv, torch.Tensor)
         mixed_qkv = causal_conv1d_update(
@@ -379,6 +383,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         query_start_loc = forward_metadata.query_start_loc
         cache_indices = forward_metadata.mamba_cache_indices
+        mamba_cache_index_mapping = forward_metadata.mamba_cache_index_mapping
         retrieve_next_token = forward_metadata.retrieve_next_token
         retrieve_next_sibling = forward_metadata.retrieve_next_sibling
         retrieve_parent_token = forward_metadata.retrieve_parent_token
@@ -397,6 +402,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
         if is_target_verify:
+            if mamba_cache_index_mapping is not None:
+                cache_indices = torch.index_select(
+                    mamba_cache_index_mapping, 0, cache_indices
+                )
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
             mixed_qkv_reshaped = mixed_qkv.view(
@@ -418,6 +427,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
+            conv_cache_indices = cache_indices
+            state_cache_indices = cache_indices
+            conv_kwargs = {}
+            if mamba_cache_index_mapping is not None:
+                conv_kwargs["cache_index_mapping"] = mamba_cache_index_mapping
+                state_cache_indices = torch.index_select(
+                    mamba_cache_index_mapping, 0, cache_indices
+                )
             if forward_metadata.has_mamba_track_mask:
                 mixed_qkv_to_track = mixed_qkv[
                     :, forward_metadata.track_conv_indices
@@ -433,10 +450,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 activation=layer.activation,
                 conv_states=conv_states,
                 has_initial_state=has_initial_states,
-                cache_indices=cache_indices,
+                cache_indices=conv_cache_indices,
                 query_start_loc=query_start_loc,
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                **conv_kwargs,
             ).transpose(0, 1)[:seq_len]
+            cache_indices = state_cache_indices
 
         query, key, value = torch.split(
             mixed_qkv,

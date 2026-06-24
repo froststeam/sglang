@@ -17,6 +17,7 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.srt.utils.custom_op import register_custom_op
 
 _LOG2E = 1.4426950408889634
+_ENABLE_WIDTH4_PREFILL_SPLIT = False
 
 _CAUSAL_CONV1D_PASS_CONFIGS = dict(MUSA_COMMON_PASS_CONFIGS)
 for _key, _value in (
@@ -34,6 +35,14 @@ def _next_power_of_2(value: int) -> int:
     return 1 << (value - 1).bit_length()
 
 
+def _tilelang_index_dtype(dtype: torch.dtype) -> str:
+    if dtype is torch.int32:
+        return "int32"
+    if dtype is torch.int64:
+        return "int64"
+    raise TypeError(f"Unsupported index dtype for TileLang MUSA kernel: {dtype}")
+
+
 @functools.lru_cache(maxsize=64)
 @tilelang.jit(
     out_idx=[],
@@ -43,6 +52,7 @@ def _next_power_of_2(value: int) -> int:
 )
 def _causal_conv1d_fwd_kernel(
     dtype: str,
+    cache_indices_dtype: str,
     width: int,
     x_stride_dim: int,
     x_stride_token: int,
@@ -56,6 +66,7 @@ def _causal_conv1d_fwd_kernel(
     has_bias: bool,
     has_conv_states: bool,
     has_cache_indices: bool,
+    has_cache_index_mapping: bool,
     has_initial_states: bool,
     use_pad_slot: bool,
     silu_activation: bool,
@@ -67,6 +78,7 @@ def _causal_conv1d_fwd_kernel(
     bias_numel = T.dynamic("bias_numel")
     state_numel = T.dynamic("state_numel")
     cache_numel = T.dynamic("cache_numel")
+    mapping_numel = T.dynamic("mapping_numel")
     init_numel = T.dynamic("init_numel")
     query_numel = T.dynamic("query_numel")
     out_numel = T.dynamic("out_numel")
@@ -78,7 +90,8 @@ def _causal_conv1d_fwd_kernel(
         weight: T.Tensor((w_numel,), dtype),
         bias: T.Tensor((bias_numel,), dtype),
         conv_states: T.Tensor((state_numel,), dtype),
-        cache_indices: T.Tensor((cache_numel,), "int32"),
+        cache_indices: T.Tensor((cache_numel,), cache_indices_dtype),
+        cache_index_mapping: T.Tensor((mapping_numel,), "int32"),
         has_initial_state: T.Tensor((init_numel,), "bool"),
         query_start_loc: T.Tensor((query_numel,), "int32"),
         out: T.Tensor((out_numel,), dtype),
@@ -132,6 +145,8 @@ def _causal_conv1d_fwd_kernel(
             cache_idx = seq_idx
             if has_cache_indices:
                 cache_idx = cache_indices[seq_idx]
+                if has_cache_index_mapping:
+                    cache_idx = cache_index_mapping[cache_idx]
             valid_seq = segment_len > 0
             if use_pad_slot and cache_idx == pad_slot_id:
                 valid_seq = False
@@ -334,6 +349,7 @@ _causal_conv1d_fwd_kernel.mode = "lazy"
 )
 def _causal_conv1d_fwd_width4_vec_kernel(
     dtype: str,
+    cache_indices_dtype: str,
     x_stride_token: int,
     w_stride_dim: int,
     state_stride_seq: int,
@@ -343,6 +359,7 @@ def _causal_conv1d_fwd_width4_vec_kernel(
     has_bias: bool,
     has_conv_states: bool,
     has_cache_indices: bool,
+    has_cache_index_mapping: bool,
     has_initial_states: bool,
     use_pad_slot: bool,
     silu_activation: bool,
@@ -355,6 +372,7 @@ def _causal_conv1d_fwd_width4_vec_kernel(
     bias_numel = T.dynamic("bias_numel")
     state_numel = T.dynamic("state_numel")
     cache_numel = T.dynamic("cache_numel")
+    mapping_numel = T.dynamic("mapping_numel")
     init_numel = T.dynamic("init_numel")
     query_numel = T.dynamic("query_numel")
     out_numel = T.dynamic("out_numel")
@@ -367,7 +385,8 @@ def _causal_conv1d_fwd_width4_vec_kernel(
         weight: T.Tensor((w_numel,), dtype),
         bias: T.Tensor((bias_numel,), dtype),
         conv_states: T.Tensor((state_numel,), dtype),
-        cache_indices: T.Tensor((cache_numel,), "int32"),
+        cache_indices: T.Tensor((cache_numel,), cache_indices_dtype),
+        cache_index_mapping: T.Tensor((mapping_numel,), "int32"),
         has_initial_state: T.Tensor((init_numel,), "bool"),
         query_start_loc: T.Tensor((query_numel,), "int32"),
         out: T.Tensor((out_numel,), dtype),
@@ -418,6 +437,8 @@ def _causal_conv1d_fwd_width4_vec_kernel(
             cache_idx = seq_idx
             if has_cache_indices:
                 cache_idx = cache_indices[seq_idx]
+                if has_cache_index_mapping:
+                    cache_idx = cache_index_mapping[cache_idx]
             valid_seq = segment_len > 0
             if use_pad_slot and cache_idx == pad_slot_id:
                 valid_seq = False
@@ -550,6 +571,7 @@ _causal_conv1d_fwd_width4_vec_kernel.mode = "lazy"
 )
 def _causal_conv1d_prefill_width4_kernel(
     dtype: str,
+    cache_indices_dtype: str,
     x_stride_token: int,
     w_stride_dim: int,
     state_stride_seq: int,
@@ -558,6 +580,7 @@ def _causal_conv1d_prefill_width4_kernel(
     o_stride_token: int,
     has_bias: bool,
     has_cache_indices: bool,
+    has_cache_index_mapping: bool,
     has_initial_states: bool,
     use_pad_slot: bool,
     silu_activation: bool,
@@ -569,6 +592,7 @@ def _causal_conv1d_prefill_width4_kernel(
     bias_numel = T.dynamic("bias_numel")
     state_numel = T.dynamic("state_numel")
     cache_numel = T.dynamic("cache_numel")
+    mapping_numel = T.dynamic("mapping_numel")
     init_numel = T.dynamic("init_numel")
     query_numel = T.dynamic("query_numel")
     out_numel = T.dynamic("out_numel")
@@ -579,7 +603,8 @@ def _causal_conv1d_prefill_width4_kernel(
         weight: T.Tensor((w_numel,), dtype),
         bias: T.Tensor((bias_numel,), dtype),
         conv_states: T.Tensor((state_numel,), dtype),
-        cache_indices: T.Tensor((cache_numel,), "int32"),
+        cache_indices: T.Tensor((cache_numel,), cache_indices_dtype),
+        cache_index_mapping: T.Tensor((mapping_numel,), "int32"),
         has_initial_state: T.Tensor((init_numel,), "bool"),
         query_start_loc: T.Tensor((query_numel,), "int32"),
         out: T.Tensor((out_numel,), dtype),
@@ -630,6 +655,8 @@ def _causal_conv1d_prefill_width4_kernel(
             cache_idx = seq_idx
             if has_cache_indices:
                 cache_idx = cache_indices[seq_idx]
+                if has_cache_index_mapping:
+                    cache_idx = cache_index_mapping[cache_idx]
             valid_seq = segment_len > 0 and feat < dim
             if use_pad_slot and cache_idx == pad_slot_id:
                 valid_seq = False
@@ -751,11 +778,13 @@ _causal_conv1d_prefill_width4_kernel.mode = "lazy"
 )
 def _causal_conv1d_prefill_width4_body_kernel(
     dtype: str,
+    cache_indices_dtype: str,
     x_stride_token: int,
     w_stride_dim: int,
     o_stride_token: int,
     has_bias: bool,
     has_cache_indices: bool,
+    has_cache_index_mapping: bool,
     use_pad_slot: bool,
     silu_activation: bool,
     block_m: int,
@@ -765,6 +794,7 @@ def _causal_conv1d_prefill_width4_body_kernel(
     w_numel = T.dynamic("w_numel")
     bias_numel = T.dynamic("bias_numel")
     cache_numel = T.dynamic("cache_numel")
+    mapping_numel = T.dynamic("mapping_numel")
     query_numel = T.dynamic("query_numel")
     out_numel = T.dynamic("out_numel")
 
@@ -773,7 +803,8 @@ def _causal_conv1d_prefill_width4_body_kernel(
         x: T.Tensor((x_numel,), dtype),
         weight: T.Tensor((w_numel,), dtype),
         bias: T.Tensor((bias_numel,), dtype),
-        cache_indices: T.Tensor((cache_numel,), "int32"),
+        cache_indices: T.Tensor((cache_numel,), cache_indices_dtype),
+        cache_index_mapping: T.Tensor((mapping_numel,), "int32"),
         query_start_loc: T.Tensor((query_numel,), "int32"),
         out: T.Tensor((out_numel,), dtype),
         max_seq_len: T.int32,
@@ -820,6 +851,8 @@ def _causal_conv1d_prefill_width4_body_kernel(
             cache_idx = seq_idx
             if has_cache_indices:
                 cache_idx = cache_indices[seq_idx]
+                if has_cache_index_mapping:
+                    cache_idx = cache_index_mapping[cache_idx]
             valid_seq = segment_len > 0 and feat < dim
             if use_pad_slot and cache_idx == pad_slot_id:
                 valid_seq = False
@@ -901,6 +934,7 @@ _causal_conv1d_prefill_width4_body_kernel.mode = "lazy"
 )
 def _causal_conv1d_decode_width4_batched_kernel(
     dtype: str,
+    cache_indices_dtype: str,
     x_stride_token: int,
     w_stride_dim: int,
     state_stride_seq: int,
@@ -909,6 +943,7 @@ def _causal_conv1d_decode_width4_batched_kernel(
     o_stride_token: int,
     has_bias: bool,
     has_cache_indices: bool,
+    has_cache_index_mapping: bool,
     has_initial_states: bool,
     use_pad_slot: bool,
     silu_activation: bool,
@@ -920,6 +955,7 @@ def _causal_conv1d_decode_width4_batched_kernel(
     bias_numel = T.dynamic("bias_numel")
     state_numel = T.dynamic("state_numel")
     cache_numel = T.dynamic("cache_numel")
+    mapping_numel = T.dynamic("mapping_numel")
     init_numel = T.dynamic("init_numel")
     out_numel = T.dynamic("out_numel")
     num_threads = block_feats * batch_per_block
@@ -930,7 +966,8 @@ def _causal_conv1d_decode_width4_batched_kernel(
         weight: T.Tensor((w_numel,), dtype),
         bias: T.Tensor((bias_numel,), dtype),
         conv_states: T.Tensor((state_numel,), dtype),
-        cache_indices: T.Tensor((cache_numel,), "int32"),
+        cache_indices: T.Tensor((cache_numel,), cache_indices_dtype),
+        cache_index_mapping: T.Tensor((mapping_numel,), "int32"),
         has_initial_state: T.Tensor((init_numel,), "bool"),
         out: T.Tensor((out_numel,), dtype),
         batch: T.int32,
@@ -963,6 +1000,8 @@ def _causal_conv1d_decode_width4_batched_kernel(
             cache_idx = seq_idx
             if has_cache_indices and seq_idx < batch:
                 cache_idx = cache_indices[seq_idx]
+                if has_cache_index_mapping:
+                    cache_idx = cache_index_mapping[cache_idx]
             valid = seq_idx < batch and feat < dim
             if use_pad_slot and cache_idx == pad_slot_id:
                 valid = False
@@ -1028,6 +1067,7 @@ def _check_inputs(
     query_start_loc: torch.Tensor,
     cache_indices: Optional[torch.Tensor],
     has_initial_state: Optional[torch.Tensor],
+    cache_index_mapping: Optional[torch.Tensor],
     activation: Optional[Union[str, bool]],
     seq_lens_cpu: List[int],
 ) -> tuple[int, int, int, int, str]:
@@ -1054,10 +1094,21 @@ def _check_inputs(
     if bias is not None and (bias.dim() != 1 or bias.numel() != dim):
         raise ValueError("bias must have shape (dim,)")
     if cache_indices is not None:
-        if cache_indices.dim() != 1 or cache_indices.dtype is not torch.int32:
-            raise TypeError("cache_indices must be a 1D int32 tensor")
+        if cache_indices.dim() != 1 or cache_indices.dtype not in (
+            torch.int32,
+            torch.int64,
+        ):
+            raise TypeError("cache_indices must be a 1D int32 or int64 tensor")
         if cache_indices.numel() != query_start_loc.numel() - 1:
             raise ValueError("cache_indices length must match batch size")
+    if cache_index_mapping is not None:
+        if (
+            cache_index_mapping.dim() != 1
+            or cache_index_mapping.dtype is not torch.int32
+        ):
+            raise TypeError("cache_index_mapping must be a 1D int32 tensor")
+        if cache_indices is None:
+            raise ValueError("cache_index_mapping requires cache_indices")
     if has_initial_state is not None:
         if has_initial_state.dim() != 1 or has_initial_state.dtype is not torch.bool:
             raise TypeError("has_initial_state must be a 1D bool tensor")
@@ -1098,6 +1149,7 @@ def _causal_conv1d_fwd_impl(
     seq_lens_cpu: List[int],
     cache_indices: Optional[torch.Tensor] = None,
     has_initial_state: Optional[torch.Tensor] = None,
+    cache_index_mapping: Optional[torch.Tensor] = None,
     activation: Optional[Union[str, bool]] = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
 ) -> torch.Tensor:
@@ -1111,6 +1163,7 @@ def _causal_conv1d_fwd_impl(
         query_start_loc,
         cache_indices,
         has_initial_state,
+        cache_index_mapping,
         activation,
         seq_lens_cpu,
     )
@@ -1122,6 +1175,9 @@ def _causal_conv1d_fwd_impl(
     bias_arg = storage_window(bias) if bias is not None else x_arg
     conv_states_arg = storage_window(conv_states) if conv_states is not None else x_arg
     cache_indices_arg = cache_indices if cache_indices is not None else query_start_loc
+    cache_index_mapping_arg = (
+        cache_index_mapping if cache_index_mapping is not None else cache_indices_arg
+    )
     has_initial_state_arg = (
         has_initial_state
         if has_initial_state is not None
@@ -1132,13 +1188,29 @@ def _causal_conv1d_fwd_impl(
     if max_seq_len == 1 and query_start_loc.numel() > 128 and dim >= 256:
         block_n = 128
     block_m = 8
-    if width == 4 and max_seq_len >= 128 and query_start_loc.numel() > 2:
-        block_m = 28
-        block_n = 512
+    if width == 4 and max_seq_len >= 128:
+        if max_seq_len <= 512:
+            block_m = 4
+            block_n = 256
+        elif max_seq_len < 4096:
+            if query_start_loc.numel() > 4:
+                block_m = 28
+                block_n = 256
+            else:
+                block_m = 12
+                block_n = 128 if query_start_loc.numel() > 2 else 256
+        else:
+            block_m = 28
+            block_n = 256
     num_cache_lines = conv_states.size(0) if conv_states is not None else 0
     state_stride_seq = conv_states.stride(0) if conv_states is not None else 0
     state_stride_dim = conv_states.stride(1) if conv_states is not None else 0
     state_stride_token = conv_states.stride(2) if conv_states is not None else 0
+    cache_indices_dtype = (
+        _tilelang_index_dtype(cache_indices.dtype)
+        if cache_indices is not None
+        else "int32"
+    )
 
     if (
         width == 4
@@ -1152,6 +1224,7 @@ def _causal_conv1d_fwd_impl(
     ):
         _causal_conv1d_decode_width4_batched_kernel(
             dtype,
+            cache_indices_dtype,
             int(x.stride(1)),
             int(weight.stride(0)),
             int(state_stride_seq),
@@ -1160,6 +1233,7 @@ def _causal_conv1d_fwd_impl(
             int(out.stride(1)),
             bias is not None,
             cache_indices is not None,
+            cache_index_mapping is not None,
             has_initial_state is not None,
             pad_slot_id is not None,
             activation in ("silu", "swish"),
@@ -1171,6 +1245,7 @@ def _causal_conv1d_fwd_impl(
             bias_arg,
             conv_states_arg,
             cache_indices_arg,
+            cache_index_mapping_arg,
             has_initial_state_arg,
             out_arg,
             int(query_start_loc.numel() - 1),
@@ -1181,7 +1256,8 @@ def _causal_conv1d_fwd_impl(
         return out
 
     if (
-        width == 4
+        _ENABLE_WIDTH4_PREFILL_SPLIT
+        and width == 4
         and max_seq_len >= 128
         and query_start_loc.numel() > 2
         and conv_states is not None
@@ -1192,6 +1268,7 @@ def _causal_conv1d_fwd_impl(
     ):
         _causal_conv1d_prefill_width4_kernel(
             dtype,
+            cache_indices_dtype,
             int(x.stride(1)),
             int(weight.stride(0)),
             int(state_stride_seq),
@@ -1200,6 +1277,7 @@ def _causal_conv1d_fwd_impl(
             int(out.stride(1)),
             bias is not None,
             cache_indices is not None,
+            cache_index_mapping is not None,
             has_initial_state is not None,
             pad_slot_id is not None,
             activation in ("silu", "swish"),
@@ -1211,6 +1289,7 @@ def _causal_conv1d_fwd_impl(
             bias_arg,
             conv_states_arg,
             cache_indices_arg,
+            cache_index_mapping_arg,
             has_initial_state_arg,
             query_start_loc,
             out_arg,
@@ -1222,11 +1301,13 @@ def _causal_conv1d_fwd_impl(
         if max_seq_len > block_m:
             _causal_conv1d_prefill_width4_body_kernel(
                 dtype,
+                cache_indices_dtype,
                 int(x.stride(1)),
                 int(weight.stride(0)),
                 int(out.stride(1)),
                 bias is not None,
                 cache_indices is not None,
+                cache_index_mapping is not None,
                 pad_slot_id is not None,
                 activation in ("silu", "swish"),
                 int(block_m),
@@ -1236,6 +1317,7 @@ def _causal_conv1d_fwd_impl(
                 weight_arg,
                 bias_arg,
                 cache_indices_arg,
+                cache_index_mapping_arg,
                 query_start_loc,
                 out_arg,
                 int(max_seq_len),
@@ -1258,6 +1340,7 @@ def _causal_conv1d_fwd_impl(
         vec_elems = 1
         _causal_conv1d_fwd_width4_vec_kernel(
             dtype,
+            cache_indices_dtype,
             int(x.stride(1)),
             int(weight.stride(0)),
             int(state_stride_seq),
@@ -1267,6 +1350,7 @@ def _causal_conv1d_fwd_impl(
             bias is not None,
             conv_states is not None,
             cache_indices is not None,
+            cache_index_mapping is not None,
             has_initial_state is not None,
             pad_slot_id is not None,
             activation in ("silu", "swish"),
@@ -1279,6 +1363,7 @@ def _causal_conv1d_fwd_impl(
             bias_arg,
             conv_states_arg,
             cache_indices_arg,
+            cache_index_mapping_arg,
             has_initial_state_arg,
             query_start_loc,
             out_arg,
@@ -1291,6 +1376,7 @@ def _causal_conv1d_fwd_impl(
 
     _causal_conv1d_fwd_kernel(
         dtype,
+        cache_indices_dtype,
         int(width),
         int(x.stride(0)),
         int(x.stride(1)),
@@ -1304,6 +1390,7 @@ def _causal_conv1d_fwd_impl(
         bias is not None,
         conv_states is not None,
         cache_indices is not None,
+        cache_index_mapping is not None,
         has_initial_state is not None,
         pad_slot_id is not None,
         activation in ("silu", "swish"),
@@ -1315,6 +1402,7 @@ def _causal_conv1d_fwd_impl(
         bias_arg,
         conv_states_arg,
         cache_indices_arg,
+        cache_index_mapping_arg,
         has_initial_state_arg,
         query_start_loc,
         out_arg,
@@ -1341,6 +1429,7 @@ def _causal_conv1d_fwd_custom(
     has_initial_state: Optional[torch.Tensor] = None,
     activation: Optional[str] = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
+    cache_index_mapping: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return _causal_conv1d_fwd_impl(
         x,
@@ -1349,10 +1438,11 @@ def _causal_conv1d_fwd_custom(
         conv_states,
         query_start_loc,
         seq_lens_cpu,
-        cache_indices,
-        has_initial_state,
-        activation,
-        pad_slot_id,
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        cache_index_mapping=cache_index_mapping,
+        activation=activation,
+        pad_slot_id=pad_slot_id,
     )
 
 
@@ -1367,7 +1457,23 @@ def causal_conv1d_fwd(
     has_initial_state: Optional[torch.Tensor] = None,
     activation: Optional[Union[str, bool]] = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
+    cache_index_mapping: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if isinstance(seq_lens_cpu, torch.Tensor) and seq_lens_cpu.device.type != "cpu":
+        # Backward-compatible positional form used by the generic mamba wrapper:
+        # causal_conv1d_fwd(..., query_start_loc, cache_indices,
+        #                   has_initial_state, activation, pad_slot_id)
+        old_cache_indices = seq_lens_cpu
+        old_has_initial_state = cache_indices
+        old_activation = has_initial_state
+        old_pad_slot_id = activation
+        seq_lens_cpu = query_start_loc.diff().detach().cpu().tolist()
+        cache_indices = old_cache_indices
+        has_initial_state = old_has_initial_state
+        activation = old_activation
+        pad_slot_id = old_pad_slot_id
+    elif isinstance(seq_lens_cpu, torch.Tensor):
+        seq_lens_cpu = seq_lens_cpu.detach().cpu().tolist()
     if isinstance(activation, bool):
         activation = "silu" if activation else None
     return _causal_conv1d_fwd_impl(
@@ -1377,10 +1483,11 @@ def causal_conv1d_fwd(
         conv_states,
         query_start_loc,
         seq_lens_cpu,
-        cache_indices,
-        has_initial_state,
-        activation,
-        pad_slot_id,
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        cache_index_mapping=cache_index_mapping,
+        activation=activation,
+        pad_slot_id=pad_slot_id,
     )
 
 
@@ -1395,6 +1502,7 @@ def causal_conv1d_fn(
     has_initial_state: Optional[torch.Tensor] = None,
     activation: Optional[Union[str, bool]] = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
+    cache_index_mapping: Optional[torch.Tensor] = None,
     **_: object,
 ) -> torch.Tensor:
     return causal_conv1d_fwd(
@@ -1404,8 +1512,9 @@ def causal_conv1d_fn(
         conv_states,
         query_start_loc,
         seq_lens_cpu,
-        cache_indices,
-        has_initial_state,
-        activation,
-        pad_slot_id,
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        cache_index_mapping=cache_index_mapping,
+        activation=activation,
+        pad_slot_id=pad_slot_id,
     )

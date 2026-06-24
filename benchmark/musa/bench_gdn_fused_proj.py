@@ -45,9 +45,10 @@ def bench_one(m: int, num_tests: int) -> None:
     def run_triton() -> None:
         triton_gdn(mixed_qkvz, mixed_ba, num_heads_qk, num_heads_v, head_qk, head_v)
 
-    tilelang_kernel = (
-        "qkvzba_contiguous_vec_kernel" if m >= 8192 else "qkvzba_contiguous_row_kernel"
-    )
+    if m >= 128:
+        tilelang_kernel = "qkvzba_contiguous_vec_kernel"
+    else:
+        tilelang_kernel = "qkvzba_contiguous_row_kernel"
     tilelang_s = bench_kineto(
         run_tilelang,
         tilelang_kernel,

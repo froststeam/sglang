@@ -136,6 +136,125 @@ def _count_topk_block_hist_kernel(max_experts: int):
 @tilelang.jit(
     out_idx=[], target="musa", pass_configs=_PASS_CONFIGS, compile_flags=_COMPILE_FLAGS
 )
+def _count_topk_single_block_kernel(max_experts: int):
+    n = T.dynamic("n")
+    e = T.dynamic("e")
+    slots_per_block = 1024
+
+    @T.prim_func
+    def deep_gemm_contig_preprocess_count_topk_single_block_kernel(
+        topk_ids: T.Tensor((n,), "int32"),
+        counts: T.Tensor((e,), "int32"),
+        num_slots: T.int32,
+        num_local_experts: T.int32,
+    ):
+        with T.Kernel(1, threads=256) as (_bid,):
+            tid = T.get_thread_binding()
+            local_counts = T.alloc_shared((max_experts,), "int32")
+
+            for i in T.serial(T.ceildiv(max_experts, 256)):
+                expert = i * 256 + tid
+                if expert < num_local_experts:
+                    local_counts[expert] = T.int32(0)
+            T.sync_threads()
+
+            for i in T.serial(T.ceildiv(slots_per_block, 256)):
+                slot = i * 256 + tid
+                if slot < num_slots:
+                    expert = topk_ids[slot]
+                    if expert >= 0 and expert < num_local_experts:
+                        T.atomic_add(local_counts[expert], T.int32(1))
+            T.sync_threads()
+
+            for i in T.serial(T.ceildiv(max_experts, 256)):
+                expert = i * 256 + tid
+                if expert < num_local_experts:
+                    counts[expert] = local_counts[expert]
+
+    return deep_gemm_contig_preprocess_count_topk_single_block_kernel
+
+
+@functools.lru_cache(maxsize=8)
+@tilelang.jit(
+    out_idx=[], target="musa", pass_configs=_PASS_CONFIGS, compile_flags=_COMPILE_FLAGS
+)
+def _count_prefix_topk_single_block_kernel(max_experts: int, max_block_m: int):
+    n = T.dynamic("n")
+    e = T.dynamic("e")
+    m = T.dynamic("m")
+    slots_per_block = 1024
+    scan_size = 1 << (max_experts - 1).bit_length()
+    threads = max(256, scan_size)
+
+    @T.prim_func
+    def deep_gemm_contig_preprocess_count_prefix_topk_single_block_kernel(
+        topk_ids: T.Tensor((n,), "int32"),
+        counts: T.Tensor((e,), "int32"),
+        cursor: T.Tensor((e,), "int32"),
+        m_indices: T.Tensor((m,), "int32"),
+        num_slots: T.int32,
+        num_local_experts: T.int32,
+        block_m: T.int32,
+    ):
+        with T.Kernel(1, threads=threads) as (_bid,):
+            tid = T.get_thread_binding()
+            local_counts = T.alloc_shared((max_experts,), "int32")
+            prefix = T.alloc_shared((scan_size,), "int32")
+            expert = T.alloc_var("int32")
+            cnt = T.alloc_var("int32")
+            aligned_cnt = T.alloc_var("int32")
+            start = T.alloc_var("int32")
+            addend = T.alloc_var("int32")
+
+            for i in T.serial(T.ceildiv(max_experts, threads)):
+                expert = i * threads + tid
+                if expert < num_local_experts:
+                    local_counts[expert] = T.int32(0)
+            T.sync_threads()
+
+            for i in T.serial(T.ceildiv(slots_per_block, threads)):
+                slot = i * threads + tid
+                if slot < num_slots:
+                    expert = topk_ids[slot]
+                    if expert >= 0 and expert < num_local_experts:
+                        T.atomic_add(local_counts[expert], T.int32(1))
+            T.sync_threads()
+
+            if tid < scan_size:
+                if tid < num_local_experts:
+                    cnt = local_counts[tid]
+                    counts[tid] = cnt
+                    prefix[tid] = T.ceildiv(cnt, block_m) * block_m
+                else:
+                    prefix[tid] = T.int32(0)
+            T.sync_threads()
+
+            for offset in T.serial((scan_size.bit_length() - 1)):
+                step = 1 << offset
+                addend = T.int32(0)
+                if tid < scan_size and tid >= step:
+                    addend = prefix[tid - step]
+                T.sync_threads()
+                if tid < scan_size and tid >= step:
+                    prefix[tid] = prefix[tid] + addend
+                T.sync_threads()
+
+            if tid < num_local_experts:
+                cnt = local_counts[tid]
+                aligned_cnt = T.ceildiv(cnt, block_m) * block_m
+                start = prefix[tid] - aligned_cnt
+                cursor[tid] = start
+                for pad in T.serial(max_block_m):
+                    if pad < aligned_cnt - cnt:
+                        m_indices[start + cnt + pad] = tid
+
+    return deep_gemm_contig_preprocess_count_prefix_topk_single_block_kernel
+
+
+@functools.lru_cache(maxsize=8)
+@tilelang.jit(
+    out_idx=[], target="musa", pass_configs=_PASS_CONFIGS, compile_flags=_COMPILE_FLAGS
+)
 def _prefix_counts_kernel(max_experts: int, max_block_m: int):
     e = T.dynamic("e")
     m = T.dynamic("m")
@@ -224,6 +343,62 @@ def _prefix_counts_scan_kernel(max_experts: int, max_block_m: int):
                         m_indices[start + cnt + pad] = tid
 
     return deep_gemm_contig_preprocess_prefix_counts_scan
+
+
+@functools.lru_cache(maxsize=8)
+@tilelang.jit(
+    out_idx=[], target="musa", pass_configs=_PASS_CONFIGS, compile_flags=_COMPILE_FLAGS
+)
+def _prefix_counts_tree_kernel(max_experts: int, max_block_m: int):
+    e = T.dynamic("e")
+    m = T.dynamic("m")
+    scan_size = 1 << (max_experts - 1).bit_length()
+    threads = max(256, scan_size)
+
+    @T.prim_func
+    def deep_gemm_contig_preprocess_prefix_counts_tree(
+        counts: T.Tensor((e,), "int32"),
+        cursor: T.Tensor((e,), "int32"),
+        m_indices: T.Tensor((m,), "int32"),
+        num_local_experts: T.int32,
+        block_m: T.int32,
+    ):
+        with T.Kernel(1, threads=threads) as (_bid,):
+            tid = T.get_thread_binding()
+            prefix = T.alloc_shared((scan_size,), "int32")
+            cnt = T.alloc_var("int32")
+            aligned_cnt = T.alloc_var("int32")
+            start = T.alloc_var("int32")
+            addend = T.alloc_var("int32")
+
+            if tid < scan_size:
+                if tid < num_local_experts:
+                    cnt = counts[tid]
+                    prefix[tid] = T.ceildiv(cnt, block_m) * block_m
+                else:
+                    prefix[tid] = T.int32(0)
+            T.sync_threads()
+
+            for offset in T.serial((scan_size.bit_length() - 1)):
+                step = 1 << offset
+                addend = T.int32(0)
+                if tid < scan_size and tid >= step:
+                    addend = prefix[tid - step]
+                T.sync_threads()
+                if tid < scan_size and tid >= step:
+                    prefix[tid] = prefix[tid] + addend
+                T.sync_threads()
+
+            if tid < num_local_experts:
+                cnt = counts[tid]
+                aligned_cnt = T.ceildiv(cnt, block_m) * block_m
+                start = prefix[tid] - aligned_cnt
+                cursor[tid] = start
+                for pad in T.serial(max_block_m):
+                    if pad < aligned_cnt - cnt:
+                        m_indices[start + cnt + pad] = tid
+
+    return deep_gemm_contig_preprocess_prefix_counts_tree
 
 
 @functools.lru_cache(maxsize=8)
@@ -960,17 +1135,27 @@ def _impl_fp8(
         raise ValueError(f"num_local_experts must be positive, got {num_local_experts}")
     clear = _clear_i32_kernel()
     fill = _fill_i32_kernel()
+    single_block_count = _count_topk_single_block_kernel(num_local_experts)
     count = _count_topk_block_hist_kernel(num_local_experts)
     block_m = int(block_m)
     if block_m <= 0:
         raise ValueError(f"block_m must be positive, got {block_m}")
+    single_block_count_prefix = _count_prefix_topk_single_block_kernel(
+        num_local_experts, block_m
+    )
+    use_single_block_count = num_slots <= 1024
+    use_single_block_count_prefix = block_m != 1 and use_single_block_count
     prefix = (
         _prefix_counts_no_pad_kernel(num_local_experts)
         if block_m == 1
         else (
-            _prefix_counts_scan_kernel(num_local_experts, block_m)
-            if num_local_experts <= 1024
-            else _prefix_counts_kernel(num_local_experts, block_m)
+            _prefix_counts_tree_kernel(num_local_experts, block_m)
+            if num_tokens < 512 and num_local_experts <= 1024
+            else (
+                _prefix_counts_scan_kernel(num_local_experts, block_m)
+                if num_local_experts <= 1024
+                else _prefix_counts_kernel(num_local_experts, block_m)
+            )
         )
     )
     compact = _fp8_assign_compact_kernel(
@@ -981,15 +1166,20 @@ def _impl_fp8(
         vec_elems,
         topk,
     )
-    clear(counts, tilelang.cdiv(num_local_experts, 256), num_local_experts)
-    count(
-        topk_ids.reshape(-1),
-        counts,
-        tilelang.cdiv(num_slots, 1024),
-        num_slots,
-        num_local_experts,
-    )
+    if not use_single_block_count and not use_single_block_count_prefix:
+        clear(counts, tilelang.cdiv(num_local_experts, 256), num_local_experts)
+        count(
+            topk_ids.reshape(-1),
+            counts,
+            tilelang.cdiv(num_slots, 1024),
+            num_slots,
+            num_local_experts,
+        )
     if block_m == 1:
+        if use_single_block_count:
+            single_block_count(
+                topk_ids.reshape(-1), counts, num_slots, num_local_experts
+            )
         prefix(counts, cursor, num_local_experts)
     else:
         fill(
@@ -998,7 +1188,18 @@ def _impl_fp8(
             m_indices.numel(),
             num_local_experts - 1,
         )
-        prefix(counts, cursor, m_indices, num_local_experts, block_m)
+        if use_single_block_count_prefix:
+            single_block_count_prefix(
+                topk_ids.reshape(-1),
+                counts,
+                cursor,
+                m_indices,
+                num_slots,
+                num_local_experts,
+                block_m,
+            )
+        else:
+            prefix(counts, cursor, m_indices, num_local_experts, block_m)
     compact(
         hidden_states.reshape(-1),
         topk_ids.reshape(-1),
@@ -1043,17 +1244,27 @@ def _impl_bf16(
         raise ValueError(f"num_local_experts must be positive, got {num_local_experts}")
     clear = _clear_i32_kernel()
     fill = _fill_i32_kernel()
+    single_block_count = _count_topk_single_block_kernel(num_local_experts)
     count = _count_topk_block_hist_kernel(num_local_experts)
     block_m = int(block_m)
     if block_m <= 0:
         raise ValueError(f"block_m must be positive, got {block_m}")
+    single_block_count_prefix = _count_prefix_topk_single_block_kernel(
+        num_local_experts, block_m
+    )
+    use_single_block_count = num_slots <= 1024
+    use_single_block_count_prefix = block_m != 1 and use_single_block_count
     prefix = (
         _prefix_counts_no_pad_kernel(num_local_experts)
         if block_m == 1
         else (
-            _prefix_counts_scan_kernel(num_local_experts, block_m)
-            if num_local_experts <= 1024
-            else _prefix_counts_kernel(num_local_experts, block_m)
+            _prefix_counts_tree_kernel(num_local_experts, block_m)
+            if num_tokens < 512 and num_local_experts <= 1024
+            else (
+                _prefix_counts_scan_kernel(num_local_experts, block_m)
+                if num_local_experts <= 1024
+                else _prefix_counts_kernel(num_local_experts, block_m)
+            )
         )
     )
     compact = _bf16_assign_compact_kernel(
@@ -1064,15 +1275,20 @@ def _impl_bf16(
         vec_elems,
         topk,
     )
-    clear(counts, tilelang.cdiv(num_local_experts, 256), num_local_experts)
-    count(
-        topk_ids.reshape(-1),
-        counts,
-        tilelang.cdiv(num_slots, 1024),
-        num_slots,
-        num_local_experts,
-    )
+    if not use_single_block_count and not use_single_block_count_prefix:
+        clear(counts, tilelang.cdiv(num_local_experts, 256), num_local_experts)
+        count(
+            topk_ids.reshape(-1),
+            counts,
+            tilelang.cdiv(num_slots, 1024),
+            num_slots,
+            num_local_experts,
+        )
     if block_m == 1:
+        if use_single_block_count:
+            single_block_count(
+                topk_ids.reshape(-1), counts, num_slots, num_local_experts
+            )
         prefix(counts, cursor, num_local_experts)
     else:
         fill(
@@ -1081,7 +1297,18 @@ def _impl_bf16(
             m_indices.numel(),
             num_local_experts - 1,
         )
-        prefix(counts, cursor, m_indices, num_local_experts, block_m)
+        if use_single_block_count_prefix:
+            single_block_count_prefix(
+                topk_ids.reshape(-1),
+                counts,
+                cursor,
+                m_indices,
+                num_slots,
+                num_local_experts,
+                block_m,
+            )
+        else:
+            prefix(counts, cursor, m_indices, num_local_experts, block_m)
     compact(
         hidden_states.reshape(-1),
         topk_ids.reshape(-1),

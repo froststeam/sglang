@@ -10,6 +10,9 @@ import torch
 from mate.testing.utils import bench_kineto
 
 from sglang.srt.hardware_backend.musa.jit_kernel.tilelang.causal_conv1d import (
+    _ENABLE_WIDTH4_PREFILL_SPLIT,
+)
+from sglang.srt.hardware_backend.musa.jit_kernel.tilelang.causal_conv1d import (
     causal_conv1d_fwd as tilelang_causal_conv1d_fwd,
 )
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
@@ -51,7 +54,7 @@ def _dtype_from_name(name: str) -> torch.dtype:
 def _tilelang_kernel_name(
     batch: int, seq_len: int, dim: int, width: int
 ) -> Union[str, tuple[str, ...]]:
-    if width == 4 and seq_len >= 128 and batch > 1:
+    if _ENABLE_WIDTH4_PREFILL_SPLIT and width == 4 and seq_len >= 128 and batch > 1:
         return (
             "sglang_musa_causal_conv1d_prefill_width4_kernel",
             "sglang_musa_causal_conv1d_prefill_width4_body_kernel",
@@ -65,7 +68,13 @@ def _tilelang_kernel_name(
 
 
 def _tilelang_block_m(batch: int, seq_len: int, width: int) -> int:
-    if width == 4 and seq_len >= 128 and batch > 1:
+    if _ENABLE_WIDTH4_PREFILL_SPLIT and width == 4 and seq_len >= 128 and batch > 1:
+        return 28
+    if width == 4 and seq_len >= 128:
+        if seq_len <= 512:
+            return 4
+        if seq_len < 4096:
+            return 28 if batch >= 4 else 12
         return 28
     return 8
 

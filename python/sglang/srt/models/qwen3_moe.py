@@ -111,13 +111,10 @@ _is_npu = is_npu()
 
 if _is_musa:
     from sglang.srt.hardware_backend.musa.jit_kernel.csrc.norm import (
-        fused_qk_rmsnorm_mrope as musa_fused_qk_rmsnorm_mrope,
-    )
-    from sglang.srt.hardware_backend.musa.jit_kernel.csrc.norm import (
-        fused_qk_rmsnorm_mrope_cache as musa_fused_qk_rmsnorm_mrope_cache,
-    )
-    from sglang.srt.hardware_backend.musa.jit_kernel.csrc.norm import (
         store_cache as musa_store_cache,
+    )
+    from sglang.srt.hardware_backend.musa.jit_kernel.csrc.norm import (
+        try_fused_qk_rmsnorm_mrope as musa_fused_qk_rmsnorm_mrope,
     )
 
 if _is_npu:
@@ -630,62 +627,69 @@ class Qwen3MoeAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         self.rotary_emb._match_cos_sin_cache_dtype(q)
-        num_tokens = q.shape[0]
-        q_3d = q.view(num_tokens, self.num_heads, self.head_dim)
-        k_3d = k.view(num_tokens, self.num_kv_heads, self.head_dim)
-        v_3d = v.view(num_tokens, self.num_kv_heads, self.head_dim)
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
             self.attn.layer_id
         )
         row_dim = self.num_kv_heads * self.head_dim
+        common_kwargs = dict(
+            q=q,
+            k=k,
+            q_weight=self.q_norm.weight,
+            k_weight=self.k_norm.weight,
+            positions=positions,
+            cos_sin_cache=self.rotary_emb.cos_sin_cache,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            is_neox=self.rotary_emb.is_neox_style,
+            mrope_section=self.rotary_emb.mrope_section,
+            is_interleaved=self.rotary_emb.mrope_interleaved,
+            eps=self.q_norm.variance_epsilon,
+        )
         if use_cache_fusion:
-            q_out = musa_fused_qk_rmsnorm_mrope_cache(
-                q=q_3d,
-                k=k_3d,
-                v=v_3d,
-                q_weight=self.q_norm.weight,
-                k_weight=self.k_norm.weight,
-                positions=positions,
-                cos_sin_cache=self.rotary_emb.cos_sin_cache,
+            fused_qk = musa_fused_qk_rmsnorm_mrope(
+                **common_kwargs,
+                v=v,
                 k_cache=k_cache.view(-1, row_dim),
                 v_cache=v_cache.view(-1, row_dim),
                 indices=forward_batch.out_cache_loc,
-                is_neox=self.rotary_emb.is_neox_style,
-                mrope_section_t=self.rotary_emb.mrope_section[0],
-                mrope_section_h=self.rotary_emb.mrope_section[1],
-                mrope_section_w=self.rotary_emb.mrope_section[2],
-                is_interleaved=self.rotary_emb.mrope_interleaved,
-                eps=self.q_norm.variance_epsilon,
+                return_k=False,
             )
+            if fused_qk is None:
+                return self.forward_prepare_native(
+                    positions, hidden_states, forward_batch
+                )
+            q_out, _ = fused_qk
             self._used_musa_fused_qk_norm_mrope_cache_last_call = True
-            inner_state = q_out.reshape(q.shape), None, None, forward_batch
+            inner_state = q_out, None, None, forward_batch
             return None, forward_batch, inner_state
         else:
-            q_out, k_out = musa_fused_qk_rmsnorm_mrope(
-                q=q_3d,
-                k=k_3d,
-                q_weight=self.q_norm.weight,
-                k_weight=self.k_norm.weight,
-                positions=positions,
-                cos_sin_cache=self.rotary_emb.cos_sin_cache,
-                is_neox=self.rotary_emb.is_neox_style,
-                mrope_section_t=self.rotary_emb.mrope_section[0],
-                mrope_section_h=self.rotary_emb.mrope_section[1],
-                mrope_section_w=self.rotary_emb.mrope_section[2],
-                is_interleaved=self.rotary_emb.mrope_interleaved,
-                eps=self.q_norm.variance_epsilon,
+            fused_qk = musa_fused_qk_rmsnorm_mrope(
+                **common_kwargs,
+                v=v,
+                k_cache=k_cache.view(-1, row_dim),
+                v_cache=v_cache.view(-1, row_dim),
+                indices=forward_batch.out_cache_loc,
             )
-            musa_store_cache(
-                k_out.reshape(num_tokens, row_dim),
-                v,
-                k_cache.view(-1, row_dim),
-                v_cache.view(-1, row_dim),
-                forward_batch.out_cache_loc,
-            )
+            if fused_qk is None:
+                fused_qk = musa_fused_qk_rmsnorm_mrope(**common_kwargs)
+                if fused_qk is None:
+                    return self.forward_prepare_native(
+                        positions, hidden_states, forward_batch
+                    )
+                q_out, k_out = fused_qk
+                musa_store_cache(
+                    k_out.reshape(q.shape[0], row_dim),
+                    v,
+                    k_cache.view(-1, row_dim),
+                    v_cache.view(-1, row_dim),
+                    forward_batch.out_cache_loc,
+                )
+            else:
+                q_out, k_out = fused_qk
         self._used_musa_fused_qk_norm_mrope_cache_last_call = True
 
-        q_out = q_out.reshape(q.shape)
-        inner_state = q_out, k_out.reshape(k.shape), v, forward_batch
+        inner_state = q_out, k_out, v, forward_batch
         return None, forward_batch, inner_state
 
     def apply_qk_norm_rope(self, qkv, positions, forward_batch):

@@ -418,6 +418,7 @@ class MambaMixer2(torch.nn.Module):
         # modes; they are computed at top-level model forward since they
         # stay the same and reused for all mamba layers in the same iteration
         state_indices_tensor = metadata.mamba_cache_indices
+        mamba_cache_index_mapping = metadata.mamba_cache_index_mapping
         conv_state = layer_cache.conv[0]
         ssm_state = layer_cache.temporal
 
@@ -522,6 +523,15 @@ class MambaMixer2(torch.nn.Module):
                 if not use_triton_causal_conv
                 else causal_conv1d_fn_triton
             )
+            conv_kwargs = {}
+            if mamba_cache_index_mapping is not None:
+                if use_triton_causal_conv:
+                    cache_indices = torch.index_select(
+                        mamba_cache_index_mapping, 0, cache_indices
+                    )
+                    state_indices_tensor_p = cache_indices
+                else:
+                    conv_kwargs["cache_index_mapping"] = mamba_cache_index_mapping
             hidden_states_B_C_p = ccfn(
                 x,
                 conv_weights,
@@ -532,7 +542,13 @@ class MambaMixer2(torch.nn.Module):
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc_p,
                 seq_lens_cpu=mixed_metadata.extend_seq_lens_cpu,
+                **conv_kwargs,
             ).transpose(0, 1)[:num_prefill_tokens]
+
+            if mamba_cache_index_mapping is not None and not use_triton_causal_conv:
+                state_indices_tensor_p = torch.index_select(
+                    mamba_cache_index_mapping, 0, state_indices_tensor_p
+                )
 
             hidden_states_p, B_p, C_p = split_hidden_states_B_C_fn(hidden_states_B_C_p)
 
@@ -579,6 +595,10 @@ class MambaMixer2(torch.nn.Module):
 
         # Process decode requests
         if has_decode:
+            if mamba_cache_index_mapping is not None:
+                state_indices_tensor_d = torch.index_select(
+                    mamba_cache_index_mapping, 0, state_indices_tensor_d
+                )
             is_target_verify = metadata.is_target_verify
 
             # 2. Convolution sequence transformation
