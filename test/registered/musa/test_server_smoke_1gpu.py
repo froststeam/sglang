@@ -11,7 +11,9 @@ class TestMusaServerSmoke1GPU(musa_server_smoke.MusaServerSmokeTest):
         name="qwen-dense-1gpu",
         model_env="MUSA_SMOKE_QWEN_DENSE_MODEL",
         tp_size=1,
-        default_gsm8k_min_score=0.85,
+        default_gsm8k_min_score=0.92,
+        default_gsm8k_chat_template_kwargs='{"enable_thinking": false}',
+        default_gsm8k_reasoning_effort="none",
         extra_args_env="MUSA_SMOKE_QWEN_DENSE_EXTRA_ARGS",
     )
 
