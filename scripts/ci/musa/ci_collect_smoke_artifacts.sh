@@ -27,6 +27,73 @@ for model_var in \
   fi
 done
 
+parallel_info="$(
+  python3 - <<'PY'
+import os
+import shlex
+
+
+def collect_extra_args():
+    values = []
+    for key, value in os.environ.items():
+        if key.startswith("MUSA_SMOKE_") and key.endswith("_EXTRA_ARGS") and value:
+            values.append(value)
+    args = []
+    for value in sorted(values):
+        try:
+            args.extend(shlex.split(value))
+        except ValueError:
+            args.extend(value.split())
+    return args
+
+
+def option_value(args, names):
+    for index, arg in enumerate(args):
+        if arg in names and index + 1 < len(args):
+            return args[index + 1]
+        for name in names:
+            prefix = f"{name}="
+            if arg.startswith(prefix):
+                return arg[len(prefix) :]
+    return ""
+
+
+def infer_tp():
+    suite = os.environ.get("MUSA_RUN_SUITE", "")
+    job = os.environ.get("CI_JOB_NAME_SLUG") or os.environ.get("CI_JOB_NAME", "")
+    text = f"{suite} {job}".lower()
+    for size in ("8", "4", "2", "1"):
+        if f"{size}gpu" in text:
+            return size
+    return ""
+
+
+def infer_ep():
+    suite = os.environ.get("MUSA_RUN_SUITE", "").lower()
+    job = (os.environ.get("CI_JOB_NAME_SLUG") or os.environ.get("CI_JOB_NAME", "")).lower()
+    text = f"{suite} {job}"
+    if "gemma4-26b-a4b" in text or "qwen3-vl-32b" in text:
+        return "4"
+    return ""
+
+
+args = collect_extra_args()
+tp = option_value(args, {"--tp", "--tp-size", "--tensor-parallel-size"}) or infer_tp()
+ep = option_value(
+    args,
+    {
+        "--ep",
+        "--ep-size",
+        "--expert-parallel-size",
+        "--expert-model-parallel-size",
+        "--moe-ep-size",
+    },
+) or infer_ep()
+print(tp or "-", ep or "-")
+PY
+)"
+read -r smoke_tp smoke_ep <<<"${parallel_info}"
+
 shopt -s nullglob
 marker_file="${artifact_dir}/.start"
 
@@ -50,6 +117,8 @@ report_files=("${artifact_dir}"/gsm8k__*.html "${artifact_dir}"/gsm8k__*.json)
   echo "commit_sha=${CI_COMMIT_SHA:-}"
   echo "musa_run_suite=${MUSA_RUN_SUITE:-}"
   echo "smoke_model=${smoke_model}"
+  echo "smoke_tp=${smoke_tp}"
+  echo "smoke_ep=${smoke_ep}"
   echo "artifact_dir=${artifact_dir}"
   echo
   echo "files:"
