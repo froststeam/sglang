@@ -221,6 +221,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         # Create logits processor for the multimodal model
         self.logits_processor = LogitsProcessor(config.text_config)
+        self.capture_aux_hidden_states = False
 
         self.post_init()
 

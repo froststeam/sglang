@@ -108,6 +108,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
 )
@@ -135,10 +136,7 @@ def can_fuse_shared_expert(
     config: PretrainedConfig,
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
-    """Whether the shared expert may be fused as an extra MoE expert (Qwen3.5 + Aiter).
-
-    Caller must still gate on ``support_shared_expert_fusion`` and ``_use_aiter``.
-    """
+    """Whether the shared expert may be fused as an extra MoE expert."""
     if (
         get_global_server_args().disable_shared_experts_fusion is True
         or getattr(config, "shared_expert_intermediate_size", 0) <= 0
@@ -255,19 +253,28 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # n_shared_experts is not defined, but shared_expert_intermediate_size is defined, so we use 1 as the number of shared experts
             self.num_shared_experts = 1
 
-        self.enable_shared_expert_fusion = False  # default to False
-        if _use_aiter:
-            # enable shared expert fusion when use aiter
-            self.enable_shared_expert_fusion = (
-                support_shared_expert_fusion
-                and can_fuse_shared_expert(config, quant_config)
-            )
+        self.enable_shared_expert_fusion = (
+            support_shared_expert_fusion
+            and can_fuse_shared_expert(config, quant_config)
+            and (_use_aiter or _is_musa)
+        )
         if self.enable_shared_expert_fusion:
             self.num_fused_shared_experts = self.num_shared_experts
+            if _is_musa and layer_id == 0:
+                log_info_on_rank0(
+                    logger,
+                    "Qwen3.5 shared expert fusion enabled on MUSA: "
+                    f"num_fused_shared_experts={self.num_fused_shared_experts}, "
+                    f"routed_experts={self.num_experts}",
+                )
 
         self.topk = TopK(
-            top_k=config.num_experts_per_tok,
+            top_k=config.num_experts_per_tok
+            + (self.num_fused_shared_experts if _is_musa else 0),
             renormalize=config.norm_topk_prob,
+            num_fused_shared_experts=(
+                self.num_fused_shared_experts if _is_musa else 0
+            ),
             layer_id=layer_id,
         )
 
@@ -361,6 +368,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         shared_out = self.shared_expert_gate(hidden_states)
         shared_logits = shared_out[0] if isinstance(shared_out, tuple) else shared_out
         return F.sigmoid(shared_logits)
+
+    def _get_shared_expert_gate_output(
+        self, hidden_states: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        if not self.enable_shared_expert_fusion or self.shared_expert_gate is None:
+            return None
+        shared_out = self.shared_expert_gate(hidden_states)
+        return shared_out[0] if isinstance(shared_out, tuple) else shared_out
 
     def _append_shared_to_topk_output(
         self,
@@ -591,9 +606,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     def _forward_router_experts(self, hidden_states: torch.Tensor):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
-        if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
-            topk_output
+        topk_kwargs = {}
+        if self.enable_shared_expert_fusion and _is_musa:
+            topk_kwargs["shared_expert_gate_output"] = (
+                self._get_shared_expert_gate_output(hidden_states)
+            )
+        topk_output = self.topk(hidden_states, router_logits, **topk_kwargs)
+        if (
+            self.enable_shared_expert_fusion
+            and not _is_musa
+            and TopKOutputChecker.format_is_standard(topk_output)
         ):
             topk_output = self._append_shared_to_topk_output(topk_output, hidden_states)
         return self.experts(hidden_states, topk_output)

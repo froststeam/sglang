@@ -414,6 +414,7 @@ class TopK(MultiPlatformOp):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         *,
+        shared_expert_gate_output: Optional[torch.Tensor] = None,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
@@ -454,6 +455,7 @@ class TopK(MultiPlatformOp):
                     layer_id=self.layer_id,
                     router_logits=router_logits,
                     topk_config=self.topk_config,
+                    shared_expert_gate_output=shared_expert_gate_output,
                     num_token_non_padded=num_token_non_padded,
                     expert_location_dispatch_info=expert_location_dispatch_info,
                 )
@@ -498,7 +500,10 @@ class TopK(MultiPlatformOp):
         )
 
     def empty_topk_output(self, device: torch.device) -> TopKOutput:
-        topk = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
+        if _is_musa and self.topk_config.num_fused_shared_experts > 0:
+            topk = self.topk_config.top_k
+        else:
+            topk = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
@@ -620,6 +625,8 @@ def fused_topk(
     renormalize: bool,
     correction_bias: Optional[torch.Tensor] = None,
     scoring_func: str = "softmax",
+    shared_expert_gate_output: Optional[torch.Tensor] = None,
+    num_fused_shared_experts: int = 0,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -643,12 +650,22 @@ def fused_topk(
                 topk_weights=topk_weights,
             )
         else:
-            topk_softmax(
-                topk_weights,
-                topk_ids,
-                gating_output,
-                renormalize,
-            )
+            if _is_musa:
+                topk_softmax(
+                    topk_weights,
+                    topk_ids,
+                    gating_output,
+                    renormalize,
+                    shared_expert_gate_output=shared_expert_gate_output,
+                    num_fused_shared_experts=num_fused_shared_experts,
+                )
+            else:
+                topk_softmax(
+                    topk_weights,
+                    topk_ids,
+                    gating_output,
+                    renormalize,
+                )
 
     elif scoring_func == "sigmoid":
         if _use_aiter and correction_bias is not None:
@@ -660,6 +677,16 @@ def fused_topk(
                 num_expert_group=1,
                 topk_group=1,
                 need_renorm=renormalize,
+            )
+        elif _is_musa:
+            topk_sigmoid(
+                topk_weights,
+                topk_ids,
+                gating_output,
+                renormalize,
+                correction_bias,
+                shared_expert_gate_output=shared_expert_gate_output,
+                num_fused_shared_experts=num_fused_shared_experts,
             )
         else:
             topk_sigmoid(
@@ -1346,6 +1373,7 @@ def select_experts(
     topk_config: TopKConfig,
     *,
     layer_id: Optional[int] = None,
+    shared_expert_gate_output: Optional[torch.Tensor] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ) -> StandardTopKOutput:
@@ -1361,6 +1389,11 @@ def select_experts(
     routed_scaling_factor = topk_config.routed_scaling_factor
     apply_routed_scaling_factor_on_output = (
         topk_config.apply_routed_scaling_factor_on_output
+    )
+    use_musa_fused_shared_experts = (
+        num_fused_shared_experts > 0
+        and shared_expert_gate_output is not None
+        and _is_musa
     )
 
     scoring_func = topk_config.scoring_func
@@ -1405,7 +1438,11 @@ def select_experts(
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
-    elif torch_native and custom_routing_function is None:
+    elif (
+        torch_native
+        and custom_routing_function is None
+        and not use_musa_fused_shared_experts
+    ):
         assert (
             num_token_non_padded is None
         ), "num_token_non_padded is not yet supported in fused_topk_native"
@@ -1462,6 +1499,12 @@ def select_experts(
                 renormalize=renormalize,
                 correction_bias=correction_bias,
                 scoring_func=scoring_func,
+                shared_expert_gate_output=(
+                    shared_expert_gate_output if use_musa_fused_shared_experts else None
+                ),
+                num_fused_shared_experts=(
+                    num_fused_shared_experts if use_musa_fused_shared_experts else 0
+                ),
             )
     else:
         assert (

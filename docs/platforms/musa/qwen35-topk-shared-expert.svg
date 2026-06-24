@@ -1,0 +1,105 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1680" height="960" viewBox="0 0 1680 960" role="img" aria-labelledby="title desc">
+  <title id="title">MUSA Qwen3.5 fused shared expert TopK</title>
+  <desc id="desc">A simplified implementation diagram showing how MUSA TopK emits routed top8 plus one shared expert slot for Qwen3.5.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="14" markerHeight="14" refX="12" refY="7" orient="auto">
+      <path d="M0,0 L14,7 L0,14 Z" fill="#263238"/>
+    </marker>
+    <style>
+      .bg { fill: #f7f9fb; }
+      .title { font: 760 42px Inter, Arial, sans-serif; fill: #101820; }
+      .sub { font: 20px Inter, Arial, sans-serif; fill: #52616b; }
+      .boxTitle { font: 740 24px Inter, Arial, sans-serif; fill: #102027; }
+      .text { font: 18px Inter, Arial, sans-serif; fill: #37474f; }
+      .small { font: 14px Inter, Arial, sans-serif; fill: #546e7a; }
+      .mono { font: 16px "SFMono-Regular", Consolas, monospace; fill: #263238; }
+      .monoSmall { font: 13px "SFMono-Regular", Consolas, monospace; fill: #455a64; }
+      .panel { rx: 12; stroke-width: 2; }
+      .py { fill: #e8f2ff; stroke: #64a6f7; }
+      .kernel { fill: #ecfdf5; stroke: #34d399; }
+      .slot { fill: #fff7df; stroke: #f5b841; }
+      .moe { fill: #f0edff; stroke: #8b7cf6; }
+      .risk { fill: #fff0f2; stroke: #fb7185; }
+      .code { fill: #ffffff; stroke: #cfd8dc; }
+      .arrow { stroke: #263238; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .thin { stroke: #78909c; stroke-width: 1.5; fill: none; }
+      .chipRouted { fill: #dbeafe; stroke: #60a5fa; stroke-width: 1.4; rx: 6; }
+      .chipShared { fill: #fde68a; stroke: #f59e0b; stroke-width: 1.4; rx: 6; }
+      .kernelLine { stroke: #16a34a; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1680" height="960"/>
+
+  <text class="title" x="70" y="82">Qwen3.5 MUSA Shared Expert Fusion</text>
+  <text class="sub" x="72" y="118">一句话：TopK kernel 直接输出 routed top8 + shared slot，不再 Python 侧 append。</text>
+
+  <rect class="panel py" x="70" y="180" width="300" height="180"/>
+  <text class="boxTitle" x="100" y="230">1. 模型层</text>
+  <text class="text" x="100" y="270">算 routed gate</text>
+  <text class="text" x="100" y="302">同时算 shared gate</text>
+  <text class="mono" x="100" y="336">router_logits [M,256]</text>
+
+  <rect class="panel kernel" x="520" y="160" width="640" height="440"/>
+  <text class="boxTitle" x="552" y="210">2. MUSA TopK Kernel</text>
+  <text class="text" x="552" y="246">每个 token 在 kernel 内完成 routed top8 + shared slot</text>
+
+  <rect class="code" x="570" y="294" width="180" height="84" rx="8"/>
+  <text class="mono" x="600" y="329">load logits</text>
+  <text class="small" x="600" y="356">256 routed experts</text>
+
+  <rect class="code" x="802" y="294" width="180" height="84" rx="8"/>
+  <text class="mono" x="832" y="329">select top8</text>
+  <text class="small" x="832" y="356">argmax loop</text>
+
+  <rect class="code" x="1012" y="294" width="108" height="84" rx="8"/>
+  <text class="mono" x="1034" y="329">renorm</text>
+  <text class="small" x="1030" y="356">top8 only</text>
+
+  <path class="kernelLine" d="M750 336 L802 336"/>
+  <path class="kernelLine" d="M982 336 L1012 336"/>
+
+  <rect class="slot" x="590" y="430" width="510" height="112" rx="10"/>
+  <text class="boxTitle" x="620" y="472">写输出：topk shape 从 [M,8] 变成 [M,9]</text>
+  <text class="mono" x="620" y="512">slot 0..7 = routed experts, slot 8 = shared expert</text>
+
+  <path class="kernelLine" d="M1066 378 C1066 410 1018 424 950 430"/>
+
+  <rect class="panel slot" x="1310" y="180" width="300" height="180"/>
+  <text class="boxTitle" x="1340" y="230">3. 输出契约</text>
+  <text class="text" x="1340" y="270">shared id = 256</text>
+  <text class="text" x="1340" y="302">shared weight = sigmoid(gate)</text>
+  <text class="mono" x="1340" y="336">topk_ids/weights [M,9]</text>
+
+  <rect class="panel moe" x="740" y="710" width="420" height="150"/>
+  <text class="boxTitle" x="770" y="760">4. Fused MoE</text>
+  <text class="text" x="770" y="800">按 257 个 expert 处理</text>
+  <text class="mono" x="770" y="834">E=257, topk=9</text>
+
+  <rect class="panel risk" x="70" y="710" width="460" height="150"/>
+  <text class="boxTitle" x="100" y="760">5. 需要避免</text>
+  <text class="text" x="100" y="800">不要 kernel append 后又 Python append</text>
+  <text class="text" x="100" y="832">否则 topk shape / expert id 会错</text>
+
+  <path class="arrow" d="M370 270 C430 270 460 270 520 270"/>
+  <path class="arrow" d="M1160 270 C1220 270 1250 270 1310 270"/>
+  <path class="arrow" d="M1460 360 C1460 610 1160 610 1030 710"/>
+  <path class="arrow" d="M840 600 C840 650 860 675 910 710"/>
+  <path class="arrow" d="M520 760 C610 760 650 760 740 760"/>
+
+  <g transform="translate(574,632)">
+    <rect class="chipRouted" x="0" y="0" width="74" height="44"/>
+    <text class="monoSmall" x="18" y="28">id0</text>
+    <rect class="chipRouted" x="86" y="0" width="74" height="44"/>
+    <text class="monoSmall" x="104" y="28">id1</text>
+    <rect class="chipRouted" x="172" y="0" width="74" height="44"/>
+    <text class="monoSmall" x="195" y="28">...</text>
+    <rect class="chipRouted" x="258" y="0" width="74" height="44"/>
+    <text class="monoSmall" x="276" y="28">id7</text>
+    <rect class="chipShared" x="370" y="0" width="154" height="44"/>
+    <text class="monoSmall" x="394" y="28">id8 = 256</text>
+  </g>
+
+  <rect class="code" x="70" y="895" width="1540" height="38" rx="6"/>
+  <text class="monoSmall" x="92" y="919">Code path: qwen2_moe.py -> musa/jit_kernel/csrc/moe.py -> moe/topk_gating.mu::launch_topk_with_shared_experts -> fused_moe / deep_gemm preprocess</text>
+</svg>

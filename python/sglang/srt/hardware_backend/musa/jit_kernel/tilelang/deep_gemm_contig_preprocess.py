@@ -182,6 +182,54 @@ def _prefix_counts_kernel(max_experts: int, max_block_m: int):
 @tilelang.jit(
     out_idx=[], target="musa", pass_configs=_PASS_CONFIGS, compile_flags=_COMPILE_FLAGS
 )
+def _prefix_counts_scan_kernel(max_experts: int, max_block_m: int):
+    e = T.dynamic("e")
+    m = T.dynamic("m")
+    scan_size = 1 << (max_experts - 1).bit_length()
+    threads = max(256, scan_size)
+
+    @T.prim_func
+    def deep_gemm_contig_preprocess_prefix_counts_scan(
+        counts: T.Tensor((e,), "int32"),
+        cursor: T.Tensor((e,), "int32"),
+        m_indices: T.Tensor((m,), "int32"),
+        num_local_experts: T.int32,
+        block_m: T.int32,
+    ):
+        with T.Kernel(1, threads=threads) as (_bid,):
+            tid = T.get_thread_binding()
+            prefix = T.alloc_shared((scan_size,), "int32")
+            cnt = T.alloc_var("int32")
+            aligned_cnt = T.alloc_var("int32")
+            start = T.alloc_var("int32")
+
+            if tid < scan_size:
+                if tid < num_local_experts:
+                    cnt = counts[tid]
+                    prefix[tid] = T.ceildiv(cnt, block_m) * block_m
+                else:
+                    prefix[tid] = T.int32(0)
+            T.sync_threads()
+
+            T.cumsum(prefix, prefix, dim=0)
+            T.sync_threads()
+
+            if tid < num_local_experts:
+                cnt = counts[tid]
+                aligned_cnt = T.ceildiv(cnt, block_m) * block_m
+                start = prefix[tid] - aligned_cnt
+                cursor[tid] = start
+                for pad in T.serial(max_block_m):
+                    if pad < aligned_cnt - cnt:
+                        m_indices[start + cnt + pad] = tid
+
+    return deep_gemm_contig_preprocess_prefix_counts_scan
+
+
+@functools.lru_cache(maxsize=8)
+@tilelang.jit(
+    out_idx=[], target="musa", pass_configs=_PASS_CONFIGS, compile_flags=_COMPILE_FLAGS
+)
 def _prefix_counts_aligned_no_fill_kernel(max_experts: int):
     e = T.dynamic("e")
 
@@ -283,13 +331,13 @@ def _fp8_assign_compact_kernel(
             lane = tid % threads_per_group
             elem_base = T.alloc_var("int32")
             hidden_group = T.alloc_var("int32")
-            input_base = T.alloc_var("int32")
+            input_base = T.alloc_var("int64")
             local_absmax = T.alloc_local((1,), "float32")
             scale = T.alloc_local((1,), "float32")
             scale_inv = T.alloc_local((1,), "float32")
             values = T.alloc_local((vec_elems,), "float32")
             dst = T.alloc_var("int32")
-            out_base = T.alloc_var("int32")
+            out_base = T.alloc_var("int64")
             dst_shared = T.alloc_shared((topk,), "int32")
 
             if tid < topk:
@@ -323,7 +371,9 @@ def _fp8_assign_compact_kernel(
                 hidden_group = tile * groups_per_block + subgroup
                 if hidden_group < hidden_groups:
                     input_base = (
-                        bt * hidden_size + hidden_group * group_size + elem_base
+                        T.Cast("int64", bt) * hidden_size
+                        + hidden_group * group_size
+                        + elem_base
                     )
                     local_absmax[0] = eps
                     for i in T.vectorized(vec_elems):
@@ -358,7 +408,7 @@ def _fp8_assign_compact_kernel(
                         dst = dst_shared[topk_idx]
                         if dst >= 0:
                             out_base = (
-                                dst * hidden_size
+                                T.Cast("int64", dst) * hidden_size
                                 + hidden_group * group_size
                                 + elem_base
                             )
@@ -497,7 +547,10 @@ def _fp8_assign_compact_kernel(
                                         max_8bit,
                                     ),
                                 )
-                            if lane == 0:
+                    if lane == 0:
+                        for topk_idx in T.serial(topk):
+                            dst = dst_shared[topk_idx]
+                            if dst >= 0:
                                 output_s[dst * hidden_groups + hidden_group] = (
                                     scale_inv[0]
                                 )
@@ -548,9 +601,9 @@ def _bf16_assign_compact_kernel(
             lane = tid % threads_per_group
             elem_base = T.alloc_var("int32")
             hidden_group = T.alloc_var("int32")
-            input_base = T.alloc_var("int32")
+            input_base = T.alloc_var("int64")
             dst = T.alloc_var("int32")
-            out_base = T.alloc_var("int32")
+            out_base = T.alloc_var("int64")
             dst_shared = T.alloc_shared((topk,), "int32")
 
             if tid < topk:
@@ -584,13 +637,15 @@ def _bf16_assign_compact_kernel(
                 hidden_group = tile * groups_per_block + subgroup
                 if hidden_group < hidden_groups:
                     input_base = (
-                        bt * hidden_size + hidden_group * group_size + elem_base
+                        T.Cast("int64", bt) * hidden_size
+                        + hidden_group * group_size
+                        + elem_base
                     )
                     for topk_idx in T.serial(topk):
                         dst = dst_shared[topk_idx]
                         if dst >= 0:
                             out_base = (
-                                dst * hidden_size
+                                T.Cast("int64", dst) * hidden_size
                                 + hidden_group * group_size
                                 + elem_base
                             )
@@ -666,9 +721,9 @@ def _bf16_deepep_assign_compact_kernel(
             lane = tid % threads_per_group
             elem_base = T.alloc_var("int32")
             hidden_group = T.alloc_var("int32")
-            input_base = T.alloc_var("int32")
+            input_base = T.alloc_var("int64")
             dst = T.alloc_var("int32")
-            out_base = T.alloc_var("int32")
+            out_base = T.alloc_var("int64")
             dst_shared = T.alloc_shared((topk,), "int32")
 
             if tid < topk:
@@ -695,13 +750,15 @@ def _bf16_deepep_assign_compact_kernel(
                 hidden_group = tile * groups_per_block + subgroup
                 if hidden_group < hidden_groups:
                     input_base = (
-                        bt * hidden_size + hidden_group * group_size + elem_base
+                        T.Cast("int64", bt) * hidden_size
+                        + hidden_group * group_size
+                        + elem_base
                     )
                     for topk_idx in T.serial(topk):
                         dst = dst_shared[topk_idx]
                         if dst >= 0:
                             out_base = (
-                                dst * hidden_size
+                                T.Cast("int64", dst) * hidden_size
                                 + hidden_group * group_size
                                 + elem_base
                             )
@@ -780,9 +837,9 @@ def _fp8_deepep_assign_compact_kernel(
             lane = tid % threads_per_group
             elem_base = T.alloc_var("int32")
             hidden_group = T.alloc_var("int32")
-            input_base = T.alloc_var("int32")
+            input_base = T.alloc_var("int64")
             dst = T.alloc_var("int32")
-            out_base = T.alloc_var("int32")
+            out_base = T.alloc_var("int64")
             dst_shared = T.alloc_shared((topk,), "int32")
 
             if tid < topk:
@@ -809,13 +866,15 @@ def _fp8_deepep_assign_compact_kernel(
                 hidden_group = tile * groups_per_block + subgroup
                 if hidden_group < hidden_groups:
                     input_base = (
-                        bt * hidden_size + hidden_group * group_size + elem_base
+                        T.Cast("int64", bt) * hidden_size
+                        + hidden_group * group_size
+                        + elem_base
                     )
                     for topk_idx in T.serial(topk):
                         dst = dst_shared[topk_idx]
                         if dst >= 0:
                             out_base = (
-                                dst * hidden_size
+                                T.Cast("int64", dst) * hidden_size
                                 + hidden_group * group_size
                                 + elem_base
                             )
@@ -839,6 +898,8 @@ def _fp8_config(hidden_size: int) -> tuple[int, int, int] | None:
     if hidden_size <= 0 or hidden_size % 128 != 0:
         return None
     hidden_groups = hidden_size // 128
+    if hidden_groups == 22:
+        return hidden_groups, hidden_groups, 8
     if hidden_groups == 24:
         return hidden_groups, hidden_groups, 8
     if hidden_groups <= 32:
@@ -906,7 +967,11 @@ def _impl_fp8(
     prefix = (
         _prefix_counts_no_pad_kernel(num_local_experts)
         if block_m == 1
-        else _prefix_counts_kernel(num_local_experts, block_m)
+        else (
+            _prefix_counts_scan_kernel(num_local_experts, block_m)
+            if num_local_experts <= 1024
+            else _prefix_counts_kernel(num_local_experts, block_m)
+        )
     )
     compact = _fp8_assign_compact_kernel(
         hidden_states.dtype,
@@ -985,7 +1050,11 @@ def _impl_bf16(
     prefix = (
         _prefix_counts_no_pad_kernel(num_local_experts)
         if block_m == 1
-        else _prefix_counts_kernel(num_local_experts, block_m)
+        else (
+            _prefix_counts_scan_kernel(num_local_experts, block_m)
+            if num_local_experts <= 1024
+            else _prefix_counts_kernel(num_local_experts, block_m)
+        )
     )
     compact = _bf16_assign_compact_kernel(
         hidden_states.dtype,
