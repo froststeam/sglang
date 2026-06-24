@@ -45,15 +45,9 @@ MTGPU_TARGET="${MTGPU_TARGET:-mp_31}"
 MUTLASS_REPO="${MUTLASS_REPO:-git@sh-code.mthreads.com:mcc-qa/third_party/mutlass.git}"
 FLASHINFER_REPO="${FLASHINFER_REPO:-git@sh-code.mthreads.com:mcc-qa/third_party/flashinfer.git}"
 MUSA_CI_SSH_KNOWN_HOSTS="${MUSA_CI_SSH_KNOWN_HOSTS:-sh-code.mthreads.com}"
-TORCH_VERSION="${TORCH_VERSION:-$(python3 - <<'PY'
-try:
-    import torch
-except Exception:
-    print("2.9.0")
-else:
-    print(torch.__version__.split("+")[0])
-PY
-)}"
+# Keep the MUSA CI torch version aligned with the torch_musa wheel in the image.
+# Runner-local CPU torch may be newer and ABI-incompatible with torch_musa.
+TORCH_VERSION="${TORCH_VERSION:-2.9.0}"
 SGLANG_CI_INSTALL_DEPS="${SGLANG_CI_INSTALL_DEPS:-1}"
 SGLANG_CI_INSTALL_SYSTEM_DEPS="${SGLANG_CI_INSTALL_SYSTEM_DEPS:-1}"
 SGLANG_CI_UPGRADE_TORCHADA="${SGLANG_CI_UPGRADE_TORCHADA:-1}"
@@ -120,6 +114,20 @@ setup_ssh_known_hosts() {
       return 1
     }
   done
+}
+
+verify_torch_version() {
+  TORCH_DEVICE_BACKEND_AUTOLOAD=0 python3 - <<PY
+import torch
+
+expected = "${TORCH_VERSION}"
+actual = torch.__version__.split("+")[0]
+if actual != expected:
+    raise SystemExit(
+        f"Expected torch=={expected}, got {torch.__version__} from {torch.__file__}"
+    )
+print(f"Verified torch {torch.__version__} from {torch.__file__}")
+PY
 }
 
 if [ ! -d "${REPO_ROOT}/python" ] || [ ! -d "${REPO_ROOT}/sgl-kernel" ]; then
@@ -212,7 +220,7 @@ fi
 
 "${PIP_INSTALL[@]}" --upgrade pip setuptools ninja --user
 if [ "${SGLANG_CI_UPGRADE_TORCHADA}" = "1" ]; then
-  "${PIP_INSTALL[@]}" --upgrade torchada --user
+  "${PIP_INSTALL[@]}" --upgrade torchada "torch==${TORCH_VERSION}" --user
 fi
 
 if [ -d "${WHL_DIR}" ] && compgen -G "${WHL_DIR}"/*.whl > /dev/null; then
@@ -282,6 +290,8 @@ fi
 if [ -n "${SGLANG_CI_TEST_PACKAGES}" ]; then
   "${PIP_INSTALL[@]}" ${SGLANG_CI_TEST_PACKAGES} --user
 fi
+
+verify_torch_version
 
 echo "Install checkout sgl-kernel for MUSA..."
 if [ -f "${REPO_ROOT}/sgl-kernel/pyproject.toml" ]; then

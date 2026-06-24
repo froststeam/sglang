@@ -50,7 +50,8 @@ def _build_server_args(case: MusaSmokeCase) -> list[str]:
             os.getenv(
                 "MUSA_SMOKE_COMMON_EXTRA_ARGS",
                 "--disable-cuda-graph --disable-piecewise-cuda-graph "
-                "--attention-backend fa3 --disable-overlap-schedule",
+                "--attention-backend fa3 --disable-overlap-schedule "
+                "--chunked-prefill-size 2048",
             )
         )
     )

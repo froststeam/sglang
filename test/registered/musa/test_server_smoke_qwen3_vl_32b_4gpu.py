@@ -15,8 +15,8 @@ class TestMusaServerSmokeQwen3VL32B4GPU(musa_server_smoke.MusaServerSmokeTest):
         default_extra_args=(
             "--ep 4 --attention-backend fa3 --mm-attention-backend fa3 "
             "--sampling-backend flashinfer --disable-custom-all-reduce "
-            "--moe-runner-backend triton --max-running-requests 128 "
-            "--max-prefill-tokens 2048 --chunked-prefill-size 2048 "
+            "--moe-runner-backend auto --max-running-requests 128 "
+            "--max-prefill-tokens 2048 "
             "--cuda-graph-bs 1 2 4 8 16 32 64 128 "
             "--skip-server-warmup --watchdog-timeout 900"
         ),
