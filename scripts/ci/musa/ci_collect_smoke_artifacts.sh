@@ -106,9 +106,35 @@ if [[ -f "${marker_file}" ]]; then
       \( -name 'gsm8k__*.html' -o -name 'gsm8k__*.json' \) \
       -newer "${marker_file}" -print0 2>/dev/null
   )
+
+  mudmp_dir="${artifact_dir}/mudmp"
+  while IFS= read -r -d "" file; do
+    case "${file}" in
+      "${project_dir}/"*)
+        rel_path="${file#"${project_dir}/"}"
+        ;;
+      /tmp/*)
+        rel_path="tmp/${file#/tmp/}"
+        ;;
+      *)
+        rel_path="$(basename "${file}")"
+        ;;
+    esac
+    mkdir -p "${mudmp_dir}/$(dirname "${rel_path}")"
+    cp -f "${file}" "${mudmp_dir}/${rel_path}"
+  done < <(
+    find "${project_dir}" /tmp -xdev -type f -name '*.mudmp' \
+      -newer "${marker_file}" -print0 2>/dev/null
+  )
 fi
 
 report_files=("${artifact_dir}"/gsm8k__*.html "${artifact_dir}"/gsm8k__*.json)
+mudmp_files=()
+if [[ -d "${artifact_dir}/mudmp" ]]; then
+  while IFS= read -r -d "" file; do
+    mudmp_files+=("${file}")
+  done < <(find "${artifact_dir}/mudmp" -type f -name '*.mudmp' -print0 2>/dev/null)
+fi
 
 {
   echo "job_name=${job_name}"
@@ -126,6 +152,15 @@ report_files=("${artifact_dir}"/gsm8k__*.html "${artifact_dir}"/gsm8k__*.json)
   if ((${#report_files[@]} > 0)); then
     for file in "${report_files[@]}"; do
       basename "${file}"
+    done
+  else
+    echo "none"
+  fi
+  echo
+  echo "mudmp_files:"
+  if ((${#mudmp_files[@]} > 0)); then
+    for file in "${mudmp_files[@]}"; do
+      printf "%s\n" "${file#"${artifact_dir}/"}"
     done
   else
     echo "none"
