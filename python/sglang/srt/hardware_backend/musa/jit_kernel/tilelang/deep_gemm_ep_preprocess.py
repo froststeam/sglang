@@ -16,6 +16,8 @@ from sglang.srt.hardware_backend.musa.jit_kernel.tilelang.deep_gemm_contig_prepr
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
+_MAX_TOKENS_PER_ASSIGN_LAUNCH = 32768
+
 
 @functools.lru_cache(maxsize=8)
 @tilelang.jit(
@@ -58,10 +60,10 @@ def _bf16_assign_masked_kernel(
             lane = tid % threads_per_group
             elem_base = T.alloc_var("int32")
             hidden_group = T.alloc_var("int32")
-            input_base = T.alloc_var("int32")
+            input_base = T.alloc_var("int64")
             local_rank = T.alloc_var("int32")
             dst = T.alloc_var("int32")
-            out_base = T.alloc_var("int32")
+            out_base = T.alloc_var("int64")
             dst_shared = T.alloc_shared((topk,), "int32")
 
             if tid < topk:
@@ -92,13 +94,15 @@ def _bf16_assign_masked_kernel(
                 hidden_group = tile * groups_per_block + subgroup
                 if hidden_group < hidden_groups:
                     input_base = (
-                        bt * hidden_size + hidden_group * group_size + elem_base
+                        T.Cast("int64", bt) * hidden_size
+                        + hidden_group * group_size
+                        + elem_base
                     )
                     for topk_idx in T.serial(topk):
                         dst = dst_shared[topk_idx]
                         if dst >= 0:
                             out_base = (
-                                dst * hidden_size
+                                T.Cast("int64", dst) * hidden_size
                                 + hidden_group * group_size
                                 + elem_base
                             )
@@ -177,14 +181,14 @@ def _fp8_assign_masked_kernel(
             lane = tid % threads_per_group
             elem_base = T.alloc_var("int32")
             hidden_group = T.alloc_var("int32")
-            input_base = T.alloc_var("int32")
+            input_base = T.alloc_var("int64")
             local_absmax = T.alloc_local((1,), "float32")
             scale = T.alloc_local((1,), "float32")
             scale_inv = T.alloc_local((1,), "float32")
             values = T.alloc_local((vec_elems,), "float32")
             local_rank = T.alloc_var("int32")
             dst = T.alloc_var("int32")
-            out_base = T.alloc_var("int32")
+            out_base = T.alloc_var("int64")
             dst_shared = T.alloc_shared((topk,), "int32")
 
             if tid < topk:
@@ -215,7 +219,9 @@ def _fp8_assign_masked_kernel(
                 hidden_group = tile * groups_per_block + subgroup
                 if hidden_group < hidden_groups:
                     input_base = (
-                        bt * hidden_size + hidden_group * group_size + elem_base
+                        T.Cast("int64", bt) * hidden_size
+                        + hidden_group * group_size
+                        + elem_base
                     )
                     local_absmax[0] = eps
                     for i in T.vectorized(vec_elems):
@@ -250,7 +256,7 @@ def _fp8_assign_masked_kernel(
                         dst = dst_shared[topk_idx]
                         if dst >= 0:
                             out_base = (
-                                dst * hidden_size
+                                T.Cast("int64", dst) * hidden_size
                                 + hidden_group * group_size
                                 + elem_base
                             )
@@ -418,16 +424,18 @@ def _impl_bf16(
     )
 
     clear(masked_m, tilelang.cdiv(int(num_local_experts), 256), int(num_local_experts))
-    compact(
-        hidden_states.reshape(-1),
-        topk_ids.reshape(-1),
-        masked_m,
-        src2dst,
-        output.reshape(-1),
-        num_tokens,
-        int(num_local_experts),
-        output.shape[1],
-    )
+    for start in range(0, num_tokens, _MAX_TOKENS_PER_ASSIGN_LAUNCH):
+        end = min(start + _MAX_TOKENS_PER_ASSIGN_LAUNCH, num_tokens)
+        compact(
+            hidden_states[start:end].reshape(-1),
+            topk_ids[start:end].reshape(-1),
+            masked_m,
+            src2dst[start * topk : end * topk],
+            output.reshape(-1),
+            end - start,
+            int(num_local_experts),
+            output.shape[1],
+        )
 
 
 def _impl_fp8(
@@ -453,19 +461,21 @@ def _impl_fp8(
     )
 
     clear(masked_m, tilelang.cdiv(int(num_local_experts), 256), int(num_local_experts))
-    compact(
-        hidden_states.reshape(-1),
-        topk_ids.reshape(-1),
-        masked_m,
-        src2dst,
-        output.reshape(-1),
-        output_scale.reshape(-1),
-        num_tokens,
-        int(num_local_experts),
-        output.shape[1],
-        1.0e-10,
-        448.0,
-    )
+    for start in range(0, num_tokens, _MAX_TOKENS_PER_ASSIGN_LAUNCH):
+        end = min(start + _MAX_TOKENS_PER_ASSIGN_LAUNCH, num_tokens)
+        compact(
+            hidden_states[start:end].reshape(-1),
+            topk_ids[start:end].reshape(-1),
+            masked_m,
+            src2dst[start * topk : end * topk],
+            output.reshape(-1),
+            output_scale.reshape(-1),
+            end - start,
+            int(num_local_experts),
+            output.shape[1],
+            1.0e-10,
+            448.0,
+        )
 
 
 @register_custom_op(

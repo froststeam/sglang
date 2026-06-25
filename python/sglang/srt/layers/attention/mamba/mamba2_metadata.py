@@ -33,6 +33,7 @@ class ForwardMetadata:
     query_start_loc: torch.Tensor
     mamba_cache_indices: torch.Tensor
     mamba_cache_indices_gdn: Optional[torch.Tensor] = None
+    mamba_cache_index_mapping: Optional[torch.Tensor] = None
     # For topk > 1 eagle
     retrieve_next_token: Optional[torch.Tensor] = None
     retrieve_next_sibling: Optional[torch.Tensor] = None
@@ -171,6 +172,7 @@ class Mamba2Metadata(ForwardMetadata):
         return Mamba2Metadata(
             query_start_loc=forward_metadata.query_start_loc,
             mamba_cache_indices=forward_metadata.mamba_cache_indices,
+            mamba_cache_index_mapping=forward_metadata.mamba_cache_index_mapping,
             retrieve_next_token=forward_metadata.retrieve_next_token,
             retrieve_next_sibling=forward_metadata.retrieve_next_sibling,
             retrieve_parent_token=forward_metadata.retrieve_parent_token,
@@ -254,6 +256,7 @@ class Mamba2Metadata(ForwardMetadata):
         return Mamba2Metadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=forward_metadata.mamba_cache_indices,
+            mamba_cache_index_mapping=forward_metadata.mamba_cache_index_mapping,
             retrieve_next_token=forward_metadata.retrieve_next_token,
             retrieve_next_sibling=forward_metadata.retrieve_next_sibling,
             retrieve_parent_token=forward_metadata.retrieve_parent_token,

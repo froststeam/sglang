@@ -37,8 +37,6 @@ def _store_hint(num_tokens: int, rot_dim: int) -> str:
         return hint
     if hint != "auto":
         return "stwb"
-    if rot_dim == 64 and 512 <= num_tokens <= 2048:
-        return "stcg"
     return "stwb"
 
 
@@ -53,10 +51,14 @@ def _musa_arch_tag() -> str:
 @cache_once
 def _rope_module(arch_tag: str, store_hint: str):
     hint_value = {"default": 0, "stwb": 1, "stcg": 2, "stcs": 3}[store_hint]
+    arch_mp31 = 1 if arch_tag == "mp31" else 0
     return load_musa_jit(
         f"sglang_musa_rope_{arch_tag}_{store_hint}",
         ("rope/rotary_embedding.mu",),
-        extra_musa_cflags=(f"-DSGLANG_MUSA_ROPE_STORE_HINT={hint_value}",),
+        extra_musa_cflags=(
+            f"-DSGLANG_MUSA_ROPE_STORE_HINT={hint_value}",
+            f"-DSGLANG_MUSA_ROPE_ARCH_MP31={arch_mp31}",
+        ),
     )
 
 

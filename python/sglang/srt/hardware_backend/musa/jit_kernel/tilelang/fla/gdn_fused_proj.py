@@ -232,8 +232,8 @@ def _fused_qkvzba_split_reshape_cat_contiguous_impl(
     head_qk: int,
     head_v: int,
 ) -> None:
-    if mixed_qkv.shape[0] >= 1024 and head_qk % 128 == 0 and head_v % 128 == 0:
-        if mixed_qkv.shape[0] >= 8192:
+    if head_qk % 128 == 0 and head_v % 128 == 0:
+        if mixed_qkv.shape[0] >= 128:
             kernel = _fused_qkvzba_split_reshape_cat_contiguous_vec_kernel(
                 num_heads_qk,
                 num_heads_v,

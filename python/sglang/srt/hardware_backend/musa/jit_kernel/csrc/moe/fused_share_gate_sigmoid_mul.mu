@@ -430,13 +430,31 @@ void launch_fused_share_gate_sigmoid_mul(
       token_num <= SGLANG_FSG_HDIM_BF16_SMALL_MAX_TOKENS &&
       token_num <= INT32_MAX) {
     if constexpr (std::is_same_v<T, __mt_bfloat16>) {
-      launch_fused_share_gate_sigmoid_mul_hdim_bf16_tpr<3072, 3, 96>(
-          output,
-          hidden_state,
-          share_gate_weight,
-          share_expert_output,
-          token_num,
-          stream);
+      if (token_num <= 64) {
+        launch_fused_share_gate_sigmoid_mul_hdim_bf16_tpr<3072, 7, 224>(
+            output,
+            hidden_state,
+            share_gate_weight,
+            share_expert_output,
+            token_num,
+            stream);
+      } else if (token_num <= 128) {
+        launch_fused_share_gate_sigmoid_mul_hdim_bf16_tpr<3072, 6, 192>(
+            output,
+            hidden_state,
+            share_gate_weight,
+            share_expert_output,
+            token_num,
+            stream);
+      } else {
+        launch_fused_share_gate_sigmoid_mul_hdim_bf16_tpr<3072, 3, 96>(
+            output,
+            hidden_state,
+            share_gate_weight,
+            share_expert_output,
+            token_num,
+            stream);
+      }
       return;
     }
   }

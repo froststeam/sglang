@@ -642,7 +642,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
         return select_index
 
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
-        return self.req_index_to_mamba_index_mapping[req_indices]
+        if not _is_musa:
+            return self.req_index_to_mamba_index_mapping[req_indices]
+        return torch.index_select(self.req_index_to_mamba_index_mapping, 0, req_indices)
 
     def mamba2_layer_cache(self, layer_id: int):
         assert layer_id in self.mamba_map

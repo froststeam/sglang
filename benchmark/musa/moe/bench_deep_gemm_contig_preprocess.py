@@ -18,15 +18,21 @@ from sglang.srt.hardware_backend.musa.jit_kernel.tilelang.deep_gemm_contig_prepr
 FP8_KERNELS = (
     "deep_gemm_contig_preprocess_clear_i32_kernel",
     "deep_gemm_contig_preprocess_count_topk_block_hist_kernel",
+    "deep_gemm_contig_preprocess_count_topk_single_block_kernel",
+    "deep_gemm_contig_preprocess_count_prefix_topk_single_block_kernel",
     "deep_gemm_contig_preprocess_fill_i32_kernel",
     "deep_gemm_contig_preprocess_prefix_counts_scan",
+    "deep_gemm_contig_preprocess_prefix_counts_tree",
     "deep_gemm_contig_preprocess_fp8_assign_compact",
 )
 BF16_KERNELS = (
     "deep_gemm_contig_preprocess_clear_i32_kernel",
     "deep_gemm_contig_preprocess_count_topk_block_hist_kernel",
+    "deep_gemm_contig_preprocess_count_topk_single_block_kernel",
+    "deep_gemm_contig_preprocess_count_prefix_topk_single_block_kernel",
     "deep_gemm_contig_preprocess_fill_i32_kernel",
     "deep_gemm_contig_preprocess_prefix_counts_scan",
+    "deep_gemm_contig_preprocess_prefix_counts_tree",
     "deep_gemm_contig_preprocess_bf16_assign_compact",
 )
 
@@ -207,6 +213,9 @@ def bench_one(
     torch.musa.synchronize()
 
     total_s = sum(float(v) for v in times)
+    count_s = float(times[1]) + float(times[2]) + float(times[3])
+    prefix_s = float(times[5]) + float(times[6])
+    compact_s = float(times[7])
     logical_bytes, dram_bytes = byte_estimates(
         m, hidden_size, num_experts, topk, block_m, all_tokens_value, dtype
     )
@@ -224,12 +233,17 @@ def bench_one(
         "effective_bw_gbps": logical_bytes / total_s / 1e9 if total_s > 0 else 0.0,
         "logical_bw_gbps": logical_bytes / total_s / 1e9 if total_s > 0 else 0.0,
         "dram_bw_gbps": dram_bytes / total_s / 1e9 if total_s > 0 else 0.0,
-        "compact_pct": float(times[4]) / total_s * 100.0 if total_s > 0 else 0.0,
+        "compact_pct": compact_s / total_s * 100.0 if total_s > 0 else 0.0,
         "clear_us": float(times[0]) * 1e6,
-        "count_us": float(times[1]) * 1e6,
-        "fill_us": float(times[2]) * 1e6,
-        "prefix_us": float(times[3]) * 1e6,
-        "compact_us": float(times[4]) * 1e6,
+        "count_us": count_s * 1e6,
+        "count_block_us": float(times[1]) * 1e6,
+        "count_single_block_us": float(times[2]) * 1e6,
+        "count_prefix_single_block_us": float(times[3]) * 1e6,
+        "fill_us": float(times[4]) * 1e6,
+        "prefix_us": prefix_s * 1e6,
+        "prefix_scan_us": float(times[5]) * 1e6,
+        "prefix_tree_us": float(times[6]) * 1e6,
+        "compact_us": compact_s * 1e6,
     }
 
     hidden_states = None

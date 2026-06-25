@@ -756,10 +756,12 @@ def invoke_fused_moe_kernel(
             # activation block-wise fp8 quantization
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
-            if _is_cuda or _is_musa:
-                A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
-            else:
-                A, A_scale = per_token_group_quant_fp8(A, block_k)
+            # Reuse pre-quantized FP8 activations from fused activation+quant paths.
+            if A.dtype != torch.float8_e4m3fn or A_scale is None:
+                if _is_cuda or _is_musa:
+                    A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
+                else:
+                    A, A_scale = per_token_group_quant_fp8(A, block_k)
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
