@@ -14,10 +14,11 @@
 from __future__ import annotations
 
 import itertools
+import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import numpy as np
 import torch
@@ -33,14 +34,47 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hip
+from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hip, is_musa
 from sglang.srt.utils.custom_op import register_custom_op
-
-if TYPE_CHECKING:
-    from sglang.srt.layers.layernorm import RMSNorm
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_musa = is_musa()
+
+if _is_musa:
+    from sglang.srt.hardware_backend.musa.jit_kernel.csrc.norm import (
+        try_fused_qk_rmsnorm_mrope as musa_fused_qk_rmsnorm_mrope,
+    )
+    from sglang.srt.hardware_backend.musa.jit_kernel.csrc.norm import (
+        try_fused_qk_rmsnorm_rope as musa_fused_qk_rmsnorm_rope,
+    )
+
+
+def _musa_qk_rope_cache_token_threshold() -> int:
+    try:
+        return int(os.getenv("SGLANG_MUSA_QK_ROPE_CACHE_TOKEN_THRESHOLD", "256"))
+    except ValueError:
+        return 256
+
+
+def _has_fast_musa_qk_rope_cache_path(
+    rotary_emb: Any,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> bool:
+    rot_dim = int(getattr(rotary_emb, "rotary_dim", head_dim))
+    return (
+        getattr(rotary_emb, "is_neox_style", False)
+        and num_heads > 0
+        and num_kv_heads > 0
+        and head_dim > 0
+        and num_heads >= num_kv_heads
+        and num_heads % num_kv_heads == 0
+        and 0 < rot_dim <= head_dim
+        and rot_dim % 2 == 0
+    )
+
 
 WeightsMapping = Mapping[str, Optional[str]]
 """If a key maps to a value of `None`, the corresponding weight is ignored."""
@@ -273,10 +307,157 @@ class AutoWeightsLoader:
         return set(self._load_module("", self.module, weights))
 
 
+@dataclass
+class QKRoPECacheResult:
+    q: torch.Tensor
+    k: Optional[torch.Tensor]
+    v: Optional[torch.Tensor]
+    save_kv_cache: bool
+
+
+def try_prepare_musa_qkv_for_rope_attention(
+    *,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    attn: RadixAttention,
+    rotary_emb: Any,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    q_size: int,
+    kv_size: int,
+    qkv: Optional[torch.Tensor] = None,
+    q: Optional[torch.Tensor] = None,
+    k: Optional[torch.Tensor] = None,
+    v: Optional[torch.Tensor] = None,
+    q_norm: Optional[Any] = None,
+    k_norm: Optional[Any] = None,
+    use_musa_fused_qk_norm_mrope: bool = False,
+    use_musa_rope_cache: bool = False,
+    gemma_qk_norm: bool = False,
+) -> Optional[QKRoPECacheResult]:
+    """Try MUSA Q/K norm + RoPE preparation, optionally storing K/V cache."""
+    has_qk_norm = q_norm is not None and k_norm is not None
+    if not (_is_musa and (use_musa_fused_qk_norm_mrope or use_musa_rope_cache)):
+        return None
+
+    if has_qk_norm and q_norm.variance_epsilon != k_norm.variance_epsilon:
+        return None
+
+    if qkv is not None:
+        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+    assert q is not None and k is not None and v is not None
+
+    if not (q.dtype == torch.bfloat16 and k.dtype == q.dtype and v.dtype == q.dtype):
+        return None
+    if getattr(forward_batch.token_to_kv_pool, "dtype", None) != torch.bfloat16:
+        return None
+    if has_qk_norm and not (
+        q_norm.weight.dtype == q.dtype and k_norm.weight.dtype == q.dtype
+    ):
+        return None
+
+    can_use_cache = forward_batch.out_cache_loc is not None and (
+        forward_batch.forward_mode.is_decode()
+        or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+    )
+    if (
+        use_musa_rope_cache
+        and positions.dim() == 1
+        and can_use_cache
+        and has_qk_norm
+        and (
+            _has_fast_musa_qk_rope_cache_path(
+                rotary_emb, num_heads, num_kv_heads, head_dim
+            )
+            or q.shape[0] <= _musa_qk_rope_cache_token_threshold()
+        )
+    ):
+        rotary_emb._match_cos_sin_cache_dtype(q)
+        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(attn.layer_id)
+        return_k = not forward_batch.forward_mode.is_decode()
+        fused_qk = musa_fused_qk_rmsnorm_rope(
+            q=q,
+            k=k,
+            q_weight=q_norm.weight,
+            k_weight=k_norm.weight,
+            positions=positions,
+            cos_sin_cache=rotary_emb.cos_sin_cache,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            is_neox=rotary_emb.is_neox_style,
+            eps=q_norm.variance_epsilon,
+            gemma=gemma_qk_norm,
+            v=v,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            indices=forward_batch.out_cache_loc,
+            return_k=return_k,
+        )
+        if fused_qk is not None:
+            fused_q, fused_k = fused_qk
+            return QKRoPECacheResult(
+                q=fused_q,
+                k=fused_k,
+                v=v if fused_k is not None else None,
+                save_kv_cache=False,
+            )
+
+    if not (has_qk_norm and use_musa_fused_qk_norm_mrope and positions.dim() == 2):
+        return None
+
+    rotary_emb._match_cos_sin_cache_dtype(q)
+    common_kwargs = dict(
+        q=q,
+        k=k,
+        q_weight=q_norm.weight,
+        k_weight=k_norm.weight,
+        positions=positions,
+        cos_sin_cache=rotary_emb.cos_sin_cache,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        is_neox=rotary_emb.is_neox_style,
+        mrope_section=getattr(rotary_emb, "mrope_section", None),
+        is_interleaved=getattr(rotary_emb, "mrope_interleaved", False),
+        mrope_interleaved_glm=getattr(rotary_emb, "mrope_interleaved_glm", False),
+        eps=q_norm.variance_epsilon,
+        gemma=gemma_qk_norm,
+    )
+    if can_use_cache:
+        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(attn.layer_id)
+        return_k = not forward_batch.forward_mode.is_decode()
+        fused_qk = musa_fused_qk_rmsnorm_mrope(
+            **common_kwargs,
+            v=v,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            indices=forward_batch.out_cache_loc,
+            return_k=return_k,
+        )
+        if fused_qk is not None:
+            fused_q, fused_k = fused_qk
+            return QKRoPECacheResult(
+                q=fused_q,
+                k=fused_k,
+                v=v if fused_k is not None else None,
+                save_kv_cache=False,
+            )
+
+    if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+        fused_qk = musa_fused_qk_rmsnorm_mrope(**common_kwargs)
+        if fused_qk is not None:
+            fused_q, fused_k = fused_qk
+            return QKRoPECacheResult(q=fused_q, k=fused_k, v=v, save_kv_cache=True)
+
+    return None
+
+
 def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
-    """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
+    """Enable fused set_kv_buffer on backends with bfloat16 KV cache support."""
     return (
-        _is_cuda
+        (_is_cuda or _is_musa)
         and hasattr(forward_batch.token_to_kv_pool, "dtype")
         and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
         and not isinstance(forward_batch.token_to_kv_pool, SWAKVPool)
@@ -416,8 +597,8 @@ def _reshape_for_qk_norm(x: torch.Tensor, head_dim: int) -> torch.Tensor:
 def apply_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
-    q_norm: RMSNorm,
-    k_norm: RMSNorm,
+    q_norm: Any,
+    k_norm: Any,
     head_dim: int,
     alt_stream: Optional[torch.cuda.Stream] = None,
     allow_inplace: bool = True,

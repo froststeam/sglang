@@ -74,7 +74,10 @@ from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
 
 # Models
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
-from sglang.srt.models.utils import fused_qk_gemma_rmsnorm
+from sglang.srt.models.utils import (
+    apply_qk_norm,
+    try_prepare_musa_qkv_for_rope_attention,
+)
 from sglang.srt.server_args import get_global_server_args
 
 # Utils
@@ -100,9 +103,6 @@ if _is_musa:
     from sglang.srt.hardware_backend.musa.jit_kernel import RMSNorm as RMSNormGated
     from sglang.srt.hardware_backend.musa.jit_kernel import (
         fused_qkvzba_split_reshape_cat_contiguous,
-    )
-    from sglang.srt.hardware_backend.musa.jit_kernel.csrc.norm import (
-        try_fused_qk_rmsnorm_mrope as musa_fused_qk_rmsnorm_mrope,
     )
 else:
     from sglang.jit_kernel.triton.gdn_fused_proj import (
@@ -839,119 +839,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         self.alt_stream = alt_stream
 
-    def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Apply Q/K normalization with optional alt_stream overlap."""
-        if self.alt_stream is not None and get_is_capture_mode():
-            current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.q_norm(q_by_head)
-            with torch.cuda.stream(self.alt_stream):
-                k_by_head = k.reshape(-1, self.head_dim)
-                k_by_head = self.k_norm(k_by_head)
-            current_stream.wait_stream(self.alt_stream)
-        elif _is_hip:
-            q_by_head, k_by_head = fused_qk_gemma_rmsnorm(
-                q,
-                k,
-                self.q_norm.weight.data,
-                self.k_norm.weight.data,
-                self.q_norm.variance_epsilon,
-                self.head_dim,
-            )
-        else:
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.q_norm(q_by_head)
-            k_by_head = k.reshape(-1, self.head_dim)
-            k_by_head = self.k_norm(k_by_head)
-        q = q_by_head.view(q.shape)
-        k = k_by_head.view(k.shape)
-        return q, k
-
-    def _try_apply_musa_fused_qk_norm_mrope(
-        self,
-        positions: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> Optional[
-        Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], bool]
-    ]:
-        is_decode = forward_batch.forward_mode.is_decode()
-        is_extend = forward_batch.forward_mode.is_extend()
-        if not (
-            _is_musa
-            and (is_decode or is_extend)
-            and get_global_server_args().rl_on_policy_target is None
-        ):
-            return None
-
-        rotary_emb = self.rotary_emb
-        rotary_emb._match_cos_sin_cache_dtype(q)
-        fused_kwargs = dict(
-            q=q,
-            k=k,
-            q_weight=self.q_norm.weight,
-            k_weight=self.k_norm.weight,
-            positions=positions,
-            cos_sin_cache=rotary_emb.cos_sin_cache,
-            num_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            head_dim=self.head_dim,
-            is_neox=rotary_emb.is_neox_style,
-            mrope_section=getattr(rotary_emb, "mrope_section", None),
-            is_interleaved=getattr(rotary_emb, "mrope_interleaved", False),
-            mrope_interleaved_glm=getattr(rotary_emb, "mrope_interleaved_glm", False),
-            eps=self.q_norm.variance_epsilon,
-            gemma=True,
-        )
-
-        if forward_batch.out_cache_loc is not None:
-            k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                self.attn.layer_id
-            )
-            fused_qk = musa_fused_qk_rmsnorm_mrope(
-                **fused_kwargs,
-                v=v,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                indices=forward_batch.out_cache_loc,
-                return_k=not is_decode,
-            )
-            if fused_qk is not None:
-                fused_q, fused_k = fused_qk
-                return fused_q, fused_k, v if fused_k is not None else None, False
-
-        if not is_extend:
-            return None
-
-        fused_qk = musa_fused_qk_rmsnorm_mrope(**fused_kwargs)
-        if fused_qk is None:
-            return None
-        fused_q, fused_k = fused_qk
-        return fused_q, fused_k, v, True
-
-    def _apply_qk_norm_mrope_for_attention(
-        self,
-        positions: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], bool]:
-        fused_result = self._try_apply_musa_fused_qk_norm_mrope(
-            positions, q, k, v, forward_batch
-        )
-        if fused_result is not None:
-            return fused_result
-
-        q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
-        return q, k, v, True
-
     def self_attention(
         self,
         positions: torch.Tensor,
@@ -973,15 +860,57 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        if not _is_musa:
-            q, k = self._apply_qk_norm(q, k)
-            q, k = self.rotary_emb(positions, q, k)
-            save_kv_cache = True
-        else:
-            q, k, v, save_kv_cache = self._apply_qk_norm_mrope_for_attention(
-                positions, q, k, v, forward_batch
+        prep = None
+        if _is_musa:
+            prep = try_prepare_musa_qkv_for_rope_attention(
+                q=q,
+                k=k,
+                v=v,
+                positions=positions,
+                forward_batch=forward_batch,
+                attn=self.attn,
+                rotary_emb=self.rotary_emb,
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                q_size=self.q_size,
+                kv_size=self.kv_size,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
+                use_musa_fused_qk_norm_mrope=(
+                    get_global_server_args().rl_on_policy_target is None
+                ),
+                use_musa_rope_cache=(
+                    get_global_server_args().rl_on_policy_target is None
+                ),
+                gemma_qk_norm=True,
             )
-        attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
+        if prep is None:
+            q, k = apply_qk_norm(
+                q=q,
+                k=k,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
+                head_dim=self.head_dim,
+                alt_stream=self.alt_stream,
+                allow_inplace=False,
+            )
+            q, k = self.rotary_emb(positions, q, k)
+            prep_q, prep_k, prep_v, save_kv_cache = q, k, v, True
+        else:
+            prep_q, prep_k, prep_v, save_kv_cache = (
+                prep.q,
+                prep.k,
+                prep.v,
+                prep.save_kv_cache,
+            )
+        attn_output = self.attn(
+            prep_q,
+            prep_k,
+            prep_v,
+            forward_batch,
+            save_kv_cache=save_kv_cache,
+        )
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)

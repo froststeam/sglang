@@ -50,6 +50,10 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
+from sglang.srt.models.utils import (
+    create_fused_set_kv_buffer_arg,
+    enable_fused_set_kv_buffer,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -189,8 +193,24 @@ class Qwen2Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+        fused_set_kv_buffer_arg = (
+            create_fused_set_kv_buffer_arg(
+                value=v,
+                layer=self.attn,
+                forward_batch=forward_batch,
+            )
+            if enable_fused_set_kv_buffer(forward_batch)
+            and get_global_server_args().rl_on_policy_target is None
+            else None
+        )
+        q, k = self.rotary_emb(
+            positions,
+            q,
+            k,
+            fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
+        )
+        save_kv_cache = fused_set_kv_buffer_arg is None
+        attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
         output, _ = self.o_proj(attn_output)
         return output
 

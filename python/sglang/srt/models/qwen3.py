@@ -29,15 +29,27 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
-from sglang.srt.models.utils import apply_qk_norm
+from sglang.srt.models.utils import (
+    QKRoPECacheResult,
+    apply_qk_norm,
+    try_prepare_musa_qkv_for_rope_attention,
+)
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
+from sglang.srt.utils import (
+    add_prefix,
+    get_bool_env_var,
+    is_cuda,
+    is_hip,
+    is_musa,
+    is_npu,
+)
 
 Qwen3Config = None
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_musa = is_musa()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -156,6 +168,16 @@ class Qwen3Attention(nn.Module):
             and isinstance(self.rotary_emb, MRotaryEmbedding)
             and getattr(self.rotary_emb, "mrope_section", None) is not None
         )
+        self.use_musa_fused_qk_norm_mrope = (
+            _is_musa
+            and isinstance(self.rotary_emb, MRotaryEmbedding)
+            and getattr(self.rotary_emb, "mrope_section", None) is not None
+            and self.rotary_emb.is_neox_style
+            and self.rotary_emb.mrope_interleaved
+            and not getattr(self.rotary_emb, "mrope_interleaved_glm", False)
+            and self.head_dim % 2 == 0
+            and sum(self.rotary_emb.mrope_section) == self.head_dim // 2
+        )
         if self.use_fused_qk_norm_mrope:
             # Scale tensors MUST stay on CPU: the C++ kernel uses .item<float>()
             # which triggers hipMemcpy D2H + sync on CUDA tensors, breaking graph capture.
@@ -164,8 +186,34 @@ class Qwen3Attention(nn.Module):
             self._fused_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
             self._fused_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
 
-    def forward_prepare_native(self, positions, hidden_states):
+    def forward_prepare_native(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
+        prep = None
+        if _is_musa:
+            prep = try_prepare_musa_qkv_for_rope_attention(
+                qkv=qkv,
+                positions=positions,
+                forward_batch=forward_batch,
+                attn=self.attn,
+                rotary_emb=self.rotary_emb,
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                q_size=self.q_size,
+                kv_size=self.kv_size,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
+                use_musa_fused_qk_norm_mrope=(
+                    self.use_musa_fused_qk_norm_mrope
+                    and get_global_server_args().rl_on_policy_target is None
+                ),
+                use_musa_rope_cache=(
+                    get_global_server_args().rl_on_policy_target is None
+                ),
+            )
+        if prep is not None:
+            return prep
+
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = apply_qk_norm(
             q=q,
@@ -176,7 +224,7 @@ class Qwen3Attention(nn.Module):
             alt_stream=self.alt_stream,
         )
         q, k = self.rotary_emb(positions, q, k)
-        return q, k, v
+        return QKRoPECacheResult(q=q, k=k, v=v, save_kv_cache=True)
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -285,10 +333,13 @@ class Qwen3Attention(nn.Module):
             not _is_npu
             or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         ):
-            q, k, v = self.forward_prepare_native(
+            prep = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
+                forward_batch=forward_batch,
             )
+            q, k, v = prep.q, prep.k, prep.v
+            save_kv_cache = prep.save_kv_cache
         else:
             q, k, v = self.forward_prepare_npu(
                 positions=positions,
