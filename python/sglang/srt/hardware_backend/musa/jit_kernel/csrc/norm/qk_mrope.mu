@@ -391,8 +391,9 @@ __global__ void fused_qk_rmsnorm_mrope_cache_32q4kv_h128_bf16_kernel(
   }
 }
 
-template <typename index_t, int Q_HEADS, int K_HEADS,
-          int HEADS_PER_BLOCK = 8, bool STORE_K_OUT = true>
+template <typename index_t, int Q_HEADS, int K_HEADS, bool GEMMA,
+          int HEADS_PER_BLOCK = 8, bool STORE_K_OUT = true,
+          bool SAME_POSITION = false>
 __global__ void fused_qk_rmsnorm_mrope_cache_h128_full_bf16_kernel(
     const __mt_bfloat16 *__restrict__ q, const __mt_bfloat16 *__restrict__ k,
     const __mt_bfloat16 *__restrict__ v,
@@ -470,28 +471,48 @@ __global__ void fused_qk_rmsnorm_mrope_cache_h128_full_bf16_kernel(
   const float scale = fast_rsqrt(sum * (1.0f / 128.0f) + eps);
 
   const int rot_offset0 = lane;
-  const int axis0 = mrope_24_20_20_interleaved_axis(rot_offset0);
-  const int64_t pos0 = positions[(int64_t)axis0 * position_stride + token];
+  int64_t pos0;
+  int64_t pos1;
+  if constexpr (SAME_POSITION) {
+    pos0 = positions[token];
+    pos1 = pos0;
+  } else {
+    constexpr unsigned int axis0_mask1 = 0x92492492U;
+    constexpr unsigned int axis0_mask2 = 0x24924924U;
+    constexpr unsigned int axis1_mask1 = 0x04924924U;
+    constexpr unsigned int axis1_mask2 = 0x09249249U;
+    const unsigned int lane_bit = 1U << lane;
+    const int axis0 =
+        ((axis0_mask1 & lane_bit) != 0U) +
+        (((axis0_mask2 & lane_bit) != 0U) << 1);
+    pos0 = positions[(int64_t)axis0 * position_stride + token];
+    const int axis1 =
+        ((axis1_mask1 & lane_bit) != 0U) +
+        (((axis1_mask2 & lane_bit) != 0U) << 1);
+    pos1 = positions[(int64_t)axis1 * position_stride + token];
+  }
   const __mt_bfloat16 *__restrict__ cache_ptr0 = cos_sin_cache + pos0 * rot_dim;
   const float cos_v0 = __bfloat162float(cache_ptr0[rot_offset0]);
   const float sin_v0 = __bfloat162float(cache_ptr0[embed_dim + rot_offset0]);
-  const float x_weight0 = __bfloat162float(weight[rot_offset0]) + 1.0f;
+  const float x_weight0 =
+      __bfloat162float(weight[rot_offset0]) + (GEMMA ? 1.0f : 0.0f);
   const float y_weight0 =
-      __bfloat162float(weight[embed_dim + rot_offset0]) + 1.0f;
+      __bfloat162float(weight[embed_dim + rot_offset0]) +
+      (GEMMA ? 1.0f : 0.0f);
   const float x0 = data_0 * scale * x_weight0;
   const float y0 = data_2 * scale * y_weight0;
   const __mt_bfloat16 x_rot0 = __float2bfloat16_rn(x0 * cos_v0 - y0 * sin_v0);
   const __mt_bfloat16 y_rot0 = __float2bfloat16_rn(y0 * cos_v0 + x0 * sin_v0);
 
   const int rot_offset1 = lane + 32;
-  const int axis1 = mrope_24_20_20_interleaved_axis(rot_offset1);
-  const int64_t pos1 = positions[(int64_t)axis1 * position_stride + token];
   const __mt_bfloat16 *__restrict__ cache_ptr1 = cos_sin_cache + pos1 * rot_dim;
   const float cos_v1 = __bfloat162float(cache_ptr1[rot_offset1]);
   const float sin_v1 = __bfloat162float(cache_ptr1[embed_dim + rot_offset1]);
-  const float x_weight1 = __bfloat162float(weight[rot_offset1]) + 1.0f;
+  const float x_weight1 =
+      __bfloat162float(weight[rot_offset1]) + (GEMMA ? 1.0f : 0.0f);
   const float y_weight1 =
-      __bfloat162float(weight[embed_dim + rot_offset1]) + 1.0f;
+      __bfloat162float(weight[embed_dim + rot_offset1]) +
+      (GEMMA ? 1.0f : 0.0f);
   const float x1 = data_1 * scale * x_weight1;
   const float y1 = data_3 * scale * y_weight1;
   const __mt_bfloat16 x_rot1 = __float2bfloat16_rn(x1 * cos_v1 - y1 * sin_v1);
@@ -518,6 +539,302 @@ __global__ void fused_qk_rmsnorm_mrope_cache_h128_full_bf16_kernel(
       k_out[k_out_base + embed_dim + rot_offset0] = y_rot0;
       k_out[k_out_base + rot_offset1] = x_rot1;
       k_out[k_out_base + embed_dim + rot_offset1] = y_rot1;
+    }
+  }
+}
+
+template <typename index_t, int Q_HEADS, int K_HEADS, bool GEMMA,
+          int HEADS_PER_BLOCK = 8, bool STORE_K_OUT = true>
+__global__ void fused_qk_rmsnorm_rope_cache_h128_full_bf16_kernel(
+    const __mt_bfloat16 *__restrict__ q, const __mt_bfloat16 *__restrict__ k,
+    const __mt_bfloat16 *__restrict__ v,
+    const __mt_bfloat16 *__restrict__ q_weight,
+    const __mt_bfloat16 *__restrict__ k_weight,
+    const int64_t *__restrict__ positions,
+    const __mt_bfloat16 *__restrict__ cos_sin_cache,
+    __mt_bfloat16 *__restrict__ q_out, __mt_bfloat16 *__restrict__ k_out,
+    __mt_bfloat16 *__restrict__ k_cache, __mt_bfloat16 *__restrict__ v_cache,
+    const index_t *__restrict__ indices, int batch, int64_t position_stride,
+    int64_t q_batch_stride, int64_t q_head_stride, int64_t k_batch_stride,
+    int64_t k_head_stride, int64_t v_batch_stride, int64_t v_head_stride,
+    int64_t q_out_batch_stride, int64_t q_out_head_stride,
+    int64_t k_out_batch_stride, int64_t k_out_head_stride,
+    int64_t k_cache_row_stride, int64_t v_cache_row_stride,
+    int64_t indices_stride, float eps) {
+  constexpr int hidden = 128;
+  constexpr int embed_dim = 64;
+  constexpr int rot_dim = 128;
+  constexpr int heads_per_block = HEADS_PER_BLOCK;
+  constexpr int groups_per_token =
+      (Q_HEADS + K_HEADS + heads_per_block - 1) / heads_per_block;
+
+  const int tid = (int)threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int token = (int)blockIdx.x / groups_per_token;
+  const int group = (int)blockIdx.x - token * groups_per_token;
+  if (token >= batch) {
+    return;
+  }
+
+  const int64_t cache_idx =
+      static_cast<int64_t>(indices[(int64_t)token * indices_stride]);
+
+  if (group == 0) {
+    constexpr int kVec = 8;
+    constexpr int row_dim = K_HEADS * hidden;
+    constexpr int vec_count = row_dim / kVec;
+    const int64_t v_token_base = (int64_t)token * v_batch_stride;
+    const int64_t v_out_base = cache_idx * v_cache_row_stride;
+    for (int vec_idx = tid; vec_idx < vec_count; vec_idx += (int)blockDim.x) {
+      const int head = vec_idx >> 4;
+      const int col = (vec_idx & 15) * kVec;
+      Vec8<__mt_bfloat16> v_vec = Vec8<__mt_bfloat16>::load(
+          v + v_token_base + (int64_t)head * v_head_stride, col);
+      *(Vec8<__mt_bfloat16> *)(v_cache + v_out_base + (int64_t)head * hidden +
+                               col) = v_vec;
+    }
+  }
+
+  const int global_head = group * heads_per_block + warp;
+  if (global_head >= Q_HEADS + K_HEADS) {
+    return;
+  }
+
+  const bool is_q = global_head < Q_HEADS;
+  const int head = is_q ? global_head : global_head - Q_HEADS;
+  const __mt_bfloat16 *__restrict__ data = is_q ? q : k;
+  const __mt_bfloat16 *__restrict__ weight = is_q ? q_weight : k_weight;
+  const int64_t base =
+      is_q ? ((int64_t)token * q_batch_stride + (int64_t)head * q_head_stride)
+           : ((int64_t)token * k_batch_stride + (int64_t)head * k_head_stride);
+
+  const float data_0 = __bfloat162float(data[base + lane]);
+  const float data_1 = __bfloat162float(data[base + lane + 32]);
+  const float data_2 = __bfloat162float(data[base + lane + 64]);
+  const float data_3 = __bfloat162float(data[base + lane + 96]);
+  float sum =
+      data_0 * data_0 + data_1 * data_1 + data_2 * data_2 + data_3 * data_3;
+#pragma unroll
+  for (int mask = 16; mask > 0; mask >>= 1) {
+    sum += __shfl_xor_sync(0xffffffff, sum, mask);
+  }
+  const float scale = fast_rsqrt(sum * (1.0f / 128.0f) + eps);
+
+  const int64_t pos = positions[(int64_t)0 * position_stride + token];
+  const __mt_bfloat16 *__restrict__ cache_ptr = cos_sin_cache + pos * rot_dim;
+
+  const float cos_v0 = __bfloat162float(cache_ptr[lane]);
+  const float sin_v0 = __bfloat162float(cache_ptr[embed_dim + lane]);
+  const float x_weight0 =
+      __bfloat162float(weight[lane]) + (GEMMA ? 1.0f : 0.0f);
+  const float y_weight0 =
+      __bfloat162float(weight[embed_dim + lane]) + (GEMMA ? 1.0f : 0.0f);
+  const float x0 = data_0 * scale * x_weight0;
+  const float y0 = data_2 * scale * y_weight0;
+  const __mt_bfloat16 x_rot0 = __float2bfloat16_rn(x0 * cos_v0 - y0 * sin_v0);
+  const __mt_bfloat16 y_rot0 = __float2bfloat16_rn(y0 * cos_v0 + x0 * sin_v0);
+
+  const int rot_offset1 = lane + 32;
+  const float cos_v1 = __bfloat162float(cache_ptr[rot_offset1]);
+  const float sin_v1 = __bfloat162float(cache_ptr[embed_dim + rot_offset1]);
+  const float x_weight1 =
+      __bfloat162float(weight[rot_offset1]) + (GEMMA ? 1.0f : 0.0f);
+  const float y_weight1 =
+      __bfloat162float(weight[embed_dim + rot_offset1]) +
+      (GEMMA ? 1.0f : 0.0f);
+  const float x1 = data_1 * scale * x_weight1;
+  const float y1 = data_3 * scale * y_weight1;
+  const __mt_bfloat16 x_rot1 = __float2bfloat16_rn(x1 * cos_v1 - y1 * sin_v1);
+  const __mt_bfloat16 y_rot1 = __float2bfloat16_rn(y1 * cos_v1 + x1 * sin_v1);
+
+  if (is_q) {
+    const int64_t q_out_base =
+        (int64_t)token * q_out_batch_stride + (int64_t)head * q_out_head_stride;
+    q_out[q_out_base + lane] = x_rot0;
+    q_out[q_out_base + embed_dim + lane] = y_rot0;
+    q_out[q_out_base + rot_offset1] = x_rot1;
+    q_out[q_out_base + embed_dim + rot_offset1] = y_rot1;
+  } else {
+    const int64_t k_cache_base =
+        cache_idx * k_cache_row_stride + (int64_t)head * hidden;
+    k_cache[k_cache_base + lane] = x_rot0;
+    k_cache[k_cache_base + embed_dim + lane] = y_rot0;
+    k_cache[k_cache_base + rot_offset1] = x_rot1;
+    k_cache[k_cache_base + embed_dim + rot_offset1] = y_rot1;
+    if constexpr (STORE_K_OUT) {
+      const int64_t k_out_base = (int64_t)token * k_out_batch_stride +
+                                 (int64_t)head * k_out_head_stride;
+      k_out[k_out_base + lane] = x_rot0;
+      k_out[k_out_base + embed_dim + lane] = y_rot0;
+      k_out[k_out_base + rot_offset1] = x_rot1;
+      k_out[k_out_base + embed_dim + rot_offset1] = y_rot1;
+    }
+  }
+}
+
+template <typename index_t, int Q_HEADS, int K_HEADS, bool GEMMA,
+          int HEADS_PER_BLOCK = 8, bool STORE_K_OUT = true>
+__global__ void fused_qk_rmsnorm_rope_cache_h128r64_bf16_kernel(
+    const __mt_bfloat16 *__restrict__ q, const __mt_bfloat16 *__restrict__ k,
+    const __mt_bfloat16 *__restrict__ v,
+    const __mt_bfloat16 *__restrict__ q_weight,
+    const __mt_bfloat16 *__restrict__ k_weight,
+    const int64_t *__restrict__ positions,
+    const __mt_bfloat16 *__restrict__ cos_sin_cache,
+    __mt_bfloat16 *__restrict__ q_out, __mt_bfloat16 *__restrict__ k_out,
+    __mt_bfloat16 *__restrict__ k_cache, __mt_bfloat16 *__restrict__ v_cache,
+    const index_t *__restrict__ indices, int batch, int64_t position_stride,
+    int64_t q_batch_stride, int64_t q_head_stride, int64_t k_batch_stride,
+    int64_t k_head_stride, int64_t v_batch_stride, int64_t v_head_stride,
+    int64_t q_out_batch_stride, int64_t q_out_head_stride,
+    int64_t k_out_batch_stride, int64_t k_out_head_stride,
+    int64_t k_cache_row_stride, int64_t v_cache_row_stride,
+    int64_t indices_stride, float eps) {
+  constexpr int hidden = 128;
+  constexpr int embed_dim = 32;
+  constexpr int rot_dim = 64;
+  constexpr int warps_per_block = HEADS_PER_BLOCK;
+  constexpr int heads_per_block = warps_per_block * 2;
+  constexpr int groups_per_token =
+      (Q_HEADS + K_HEADS + heads_per_block - 1) / heads_per_block;
+
+  const int tid = (int)threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int half = lane >> 4;
+  const int sublane = lane & 15;
+  const int pair_col = sublane * 2;
+  const int token = (int)blockIdx.x / groups_per_token;
+  const int group = (int)blockIdx.x - token * groups_per_token;
+  if (token >= batch) {
+    return;
+  }
+
+  const int64_t cache_idx =
+      static_cast<int64_t>(indices[(int64_t)token * indices_stride]);
+
+  if (group == 0) {
+    constexpr int kVec = 8;
+    constexpr int row_dim = K_HEADS * hidden;
+    constexpr int vec_count = row_dim / kVec;
+    const int64_t v_token_base = (int64_t)token * v_batch_stride;
+    const int64_t v_out_base = cache_idx * v_cache_row_stride;
+    for (int vec_idx = tid; vec_idx < vec_count; vec_idx += (int)blockDim.x) {
+      const int head = vec_idx >> 4;
+      const int col = (vec_idx & 15) * kVec;
+      Vec8<__mt_bfloat16> v_vec = Vec8<__mt_bfloat16>::load(
+          v + v_token_base + (int64_t)head * v_head_stride, col);
+      *(Vec8<__mt_bfloat16> *)(v_cache + v_out_base + (int64_t)head * hidden +
+                               col) = v_vec;
+    }
+  }
+
+  const int global_head = group * heads_per_block + warp * 2 + half;
+  if (global_head >= Q_HEADS + K_HEADS) {
+    return;
+  }
+
+  const bool is_q = global_head < Q_HEADS;
+  const int head = is_q ? global_head : global_head - Q_HEADS;
+  const __mt_bfloat16 *__restrict__ data = is_q ? q : k;
+  const __mt_bfloat16 *__restrict__ weight = is_q ? q_weight : k_weight;
+  const int64_t base =
+      is_q ? ((int64_t)token * q_batch_stride + (int64_t)head * q_head_stride)
+           : ((int64_t)token * k_batch_stride + (int64_t)head * k_head_stride);
+
+  const float2 data_0 = __bfloat1622float2(
+      *reinterpret_cast<const __mt_bfloat162 *>(data + base + pair_col));
+  const float2 data_1 = __bfloat1622float2(*reinterpret_cast<const __mt_bfloat162 *>(
+      data + base + embed_dim + pair_col));
+  const float2 data_2 = __bfloat1622float2(*reinterpret_cast<const __mt_bfloat162 *>(
+      data + base + 64 + pair_col));
+  const float2 data_3 = __bfloat1622float2(*reinterpret_cast<const __mt_bfloat162 *>(
+      data + base + 96 + pair_col));
+  float sum = data_0.x * data_0.x + data_0.y * data_0.y +
+              data_1.x * data_1.x + data_1.y * data_1.y +
+              data_2.x * data_2.x + data_2.y * data_2.y +
+              data_3.x * data_3.x + data_3.y * data_3.y;
+#pragma unroll
+  for (int mask = 8; mask > 0; mask >>= 1) {
+    sum += __shfl_xor_sync(0xffffffff, sum, mask);
+  }
+  const float scale = fast_rsqrt(sum * (1.0f / 128.0f) + eps);
+
+  const int64_t pos = positions[(int64_t)0 * position_stride + token];
+  const __mt_bfloat16 *__restrict__ cache_ptr = cos_sin_cache + pos * rot_dim;
+
+  const float2 cos_v = __bfloat1622float2(
+      *reinterpret_cast<const __mt_bfloat162 *>(cache_ptr + pair_col));
+  const float2 sin_v = __bfloat1622float2(*reinterpret_cast<const __mt_bfloat162 *>(
+      cache_ptr + embed_dim + pair_col));
+  float2 x_weight = __bfloat1622float2(
+      *reinterpret_cast<const __mt_bfloat162 *>(weight + pair_col));
+  float2 y_weight = __bfloat1622float2(*reinterpret_cast<const __mt_bfloat162 *>(
+      weight + embed_dim + pair_col));
+  float2 pass_weight0 = __bfloat1622float2(*reinterpret_cast<const __mt_bfloat162 *>(
+      weight + 64 + pair_col));
+  float2 pass_weight1 = __bfloat1622float2(*reinterpret_cast<const __mt_bfloat162 *>(
+      weight + 96 + pair_col));
+  if constexpr (GEMMA) {
+    x_weight.x += 1.0f;
+    x_weight.y += 1.0f;
+    y_weight.x += 1.0f;
+    y_weight.y += 1.0f;
+    pass_weight0.x += 1.0f;
+    pass_weight0.y += 1.0f;
+    pass_weight1.x += 1.0f;
+    pass_weight1.y += 1.0f;
+  }
+  const float2 x = {data_0.x * scale * x_weight.x,
+                    data_0.y * scale * x_weight.y};
+  const float2 y = {data_1.x * scale * y_weight.x,
+                    data_1.y * scale * y_weight.y};
+  const float2 x_rot_f = {x.x * cos_v.x - y.x * sin_v.x,
+                          x.y * cos_v.y - y.y * sin_v.y};
+  const float2 y_rot_f = {y.x * cos_v.x + x.x * sin_v.x,
+                          y.y * cos_v.y + x.y * sin_v.y};
+  const float2 pass0_f = {data_2.x * scale * pass_weight0.x,
+                          data_2.y * scale * pass_weight0.y};
+  const float2 pass1_f = {data_3.x * scale * pass_weight1.x,
+                          data_3.y * scale * pass_weight1.y};
+  const __mt_bfloat162 x_rot = __float22bfloat162_rn(x_rot_f);
+  const __mt_bfloat162 y_rot = __float22bfloat162_rn(y_rot_f);
+  const __mt_bfloat162 pass0 = __float22bfloat162_rn(pass0_f);
+  const __mt_bfloat162 pass1 = __float22bfloat162_rn(pass1_f);
+
+  if (is_q) {
+    const int64_t q_out_base =
+        (int64_t)token * q_out_batch_stride + (int64_t)head * q_out_head_stride;
+    *reinterpret_cast<__mt_bfloat162 *>(q_out + q_out_base + pair_col) = x_rot;
+    *reinterpret_cast<__mt_bfloat162 *>(q_out + q_out_base + embed_dim + pair_col) =
+        y_rot;
+    *reinterpret_cast<__mt_bfloat162 *>(q_out + q_out_base + 64 + pair_col) =
+        pass0;
+    *reinterpret_cast<__mt_bfloat162 *>(q_out + q_out_base + 96 + pair_col) =
+        pass1;
+  } else {
+    const int64_t k_cache_base =
+        cache_idx * k_cache_row_stride + (int64_t)head * hidden;
+    *reinterpret_cast<__mt_bfloat162 *>(k_cache + k_cache_base + pair_col) =
+        x_rot;
+    *reinterpret_cast<__mt_bfloat162 *>(k_cache + k_cache_base + embed_dim +
+                                        pair_col) = y_rot;
+    *reinterpret_cast<__mt_bfloat162 *>(k_cache + k_cache_base + 64 + pair_col) =
+        pass0;
+    *reinterpret_cast<__mt_bfloat162 *>(k_cache + k_cache_base + 96 + pair_col) =
+        pass1;
+    if constexpr (STORE_K_OUT) {
+      const int64_t k_out_base = (int64_t)token * k_out_batch_stride +
+                                 (int64_t)head * k_out_head_stride;
+      *reinterpret_cast<__mt_bfloat162 *>(k_out + k_out_base + pair_col) =
+          x_rot;
+      *reinterpret_cast<__mt_bfloat162 *>(k_out + k_out_base + embed_dim +
+                                          pair_col) = y_rot;
+      *reinterpret_cast<__mt_bfloat162 *>(k_out + k_out_base + 64 + pair_col) =
+          pass0;
+      *reinterpret_cast<__mt_bfloat162 *>(k_out + k_out_base + 96 + pair_col) =
+          pass1;
     }
   }
 }
@@ -1193,8 +1510,9 @@ void launch_h256r64_mrope_kernel(
     ffi::TensorView k_weight, ffi::TensorView positions,
     ffi::TensorView cos_sin_cache, ffi::TensorView q_out,
     ffi::TensorView k_out, int batch, float eps, musaStream_t stream) {
-  constexpr int heads_per_block = HEADS_PER_BLOCK;
-  constexpr int threads = 32 * heads_per_block;
+  constexpr int warps_per_block = HEADS_PER_BLOCK;
+  constexpr int heads_per_block = warps_per_block * 2;
+  constexpr int threads = 32 * warps_per_block;
   constexpr int groups_per_token =
       (Q_HEADS + K_HEADS + heads_per_block - 1) / heads_per_block;
   fused_qk_rmsnorm_mrope_h256r64_bf16_kernel<Q_HEADS, K_HEADS,
@@ -1225,8 +1543,9 @@ void launch_h128_full_mrope_kernel(
     ffi::TensorView k_weight, ffi::TensorView positions,
     ffi::TensorView cos_sin_cache, ffi::TensorView q_out,
     ffi::TensorView k_out, int batch, float eps, musaStream_t stream) {
-  constexpr int heads_per_block = HEADS_PER_BLOCK;
-  constexpr int threads = 32 * heads_per_block;
+  constexpr int warps_per_block = HEADS_PER_BLOCK;
+  constexpr int heads_per_block = warps_per_block * 2;
+  constexpr int threads = 32 * warps_per_block;
   constexpr int groups_per_token =
       (Q_HEADS + K_HEADS + heads_per_block - 1) / heads_per_block;
   fused_qk_rmsnorm_mrope_h128_full_bf16_kernel<Q_HEADS, K_HEADS,
@@ -1593,7 +1912,8 @@ void launch_qk_mrope_cache_kernel(
 	          static_cast<int64_t>(indices.stride(0)), eps);
 }
 
-template <typename index_t, int Q_HEADS, int K_HEADS, int HEADS_PER_BLOCK = 8>
+template <typename index_t, int Q_HEADS, int K_HEADS, bool GEMMA,
+          int HEADS_PER_BLOCK = 8>
 void launch_h128_full_mrope_cache_kernel(
     ffi::TensorView q, ffi::TensorView k, ffi::TensorView v,
     ffi::TensorView q_weight, ffi::TensorView k_weight,
@@ -1604,8 +1924,108 @@ void launch_h128_full_mrope_cache_kernel(
   constexpr int threads = 32 * heads_per_block;
   constexpr int groups_per_token =
       (Q_HEADS + K_HEADS + heads_per_block - 1) / heads_per_block;
-  fused_qk_rmsnorm_mrope_cache_h128_full_bf16_kernel<
-      index_t, Q_HEADS, K_HEADS, HEADS_PER_BLOCK, false>
+#define LAUNCH_H128_FULL_MROPE_CACHE(SAME_POSITION_VALUE)                    \
+  fused_qk_rmsnorm_mrope_cache_h128_full_bf16_kernel<                        \
+      index_t, Q_HEADS, K_HEADS, GEMMA, HEADS_PER_BLOCK, false,              \
+      SAME_POSITION_VALUE>                                                   \
+      <<<batch * groups_per_token, threads, 0, stream>>>(                    \
+          static_cast<const __mt_bfloat16 *>(q.data_ptr()),                  \
+          static_cast<const __mt_bfloat16 *>(k.data_ptr()),                  \
+          static_cast<const __mt_bfloat16 *>(v.data_ptr()),                  \
+          static_cast<const __mt_bfloat16 *>(q_weight.data_ptr()),           \
+          static_cast<const __mt_bfloat16 *>(k_weight.data_ptr()),           \
+          static_cast<const int64_t *>(positions.data_ptr()),                \
+          static_cast<const __mt_bfloat16 *>(cos_sin_cache.data_ptr()),      \
+          static_cast<__mt_bfloat16 *>(q_out.data_ptr()), nullptr,           \
+          static_cast<__mt_bfloat16 *>(k_cache.data_ptr()),                  \
+          static_cast<__mt_bfloat16 *>(v_cache.data_ptr()),                  \
+          static_cast<const index_t *>(indices.data_ptr()), batch,           \
+          static_cast<int64_t>(positions.stride(0)),                         \
+          static_cast<int64_t>(q.stride(0)),                                 \
+          static_cast<int64_t>(q.stride(1)),                                 \
+          static_cast<int64_t>(k.stride(0)),                                 \
+          static_cast<int64_t>(k.stride(1)),                                 \
+          static_cast<int64_t>(v.stride(0)),                                 \
+          static_cast<int64_t>(v.stride(1)),                                 \
+          static_cast<int64_t>(q_out.stride(0)),                             \
+          static_cast<int64_t>(q_out.stride(1)), 0, 0,                       \
+          static_cast<int64_t>(k_cache.stride(0)),                           \
+          static_cast<int64_t>(v_cache.stride(0)),                           \
+          static_cast<int64_t>(indices.stride(0)), eps)
+  if (positions.stride(0) == 0) {
+    LAUNCH_H128_FULL_MROPE_CACHE(true);
+  } else {
+    LAUNCH_H128_FULL_MROPE_CACHE(false);
+  }
+#undef LAUNCH_H128_FULL_MROPE_CACHE
+}
+
+template <typename index_t, int Q_HEADS, int K_HEADS, bool GEMMA,
+          int HEADS_PER_BLOCK = 8>
+void launch_h128_full_mrope_cache_out_kernel(
+    ffi::TensorView q, ffi::TensorView k, ffi::TensorView v,
+    ffi::TensorView q_weight, ffi::TensorView k_weight,
+    ffi::TensorView positions, ffi::TensorView cos_sin_cache,
+    ffi::TensorView q_out, ffi::TensorView k_out, ffi::TensorView k_cache,
+    ffi::TensorView v_cache, ffi::TensorView indices, int batch, float eps,
+    musaStream_t stream) {
+  constexpr int heads_per_block = HEADS_PER_BLOCK;
+  constexpr int threads = 32 * heads_per_block;
+  constexpr int groups_per_token =
+      (Q_HEADS + K_HEADS + heads_per_block - 1) / heads_per_block;
+#define LAUNCH_H128_FULL_MROPE_CACHE_OUT(SAME_POSITION_VALUE)                \
+  fused_qk_rmsnorm_mrope_cache_h128_full_bf16_kernel<                        \
+      index_t, Q_HEADS, K_HEADS, GEMMA, HEADS_PER_BLOCK, true,               \
+      SAME_POSITION_VALUE>                                                   \
+      <<<batch * groups_per_token, threads, 0, stream>>>(                    \
+          static_cast<const __mt_bfloat16 *>(q.data_ptr()),                  \
+          static_cast<const __mt_bfloat16 *>(k.data_ptr()),                  \
+          static_cast<const __mt_bfloat16 *>(v.data_ptr()),                  \
+          static_cast<const __mt_bfloat16 *>(q_weight.data_ptr()),           \
+          static_cast<const __mt_bfloat16 *>(k_weight.data_ptr()),           \
+          static_cast<const int64_t *>(positions.data_ptr()),                \
+          static_cast<const __mt_bfloat16 *>(cos_sin_cache.data_ptr()),      \
+          static_cast<__mt_bfloat16 *>(q_out.data_ptr()),                    \
+          static_cast<__mt_bfloat16 *>(k_out.data_ptr()),                    \
+          static_cast<__mt_bfloat16 *>(k_cache.data_ptr()),                  \
+          static_cast<__mt_bfloat16 *>(v_cache.data_ptr()),                  \
+          static_cast<const index_t *>(indices.data_ptr()), batch,           \
+          static_cast<int64_t>(positions.stride(0)),                         \
+          static_cast<int64_t>(q.stride(0)),                                 \
+          static_cast<int64_t>(q.stride(1)),                                 \
+          static_cast<int64_t>(k.stride(0)),                                 \
+          static_cast<int64_t>(k.stride(1)),                                 \
+          static_cast<int64_t>(v.stride(0)),                                 \
+          static_cast<int64_t>(v.stride(1)),                                 \
+          static_cast<int64_t>(q_out.stride(0)),                             \
+          static_cast<int64_t>(q_out.stride(1)),                             \
+          static_cast<int64_t>(k_out.stride(0)),                             \
+          static_cast<int64_t>(k_out.stride(1)),                             \
+          static_cast<int64_t>(k_cache.stride(0)),                           \
+          static_cast<int64_t>(v_cache.stride(0)),                           \
+          static_cast<int64_t>(indices.stride(0)), eps)
+  if (positions.stride(0) == 0) {
+    LAUNCH_H128_FULL_MROPE_CACHE_OUT(true);
+  } else {
+    LAUNCH_H128_FULL_MROPE_CACHE_OUT(false);
+  }
+#undef LAUNCH_H128_FULL_MROPE_CACHE_OUT
+}
+
+template <typename index_t, int Q_HEADS, int K_HEADS, bool GEMMA,
+          int HEADS_PER_BLOCK = 8>
+void launch_h128_full_rope_cache_kernel(
+    ffi::TensorView q, ffi::TensorView k, ffi::TensorView v,
+    ffi::TensorView q_weight, ffi::TensorView k_weight,
+    ffi::TensorView positions, ffi::TensorView cos_sin_cache,
+    ffi::TensorView q_out, ffi::TensorView k_cache, ffi::TensorView v_cache,
+    ffi::TensorView indices, int batch, float eps, musaStream_t stream) {
+  constexpr int heads_per_block = HEADS_PER_BLOCK;
+  constexpr int threads = 32 * heads_per_block;
+  constexpr int groups_per_token =
+      (Q_HEADS + K_HEADS + heads_per_block - 1) / heads_per_block;
+  fused_qk_rmsnorm_rope_cache_h128_full_bf16_kernel<
+      index_t, Q_HEADS, K_HEADS, GEMMA, HEADS_PER_BLOCK, false>
       <<<batch * groups_per_token, threads, 0, stream>>>(
           static_cast<const __mt_bfloat16 *>(q.data_ptr()),
           static_cast<const __mt_bfloat16 *>(k.data_ptr()),
@@ -1619,18 +2039,22 @@ void launch_h128_full_mrope_cache_kernel(
           static_cast<__mt_bfloat16 *>(v_cache.data_ptr()),
           static_cast<const index_t *>(indices.data_ptr()), batch,
           static_cast<int64_t>(positions.stride(0)),
-          static_cast<int64_t>(q.stride(0)), static_cast<int64_t>(q.stride(1)),
-          static_cast<int64_t>(k.stride(0)), static_cast<int64_t>(k.stride(1)),
-          static_cast<int64_t>(v.stride(0)), static_cast<int64_t>(v.stride(1)),
+          static_cast<int64_t>(q.stride(0)),
+          static_cast<int64_t>(q.stride(1)),
+          static_cast<int64_t>(k.stride(0)),
+          static_cast<int64_t>(k.stride(1)),
+          static_cast<int64_t>(v.stride(0)),
+          static_cast<int64_t>(v.stride(1)),
           static_cast<int64_t>(q_out.stride(0)),
           static_cast<int64_t>(q_out.stride(1)), 0, 0,
           static_cast<int64_t>(k_cache.stride(0)),
           static_cast<int64_t>(v_cache.stride(0)),
-	          static_cast<int64_t>(indices.stride(0)), eps);
+          static_cast<int64_t>(indices.stride(0)), eps);
 }
 
-template <typename index_t, int Q_HEADS, int K_HEADS, int HEADS_PER_BLOCK = 8>
-void launch_h128_full_mrope_cache_out_kernel(
+template <typename index_t, int Q_HEADS, int K_HEADS, bool GEMMA,
+          int HEADS_PER_BLOCK = 8>
+void launch_h128_full_rope_cache_out_kernel(
     ffi::TensorView q, ffi::TensorView k, ffi::TensorView v,
     ffi::TensorView q_weight, ffi::TensorView k_weight,
     ffi::TensorView positions, ffi::TensorView cos_sin_cache,
@@ -1641,8 +2065,8 @@ void launch_h128_full_mrope_cache_out_kernel(
   constexpr int threads = 32 * heads_per_block;
   constexpr int groups_per_token =
       (Q_HEADS + K_HEADS + heads_per_block - 1) / heads_per_block;
-  fused_qk_rmsnorm_mrope_cache_h128_full_bf16_kernel<
-      index_t, Q_HEADS, K_HEADS, HEADS_PER_BLOCK>
+  fused_qk_rmsnorm_rope_cache_h128_full_bf16_kernel<
+      index_t, Q_HEADS, K_HEADS, GEMMA, HEADS_PER_BLOCK, true>
       <<<batch * groups_per_token, threads, 0, stream>>>(
           static_cast<const __mt_bfloat16 *>(q.data_ptr()),
           static_cast<const __mt_bfloat16 *>(k.data_ptr()),
@@ -1657,9 +2081,96 @@ void launch_h128_full_mrope_cache_out_kernel(
           static_cast<__mt_bfloat16 *>(v_cache.data_ptr()),
           static_cast<const index_t *>(indices.data_ptr()), batch,
           static_cast<int64_t>(positions.stride(0)),
-          static_cast<int64_t>(q.stride(0)), static_cast<int64_t>(q.stride(1)),
-          static_cast<int64_t>(k.stride(0)), static_cast<int64_t>(k.stride(1)),
-          static_cast<int64_t>(v.stride(0)), static_cast<int64_t>(v.stride(1)),
+          static_cast<int64_t>(q.stride(0)),
+          static_cast<int64_t>(q.stride(1)),
+          static_cast<int64_t>(k.stride(0)),
+          static_cast<int64_t>(k.stride(1)),
+          static_cast<int64_t>(v.stride(0)),
+          static_cast<int64_t>(v.stride(1)),
+          static_cast<int64_t>(q_out.stride(0)),
+          static_cast<int64_t>(q_out.stride(1)),
+          static_cast<int64_t>(k_out.stride(0)),
+          static_cast<int64_t>(k_out.stride(1)),
+          static_cast<int64_t>(k_cache.stride(0)),
+          static_cast<int64_t>(v_cache.stride(0)),
+          static_cast<int64_t>(indices.stride(0)), eps);
+}
+
+template <typename index_t, int Q_HEADS, int K_HEADS, bool GEMMA,
+          int HEADS_PER_BLOCK = 4>
+void launch_h128r64_rope_cache_kernel(
+    ffi::TensorView q, ffi::TensorView k, ffi::TensorView v,
+    ffi::TensorView q_weight, ffi::TensorView k_weight,
+    ffi::TensorView positions, ffi::TensorView cos_sin_cache,
+    ffi::TensorView q_out, ffi::TensorView k_cache, ffi::TensorView v_cache,
+    ffi::TensorView indices, int batch, float eps, musaStream_t stream) {
+  constexpr int heads_per_block = HEADS_PER_BLOCK;
+  constexpr int threads = 32 * heads_per_block;
+  constexpr int groups_per_token =
+      (Q_HEADS + K_HEADS + heads_per_block - 1) / heads_per_block;
+  fused_qk_rmsnorm_rope_cache_h128r64_bf16_kernel<
+      index_t, Q_HEADS, K_HEADS, GEMMA, HEADS_PER_BLOCK, false>
+      <<<batch * groups_per_token, threads, 0, stream>>>(
+          static_cast<const __mt_bfloat16 *>(q.data_ptr()),
+          static_cast<const __mt_bfloat16 *>(k.data_ptr()),
+          static_cast<const __mt_bfloat16 *>(v.data_ptr()),
+          static_cast<const __mt_bfloat16 *>(q_weight.data_ptr()),
+          static_cast<const __mt_bfloat16 *>(k_weight.data_ptr()),
+          static_cast<const int64_t *>(positions.data_ptr()),
+          static_cast<const __mt_bfloat16 *>(cos_sin_cache.data_ptr()),
+          static_cast<__mt_bfloat16 *>(q_out.data_ptr()), nullptr,
+          static_cast<__mt_bfloat16 *>(k_cache.data_ptr()),
+          static_cast<__mt_bfloat16 *>(v_cache.data_ptr()),
+          static_cast<const index_t *>(indices.data_ptr()), batch,
+          static_cast<int64_t>(positions.stride(0)),
+          static_cast<int64_t>(q.stride(0)),
+          static_cast<int64_t>(q.stride(1)),
+          static_cast<int64_t>(k.stride(0)),
+          static_cast<int64_t>(k.stride(1)),
+          static_cast<int64_t>(v.stride(0)),
+          static_cast<int64_t>(v.stride(1)),
+          static_cast<int64_t>(q_out.stride(0)),
+          static_cast<int64_t>(q_out.stride(1)), 0, 0,
+          static_cast<int64_t>(k_cache.stride(0)),
+          static_cast<int64_t>(v_cache.stride(0)),
+          static_cast<int64_t>(indices.stride(0)), eps);
+}
+
+template <typename index_t, int Q_HEADS, int K_HEADS, bool GEMMA,
+          int HEADS_PER_BLOCK = 4>
+void launch_h128r64_rope_cache_out_kernel(
+    ffi::TensorView q, ffi::TensorView k, ffi::TensorView v,
+    ffi::TensorView q_weight, ffi::TensorView k_weight,
+    ffi::TensorView positions, ffi::TensorView cos_sin_cache,
+    ffi::TensorView q_out, ffi::TensorView k_out, ffi::TensorView k_cache,
+    ffi::TensorView v_cache, ffi::TensorView indices, int batch, float eps,
+    musaStream_t stream) {
+  constexpr int heads_per_block = HEADS_PER_BLOCK;
+  constexpr int threads = 32 * heads_per_block;
+  constexpr int groups_per_token =
+      (Q_HEADS + K_HEADS + heads_per_block - 1) / heads_per_block;
+  fused_qk_rmsnorm_rope_cache_h128r64_bf16_kernel<
+      index_t, Q_HEADS, K_HEADS, GEMMA, HEADS_PER_BLOCK, true>
+      <<<batch * groups_per_token, threads, 0, stream>>>(
+          static_cast<const __mt_bfloat16 *>(q.data_ptr()),
+          static_cast<const __mt_bfloat16 *>(k.data_ptr()),
+          static_cast<const __mt_bfloat16 *>(v.data_ptr()),
+          static_cast<const __mt_bfloat16 *>(q_weight.data_ptr()),
+          static_cast<const __mt_bfloat16 *>(k_weight.data_ptr()),
+          static_cast<const int64_t *>(positions.data_ptr()),
+          static_cast<const __mt_bfloat16 *>(cos_sin_cache.data_ptr()),
+          static_cast<__mt_bfloat16 *>(q_out.data_ptr()),
+          static_cast<__mt_bfloat16 *>(k_out.data_ptr()),
+          static_cast<__mt_bfloat16 *>(k_cache.data_ptr()),
+          static_cast<__mt_bfloat16 *>(v_cache.data_ptr()),
+          static_cast<const index_t *>(indices.data_ptr()), batch,
+          static_cast<int64_t>(positions.stride(0)),
+          static_cast<int64_t>(q.stride(0)),
+          static_cast<int64_t>(q.stride(1)),
+          static_cast<int64_t>(k.stride(0)),
+          static_cast<int64_t>(k.stride(1)),
+          static_cast<int64_t>(v.stride(0)),
+          static_cast<int64_t>(v.stride(1)),
           static_cast<int64_t>(q_out.stride(0)),
           static_cast<int64_t>(q_out.stride(1)),
           static_cast<int64_t>(k_out.stride(0)),
@@ -1833,40 +2344,112 @@ void launch_fused_qk_rmsnorm_mrope_cache_bf16(
     }
   }
   const bool use_h128_full_mrope_specialization =
-      gemma && is_interleaved && hidden == 128 && rot_dim == 128 &&
-      mrope_section_t == 24 && mrope_section_h == 20 &&
-      mrope_section_w == 20;
+      is_interleaved && hidden == 128 && rot_dim == 128 && mrope_section_t == 24 &&
+      mrope_section_h == 20 && mrope_section_w == 20;
   if (use_h128_full_mrope_specialization) {
-    if (q_heads == 2 && k_heads == 2) {
-      launch_h128_full_mrope_cache_kernel<index_t, 2, 2>(
-          q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out, k_cache,
-          v_cache, indices, batch, eps, stream);
-      return;
-    }
-    if (q_heads == 4 && k_heads == 4) {
-      launch_h128_full_mrope_cache_kernel<index_t, 4, 4>(
-          q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out, k_cache,
-          v_cache, indices, batch, eps, stream);
-      return;
-    }
-    if (q_heads == 8 && k_heads == 8) {
-      launch_h128_full_mrope_cache_kernel<index_t, 8, 8>(
-          q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out, k_cache,
-          v_cache, indices, batch, eps, stream);
-      return;
-    }
-    if (q_heads == 32 && k_heads == 32) {
-      launch_h128_full_mrope_cache_kernel<index_t, 32, 32>(
-          q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out, k_cache,
-          v_cache, indices, batch, eps, stream);
-      return;
-    }
-    if (q_heads == 16 && k_heads == 16) {
-      launch_h128_full_mrope_cache_kernel<index_t, 16, 16>(
-          q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out, k_cache,
-          v_cache, indices, batch, eps, stream);
-      return;
-    }
+#define LAUNCH_H128_MROPE_CACHE(QH, KH)                                       \
+  do {                                                                        \
+    if (q_heads == (QH) && k_heads == (KH)) {                                 \
+      if (gemma) {                                                            \
+        launch_h128_full_mrope_cache_kernel<index_t, QH, KH, true>(           \
+            q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out,     \
+            k_cache, v_cache, indices, batch, eps, stream);                   \
+      } else {                                                                \
+        launch_h128_full_mrope_cache_kernel<index_t, QH, KH, false>(          \
+            q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out,     \
+            k_cache, v_cache, indices, batch, eps, stream);                   \
+      }                                                                       \
+      return;                                                                 \
+    }                                                                         \
+  } while (0)
+    LAUNCH_H128_MROPE_CACHE(2, 1);
+    LAUNCH_H128_MROPE_CACHE(4, 1);
+    LAUNCH_H128_MROPE_CACHE(4, 2);
+    LAUNCH_H128_MROPE_CACHE(8, 2);
+    LAUNCH_H128_MROPE_CACHE(8, 4);
+    LAUNCH_H128_MROPE_CACHE(16, 4);
+    LAUNCH_H128_MROPE_CACHE(16, 8);
+    LAUNCH_H128_MROPE_CACHE(32, 8);
+    LAUNCH_H128_MROPE_CACHE(2, 2);
+    LAUNCH_H128_MROPE_CACHE(4, 4);
+    LAUNCH_H128_MROPE_CACHE(8, 8);
+    LAUNCH_H128_MROPE_CACHE(16, 16);
+    LAUNCH_H128_MROPE_CACHE(32, 32);
+#undef LAUNCH_H128_MROPE_CACHE
+  }
+  const bool use_h128_full_rope_specialization =
+      hidden == 128 && rot_dim == 128 && mrope_section_t == 64 &&
+      mrope_section_h == 0 && mrope_section_w == 0 && !is_interleaved;
+  if (use_h128_full_rope_specialization) {
+#define LAUNCH_H128_ROPE_CACHE(QH, KH)                                        \
+  do {                                                                        \
+    if (q_heads == (QH) && k_heads == (KH)) {                                 \
+      if (gemma) {                                                            \
+        launch_h128_full_rope_cache_kernel<index_t, QH, KH, true>(            \
+            q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out,     \
+            k_cache, v_cache, indices, batch, eps, stream);                   \
+      } else {                                                                \
+        launch_h128_full_rope_cache_kernel<index_t, QH, KH, false>(           \
+            q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out,     \
+            k_cache, v_cache, indices, batch, eps, stream);                   \
+      }                                                                       \
+      return;                                                                 \
+    }                                                                         \
+  } while (0)
+    LAUNCH_H128_ROPE_CACHE(8, 8);
+    LAUNCH_H128_ROPE_CACHE(16, 8);
+    LAUNCH_H128_ROPE_CACHE(24, 8);
+    LAUNCH_H128_ROPE_CACHE(32, 8);
+    LAUNCH_H128_ROPE_CACHE(40, 8);
+    LAUNCH_H128_ROPE_CACHE(48, 8);
+    LAUNCH_H128_ROPE_CACHE(64, 8);
+    LAUNCH_H128_ROPE_CACHE(5, 1);
+    LAUNCH_H128_ROPE_CACHE(8, 1);
+    LAUNCH_H128_ROPE_CACHE(10, 2);
+    LAUNCH_H128_ROPE_CACHE(16, 1);
+    LAUNCH_H128_ROPE_CACHE(16, 2);
+    LAUNCH_H128_ROPE_CACHE(16, 4);
+    LAUNCH_H128_ROPE_CACHE(20, 4);
+    LAUNCH_H128_ROPE_CACHE(24, 4);
+    LAUNCH_H128_ROPE_CACHE(32, 2);
+    LAUNCH_H128_ROPE_CACHE(32, 4);
+    LAUNCH_H128_ROPE_CACHE(40, 4);
+    LAUNCH_H128_ROPE_CACHE(4, 1);
+    LAUNCH_H128_ROPE_CACHE(8, 2);
+#undef LAUNCH_H128_ROPE_CACHE
+  }
+  const bool use_h128r64_rope_specialization =
+      hidden == 128 && rot_dim == 64 && mrope_section_t == 32 &&
+      mrope_section_h == 0 && mrope_section_w == 0 && !is_interleaved;
+  if (use_h128r64_rope_specialization) {
+#define LAUNCH_H128R64_ROPE_CACHE(QH, KH)                                     \
+  do {                                                                        \
+    if (q_heads == (QH) && k_heads == (KH)) {                                 \
+      if (gemma) {                                                            \
+        launch_h128r64_rope_cache_kernel<index_t, QH, KH, true>(              \
+            q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out,     \
+            k_cache, v_cache, indices, batch, eps, stream);                   \
+      } else {                                                                \
+        launch_h128r64_rope_cache_kernel<index_t, QH, KH, false>(             \
+            q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out,     \
+            k_cache, v_cache, indices, batch, eps, stream);                   \
+      }                                                                       \
+      return;                                                                 \
+    }                                                                         \
+  } while (0)
+    LAUNCH_H128R64_ROPE_CACHE(6, 1);
+    LAUNCH_H128R64_ROPE_CACHE(8, 1);
+    LAUNCH_H128R64_ROPE_CACHE(12, 1);
+    LAUNCH_H128R64_ROPE_CACHE(12, 2);
+    LAUNCH_H128R64_ROPE_CACHE(16, 2);
+    LAUNCH_H128R64_ROPE_CACHE(24, 2);
+    LAUNCH_H128R64_ROPE_CACHE(24, 4);
+    LAUNCH_H128R64_ROPE_CACHE(32, 4);
+    LAUNCH_H128R64_ROPE_CACHE(48, 4);
+    LAUNCH_H128R64_ROPE_CACHE(48, 8);
+    LAUNCH_H128R64_ROPE_CACHE(64, 8);
+    LAUNCH_H128R64_ROPE_CACHE(96, 8);
+#undef LAUNCH_H128R64_ROPE_CACHE
   }
   if (!use_32q4kv_h128_mrope_specialization) {
     constexpr int threads = 256;
@@ -2137,40 +2720,112 @@ void launch_fused_qk_rmsnorm_mrope_cache_out_bf16(
     }
   }
   const bool use_h128_full_mrope_specialization =
-      gemma && is_interleaved && hidden == 128 && rot_dim == 128 &&
-      mrope_section_t == 24 && mrope_section_h == 20 &&
-      mrope_section_w == 20;
+      is_interleaved && hidden == 128 && rot_dim == 128 && mrope_section_t == 24 &&
+      mrope_section_h == 20 && mrope_section_w == 20;
   if (use_h128_full_mrope_specialization) {
-    if (q_heads == 2 && k_heads == 2) {
-      launch_h128_full_mrope_cache_out_kernel<index_t, 2, 2>(
-          q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out, k_out,
-          k_cache, v_cache, indices, batch, eps, stream);
-      return;
-    }
-    if (q_heads == 4 && k_heads == 4) {
-      launch_h128_full_mrope_cache_out_kernel<index_t, 4, 4>(
-          q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out, k_out,
-          k_cache, v_cache, indices, batch, eps, stream);
-      return;
-    }
-    if (q_heads == 8 && k_heads == 8) {
-      launch_h128_full_mrope_cache_out_kernel<index_t, 8, 8>(
-          q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out, k_out,
-          k_cache, v_cache, indices, batch, eps, stream);
-      return;
-    }
-    if (q_heads == 32 && k_heads == 32) {
-      launch_h128_full_mrope_cache_out_kernel<index_t, 32, 32>(
-          q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out, k_out,
-          k_cache, v_cache, indices, batch, eps, stream);
-      return;
-    }
-    if (q_heads == 16 && k_heads == 16) {
-      launch_h128_full_mrope_cache_out_kernel<index_t, 16, 16>(
-          q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out, k_out,
-          k_cache, v_cache, indices, batch, eps, stream);
-      return;
-    }
+#define LAUNCH_H128_MROPE_CACHE_OUT(QH, KH)                                   \
+  do {                                                                        \
+    if (q_heads == (QH) && k_heads == (KH)) {                                 \
+      if (gemma) {                                                            \
+        launch_h128_full_mrope_cache_out_kernel<index_t, QH, KH, true>(       \
+            q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out,     \
+            k_out, k_cache, v_cache, indices, batch, eps, stream);            \
+      } else {                                                                \
+        launch_h128_full_mrope_cache_out_kernel<index_t, QH, KH, false>(      \
+            q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out,     \
+            k_out, k_cache, v_cache, indices, batch, eps, stream);            \
+      }                                                                       \
+      return;                                                                 \
+    }                                                                         \
+  } while (0)
+    LAUNCH_H128_MROPE_CACHE_OUT(2, 1);
+    LAUNCH_H128_MROPE_CACHE_OUT(4, 1);
+    LAUNCH_H128_MROPE_CACHE_OUT(4, 2);
+    LAUNCH_H128_MROPE_CACHE_OUT(8, 2);
+    LAUNCH_H128_MROPE_CACHE_OUT(8, 4);
+    LAUNCH_H128_MROPE_CACHE_OUT(16, 4);
+    LAUNCH_H128_MROPE_CACHE_OUT(16, 8);
+    LAUNCH_H128_MROPE_CACHE_OUT(32, 8);
+    LAUNCH_H128_MROPE_CACHE_OUT(2, 2);
+    LAUNCH_H128_MROPE_CACHE_OUT(4, 4);
+    LAUNCH_H128_MROPE_CACHE_OUT(8, 8);
+    LAUNCH_H128_MROPE_CACHE_OUT(16, 16);
+    LAUNCH_H128_MROPE_CACHE_OUT(32, 32);
+#undef LAUNCH_H128_MROPE_CACHE_OUT
+  }
+  const bool use_h128_full_rope_specialization =
+      hidden == 128 && rot_dim == 128 && mrope_section_t == 64 &&
+      mrope_section_h == 0 && mrope_section_w == 0 && !is_interleaved;
+  if (use_h128_full_rope_specialization) {
+#define LAUNCH_H128_ROPE_CACHE_OUT(QH, KH)                                    \
+  do {                                                                        \
+    if (q_heads == (QH) && k_heads == (KH)) {                                 \
+      if (gemma) {                                                            \
+        launch_h128_full_rope_cache_out_kernel<index_t, QH, KH, true>(        \
+            q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out,     \
+            k_out, k_cache, v_cache, indices, batch, eps, stream);            \
+      } else {                                                                \
+        launch_h128_full_rope_cache_out_kernel<index_t, QH, KH, false>(       \
+            q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out,     \
+            k_out, k_cache, v_cache, indices, batch, eps, stream);            \
+      }                                                                       \
+      return;                                                                 \
+    }                                                                         \
+  } while (0)
+    LAUNCH_H128_ROPE_CACHE_OUT(8, 8);
+    LAUNCH_H128_ROPE_CACHE_OUT(16, 8);
+    LAUNCH_H128_ROPE_CACHE_OUT(24, 8);
+    LAUNCH_H128_ROPE_CACHE_OUT(32, 8);
+    LAUNCH_H128_ROPE_CACHE_OUT(40, 8);
+    LAUNCH_H128_ROPE_CACHE_OUT(48, 8);
+    LAUNCH_H128_ROPE_CACHE_OUT(64, 8);
+    LAUNCH_H128_ROPE_CACHE_OUT(5, 1);
+    LAUNCH_H128_ROPE_CACHE_OUT(8, 1);
+    LAUNCH_H128_ROPE_CACHE_OUT(10, 2);
+    LAUNCH_H128_ROPE_CACHE_OUT(16, 1);
+    LAUNCH_H128_ROPE_CACHE_OUT(16, 2);
+    LAUNCH_H128_ROPE_CACHE_OUT(16, 4);
+    LAUNCH_H128_ROPE_CACHE_OUT(20, 4);
+    LAUNCH_H128_ROPE_CACHE_OUT(24, 4);
+    LAUNCH_H128_ROPE_CACHE_OUT(32, 2);
+    LAUNCH_H128_ROPE_CACHE_OUT(32, 4);
+    LAUNCH_H128_ROPE_CACHE_OUT(40, 4);
+    LAUNCH_H128_ROPE_CACHE_OUT(4, 1);
+    LAUNCH_H128_ROPE_CACHE_OUT(8, 2);
+#undef LAUNCH_H128_ROPE_CACHE_OUT
+  }
+  const bool use_h128r64_rope_specialization =
+      hidden == 128 && rot_dim == 64 && mrope_section_t == 32 &&
+      mrope_section_h == 0 && mrope_section_w == 0 && !is_interleaved;
+  if (use_h128r64_rope_specialization) {
+#define LAUNCH_H128R64_ROPE_CACHE_OUT(QH, KH)                                 \
+  do {                                                                        \
+    if (q_heads == (QH) && k_heads == (KH)) {                                 \
+      if (gemma) {                                                            \
+        launch_h128r64_rope_cache_out_kernel<index_t, QH, KH, true>(          \
+            q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out,     \
+            k_out, k_cache, v_cache, indices, batch, eps, stream);            \
+      } else {                                                                \
+        launch_h128r64_rope_cache_out_kernel<index_t, QH, KH, false>(         \
+            q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out,     \
+            k_out, k_cache, v_cache, indices, batch, eps, stream);            \
+      }                                                                       \
+      return;                                                                 \
+    }                                                                         \
+  } while (0)
+    LAUNCH_H128R64_ROPE_CACHE_OUT(6, 1);
+    LAUNCH_H128R64_ROPE_CACHE_OUT(8, 1);
+    LAUNCH_H128R64_ROPE_CACHE_OUT(12, 1);
+    LAUNCH_H128R64_ROPE_CACHE_OUT(12, 2);
+    LAUNCH_H128R64_ROPE_CACHE_OUT(16, 2);
+    LAUNCH_H128R64_ROPE_CACHE_OUT(24, 2);
+    LAUNCH_H128R64_ROPE_CACHE_OUT(24, 4);
+    LAUNCH_H128R64_ROPE_CACHE_OUT(32, 4);
+    LAUNCH_H128R64_ROPE_CACHE_OUT(48, 4);
+    LAUNCH_H128R64_ROPE_CACHE_OUT(48, 8);
+    LAUNCH_H128R64_ROPE_CACHE_OUT(64, 8);
+    LAUNCH_H128R64_ROPE_CACHE_OUT(96, 8);
+#undef LAUNCH_H128R64_ROPE_CACHE_OUT
   }
   if (use_32q4kv_h128_mrope_specialization) {
     launch_qk_mrope_cache_out_kernel<index_t>(

@@ -545,6 +545,59 @@ def try_fused_qk_rmsnorm_mrope(
     )
 
 
+def try_fused_qk_rmsnorm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    *,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    is_neox: bool,
+    eps: float = 1e-6,
+    gemma: bool = False,
+    v: torch.Tensor | None = None,
+    k_cache: torch.Tensor | None = None,
+    v_cache: torch.Tensor | None = None,
+    indices: torch.Tensor | None = None,
+    return_k: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None] | None:
+    if not (
+        positions.dim() == 1
+        and cos_sin_cache.dim() == 2
+        and is_neox
+        and cos_sin_cache.size(1) % 2 == 0
+    ):
+        return None
+
+    positions_3d = positions.unsqueeze(0).expand(3, -1)
+    rot_half = int(cos_sin_cache.size(1)) // 2
+    return try_fused_qk_rmsnorm_mrope(
+        q=q,
+        k=k,
+        q_weight=q_weight,
+        k_weight=k_weight,
+        positions=positions_3d,
+        cos_sin_cache=cos_sin_cache,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        is_neox=is_neox,
+        mrope_section=(rot_half, 0, 0),
+        is_interleaved=False,
+        eps=eps,
+        gemma=gemma,
+        v=v,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        indices=indices,
+        return_k=return_k,
+    )
+
+
 def store_cache(
     k: torch.Tensor,
     v: torch.Tensor,

@@ -7,10 +7,17 @@ from typing import Tuple
 
 import torch
 
-from sglang.srt.utils import cpu_has_amx_support, get_compiler_backend, is_cpu, is_npu
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    get_compiler_backend,
+    is_cpu,
+    is_musa,
+    is_npu,
+)
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_musa = is_musa()
 _is_cpu_amx_available = cpu_has_amx_support()
 
 if _is_npu:
@@ -94,6 +101,19 @@ def apply_rotary_pos_emb_native(
     return q_embed, k_embed
 
 
+def apply_rotary_pos_emb_musa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim=1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """MUSA implementation for HF-style full-dim rotate_half RoPE."""
+    from sglang.srt.hardware_backend.musa.jit_kernel.csrc.rope import rotary_pos_emb
+
+    return rotary_pos_emb(q, k, cos, sin, unsqueeze_dim)
+
+
 def apply_rotary_pos_emb_npu(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -130,6 +150,8 @@ def apply_rotary_pos_emb_npu(
 
 if _is_npu:
     apply_rotary_pos_emb = apply_rotary_pos_emb_npu
+elif _is_musa:
+    apply_rotary_pos_emb = apply_rotary_pos_emb_musa
 elif _is_cpu and _is_cpu_amx_available:
     apply_rotary_pos_emb = torch.ops.sgl_kernel.apply_rotary_pos_emb_cpu
 else:

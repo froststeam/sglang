@@ -46,6 +46,14 @@ if _is_hip:
         fused_qk_rope_reshape_and_cache,
     )
 
+if _is_musa:
+    from sglang.srt.hardware_backend.musa.jit_kernel.csrc.rope import (
+        rotary_embedding_cache as musa_rotary_embedding_cache,
+    )
+    from sglang.srt.hardware_backend.musa.jit_kernel.csrc.rope import (
+        rotary_embedding_cache_qout as musa_rotary_embedding_cache_qout,
+    )
+
 
 class RotaryEmbedding(MultiPlatformOp):
     """Original rotary positional embedding."""
@@ -386,6 +394,44 @@ class RotaryEmbedding(MultiPlatformOp):
                     output_zeros=False,
                     **extra_args,
                 )
+            elif fused_set_kv_buffer_arg is not None and _is_musa:
+                self.cos_sin_cache = self.cos_sin_cache.to(
+                    query.device, dtype=query.dtype
+                )
+                use_musa_qout_cache = (
+                    query.dtype == torch.bfloat16
+                    and self.is_neox_style
+                    and self.head_size == self.rotary_dim
+                    and self.rotary_dim in (64, 128)
+                    and positions.dim() == 1
+                    and not query.is_contiguous()
+                )
+                if use_musa_qout_cache:
+                    query = musa_rotary_embedding_cache_qout(
+                        positions,
+                        query,
+                        key,
+                        fused_set_kv_buffer_arg.value,
+                        self.head_size,
+                        self.cos_sin_cache,
+                        self.is_neox_style,
+                        fused_set_kv_buffer_arg.k_buffer,
+                        fused_set_kv_buffer_arg.v_buffer,
+                        fused_set_kv_buffer_arg.cache_loc,
+                    )
+                else:
+                    musa_rotary_embedding_cache(
+                        positions,
+                        query,
+                        key,
+                        fused_set_kv_buffer_arg.value,
+                        self.head_size,
+                        self.cos_sin_cache,
+                        self.is_neox_style,
+                        fused_set_kv_buffer_arg.k_buffer,
+                        fused_set_kv_buffer_arg.v_buffer,
+                        fused_set_kv_buffer_arg.cache_loc,
+                    )
             else:
                 assert (
                     fused_set_kv_buffer_arg is None
