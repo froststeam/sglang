@@ -297,7 +297,7 @@ class EagleDraftWorker(BaseDraftWorker):
         Device2ExtendCudaGraphRunner = {
             "npu": EAGLEDraftExtendNpuGraphRunner,
             "cuda": EAGLEDraftExtendCudaGraphRunner,
-            "musa": EAGLEDraftCudaGraphRunner,
+            "musa": EAGLEDraftExtendCudaGraphRunner,
         }
         supports_hip_aiter_draft_extend_graph = False
         if _is_hip:
