@@ -220,6 +220,9 @@ class ModelConfig:
                 "Gemma3ForConditionalGeneration",
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
+                # MiniMax-M3: text-only bring-up (vision tower not yet wired). Served
+                # via the text backbone; pass --enable-multimodal once vision lands.
+                "MiniMaxM3SparseForConditionalGeneration",
             ]
             if (
                 self.hf_config.architectures[0] in mm_disabled_models
