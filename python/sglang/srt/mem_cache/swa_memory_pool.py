@@ -161,8 +161,6 @@ class SWAKVPool(BaseSWAKVPool):
             return self.full_kv_pool.get_kv_buffer(layer_id_pool)
 
     def set_swa_loc(self, loc: torch.Tensor):
-        if _is_musa and loc.dtype != torch.long:
-            loc = loc.to(torch.long)
         self.swa_loc = loc
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
