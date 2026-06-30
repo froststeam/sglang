@@ -2113,9 +2113,9 @@ class DeepseekV2Model(nn.Module):
             torch.cuda.Stream()
             if (
                 _is_cuda
-                or _is_musa
                 or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
                 or envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
+                or envs.SGLANG_MUSA_USE_MULTI_STREAM.get()
             )
             else None
         )

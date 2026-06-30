@@ -65,6 +65,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -210,7 +211,11 @@ class LongcatFlashModelNextN(nn.Module):
     ) -> None:
         super().__init__()
         self.vocab_size = config.vocab_size
-        self.alt_stream = torch.cuda.Stream()
+        self.alt_stream = (
+            torch.cuda.Stream()
+            if _is_cuda or envs.SGLANG_MUSA_USE_MULTI_STREAM.get()
+            else None
+        )
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,

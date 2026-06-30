@@ -81,6 +81,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.utils import (
     maybe_executor_submit,
@@ -520,7 +521,11 @@ class LongcatFlashModel(nn.Module):
                 use_attn_tp_group=is_dp_attention_enabled(),
             )
 
-        self.alt_stream = torch.cuda.Stream()
+        self.alt_stream = (
+            torch.cuda.Stream()
+            if _is_cuda or envs.SGLANG_MUSA_USE_MULTI_STREAM.get()
+            else None
+        )
         self.layers = nn.ModuleList(
             [
                 LongcatFlashDecoderLayer(
