@@ -456,6 +456,24 @@ def _ensure_fastokens_patched():
     logger.info("fastokens backend enabled - transformers patched successfully")
 
 
+def _enable_fastokens_tokenizer(tokenizer, tokenizer_name):
+    """Enable fastokens after local tokenizer fixes have been applied."""
+    try:
+        import tokenizers.decoders as tokenizers_decoders
+        from fastokens._compat import _TokenizerShim
+        from fastokens._native import DecodeStream
+    except ImportError:
+        raise ImportError(
+            "The fastokens package is required when --tokenizer-backend=fastokens. "
+            "Install it with: pip install fastokens"
+        ) from None
+
+    tokenizers_decoders.DecodeStream = DecodeStream
+    if not isinstance(tokenizer._tokenizer, _TokenizerShim):
+        tokenizer._tokenizer = _TokenizerShim(tokenizer._tokenizer)
+    logger.info("Using fastokens tokenizer backend for %s", tokenizer_name)
+
+
 def get_tokenizer(
     tokenizer_name: str,
     *args,
@@ -472,8 +490,11 @@ def get_tokenizer(
 
         return TiktokenTokenizer(tokenizer_name)
 
-    if tokenizer_backend == "fastokens":
-        _ensure_fastokens_patched()
+    if tokenizer_backend not in ("huggingface", "fastokens"):
+        raise ValueError(
+            f"Unsupported tokenizer backend: {tokenizer_backend}. "
+            "Supported backends are: huggingface, fastokens."
+        )
 
     if tokenizer_mode == "slow":
         if kwargs.get("use_fast", False):
@@ -511,7 +532,12 @@ def get_tokenizer(
                 tokenizer_name, *args, **common_kwargs
             )
 
-        return _apply_post_load_fixes(tokenizer, tokenizer_name, tokenizer_revision)
+        tokenizer = _apply_post_load_fixes(
+            tokenizer, tokenizer_name, tokenizer_revision
+        )
+        if tokenizer_backend == "fastokens":
+            _enable_fastokens_tokenizer(tokenizer, tokenizer_name)
+        return tokenizer
     except Exception as e:
         if tokenizer_backend == "fastokens":
             raise RuntimeError(
