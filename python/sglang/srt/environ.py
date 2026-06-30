@@ -354,6 +354,7 @@ class Envs:
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
     SGLANG_MUSA_FA3_SYNC_BEFORE_KVCACHE_ATTENTION = EnvBool(False)
     SGLANG_MUSA_USE_JIT_ALL_REDUCE = EnvBool(True)
+    SGLANG_MUSA_USE_MULTI_STREAM = EnvBool(False)
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
