@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 
+from sglang.srt.environ import envs
 from sglang.srt.speculative.spec_registry import (
     CustomSpecAlgo,
     ServerArgsValidator,
@@ -112,6 +113,18 @@ class SpeculativeAlgorithm(Enum):
     def supports_spec_v2(self) -> bool:
         return (self.is_eagle() and not self.is_frozen_kv_mtp()) or self.is_standalone()
 
+    def use_spec_v2_worker(self, server_args: ServerArgs) -> bool:
+        if not self.supports_spec_v2():
+            return False
+
+        if not envs.SGLANG_ENABLE_SPEC_V2.get():
+            return False
+
+        return (
+            server_args.speculative_eagle_topk is None
+            or server_args.speculative_eagle_topk <= 1
+        )
+
     def create_worker(
         self, server_args: ServerArgs
     ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
@@ -120,6 +133,7 @@ class SpeculativeAlgorithm(Enum):
         ), "Cannot create worker for NONE speculative algorithm."
 
         enable_overlap = not server_args.disable_overlap_schedule
+        use_spec_v2_worker = self.use_spec_v2_worker(server_args)
 
         if self.is_dflash():
             if enable_overlap:
@@ -145,7 +159,7 @@ class SpeculativeAlgorithm(Enum):
 
         if self.is_eagle() and server_args.enable_multi_layer_eagle:
             # FIXME: migrate to EagleWorker
-            if enable_overlap:
+            if use_spec_v2_worker:
                 from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
                     MultiLayerEagleWorkerV2,
                 )
@@ -159,7 +173,7 @@ class SpeculativeAlgorithm(Enum):
             return MultiLayerEagleWorker
 
         elif self.is_eagle():
-            if enable_overlap:
+            if use_spec_v2_worker:
                 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 
                 return EAGLEWorkerV2
@@ -168,7 +182,7 @@ class SpeculativeAlgorithm(Enum):
 
             return EAGLEWorker
         elif self.is_standalone():
-            if enable_overlap:
+            if use_spec_v2_worker:
                 from sglang.srt.speculative.standalone_worker_v2 import (
                     StandaloneWorkerV2,
                 )
