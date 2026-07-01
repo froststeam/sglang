@@ -1,7 +1,10 @@
 """Unit tests for the speculative algorithm plugin registry."""
 
+import sys
+import types
 import unittest
-from unittest.mock import MagicMock
+from contextlib import contextmanager
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import (
@@ -13,6 +16,37 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+
+
+@contextmanager
+def _fake_builtin_worker_modules():
+    worker_modules = {
+        "sglang.srt.speculative.eagle_worker": "EAGLEWorker",
+        "sglang.srt.speculative.eagle_worker_v2": "EAGLEWorkerV2",
+        "sglang.srt.speculative.multi_layer_eagle_worker": "MultiLayerEagleWorker",
+        "sglang.srt.speculative.multi_layer_eagle_worker_v2": "MultiLayerEagleWorkerV2",
+        "sglang.srt.speculative.standalone_worker": "StandaloneWorker",
+        "sglang.srt.speculative.standalone_worker_v2": "StandaloneWorkerV2",
+    }
+    previous_modules = {}
+    worker_classes = {}
+
+    try:
+        for module_name, class_name in worker_modules.items():
+            previous_modules[module_name] = sys.modules.get(module_name)
+            module = types.ModuleType(module_name)
+            worker_cls = type(class_name, (), {})
+            setattr(module, class_name, worker_cls)
+            sys.modules[module_name] = module
+            worker_classes[class_name] = worker_cls
+
+        yield worker_classes
+    finally:
+        for module_name, module in previous_modules.items():
+            if module is None:
+                sys.modules.pop(module_name, None)
+            else:
+                sys.modules[module_name] = module
 
 
 class _RegistryIsolated(CustomTestCase):
@@ -163,6 +197,68 @@ class TestCustomSpecAlgoInterface(_RegistryIsolated):
         server_args.disable_overlap_schedule = False
         with self.assertRaisesRegex(ValueError, "does not support overlap"):
             self.algo.create_worker(server_args)
+
+
+class TestBuiltinSpecWorkerSelection(CustomTestCase):
+    def _server_args(
+        self,
+        *,
+        disable_overlap_schedule=True,
+        speculative_eagle_topk=None,
+        enable_multi_layer_eagle=False,
+    ):
+        server_args = MagicMock()
+        server_args.disable_overlap_schedule = disable_overlap_schedule
+        server_args.speculative_eagle_topk = speculative_eagle_topk
+        server_args.enable_multi_layer_eagle = enable_multi_layer_eagle
+        return server_args
+
+    @patch("sglang.srt.speculative.spec_info.envs.SGLANG_ENABLE_SPEC_V2.get")
+    def test_eagle_uses_spec_v2_worker_when_overlap_disabled(self, mock_spec_v2):
+        mock_spec_v2.return_value = True
+        server_args = self._server_args(disable_overlap_schedule=True)
+
+        with _fake_builtin_worker_modules() as worker_classes:
+            worker_cls = SpeculativeAlgorithm.EAGLE.create_worker(server_args)
+
+        self.assertIs(worker_cls, worker_classes["EAGLEWorkerV2"])
+
+    @patch("sglang.srt.speculative.spec_info.envs.SGLANG_ENABLE_SPEC_V2.get")
+    def test_eagle_uses_spec_v1_worker_when_spec_v2_env_disabled(
+        self, mock_spec_v2
+    ):
+        mock_spec_v2.return_value = False
+        server_args = self._server_args(disable_overlap_schedule=True)
+
+        with _fake_builtin_worker_modules() as worker_classes:
+            worker_cls = SpeculativeAlgorithm.EAGLE.create_worker(server_args)
+
+        self.assertIs(worker_cls, worker_classes["EAGLEWorker"])
+
+    @patch("sglang.srt.speculative.spec_info.envs.SGLANG_ENABLE_SPEC_V2.get")
+    def test_eagle_uses_spec_v1_worker_when_topk_gt_one(self, mock_spec_v2):
+        mock_spec_v2.return_value = True
+        server_args = self._server_args(
+            disable_overlap_schedule=True,
+            speculative_eagle_topk=2,
+        )
+
+        with _fake_builtin_worker_modules() as worker_classes:
+            worker_cls = SpeculativeAlgorithm.EAGLE.create_worker(server_args)
+
+        self.assertIs(worker_cls, worker_classes["EAGLEWorker"])
+
+    @patch("sglang.srt.speculative.spec_info.envs.SGLANG_ENABLE_SPEC_V2.get")
+    def test_standalone_uses_spec_v2_worker_when_overlap_disabled(
+        self, mock_spec_v2
+    ):
+        mock_spec_v2.return_value = True
+        server_args = self._server_args(disable_overlap_schedule=True)
+
+        with _fake_builtin_worker_modules() as worker_classes:
+            worker_cls = SpeculativeAlgorithm.STANDALONE.create_worker(server_args)
+
+        self.assertIs(worker_cls, worker_classes["StandaloneWorkerV2"])
 
 
 class TestValidatorHook(_RegistryIsolated):

@@ -369,7 +369,7 @@ class ServerArgs:
     model_path: str
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
-    tokenizer_backend: str = "huggingface"
+    tokenizer_backend: Optional[str] = None
     tokenizer_worker_num: int = 1
     detokenizer_worker_num: int = 1
     skip_tokenizer_init: bool = False
@@ -655,7 +655,7 @@ class ServerArgs:
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
-    linear_attn_backend: str = "triton"
+    linear_attn_backend: Optional[str] = None
     linear_attn_decode_backend: Optional[str] = None
     linear_attn_prefill_backend: Optional[str] = None
 
@@ -877,6 +877,8 @@ class ServerArgs:
         self._validate_prefill_only_disable_kv_cache_args()
 
         if self.model_path.lower() in ["none", "dummy"]:
+            self._handle_musa_backends()
+            self._handle_backend_defaults()
             # Skip for dummy models
             return
 
@@ -905,6 +907,8 @@ class ServerArgs:
         self._handle_npu_backends()
         self._handle_mps_backends()
         self._handle_xpu_backends()
+        self._handle_musa_backends()
+        self._handle_backend_defaults()
 
         # Allow OOT platform plugins to apply server args defaults.
         from sglang.srt.platforms import current_platform
@@ -1306,6 +1310,33 @@ class ServerArgs:
                     " flag and disabling piecewise CUDA graph."
                 )
             self.disable_piecewise_cuda_graph = True
+
+    def _handle_backend_defaults(self):
+        if self.tokenizer_backend is None:
+            self.tokenizer_backend = "huggingface"
+        if self.linear_attn_backend is None:
+            self.linear_attn_backend = "triton"
+
+    def _handle_musa_backends(self):
+        if not is_musa():
+            return
+
+        self.disable_overlap_schedule = True
+
+        if get_device_sm() < 31:
+            return
+
+        if self.is_attention_backend_not_set():
+            self.attention_backend = "fa3"
+
+        if self.mm_attention_backend is None:
+            self.mm_attention_backend = "fa3"
+
+        if self.linear_attn_backend is None:
+            self.linear_attn_backend = "flashinfer"
+
+        if self.sampling_backend is None:
+            self.sampling_backend = "flashinfer"
 
     def _handle_piecewise_cuda_graph(self):
         # Skip auto-disable when enforce flag is set (for testing)
@@ -3794,21 +3825,17 @@ class ServerArgs:
             if (
                 self.speculative_eagle_topk is not None
                 and self.speculative_eagle_topk > 1
-                and not self.disable_overlap_schedule
             ):
-                self.disable_overlap_schedule = True
                 spec_v1_reason = "spec v2 currently only supports topk = 1"
-            elif (
-                not envs.SGLANG_ENABLE_SPEC_V2.get()
-                and not self.disable_overlap_schedule
-            ):
-                self.disable_overlap_schedule = True
+            elif not envs.SGLANG_ENABLE_SPEC_V2.get():
                 spec_v1_reason = "SGLANG_ENABLE_SPEC_V2=False"
 
-            if self.disable_overlap_schedule:
+            if spec_v1_reason is not None:
+                if not self.disable_overlap_schedule:
+                    self.disable_overlap_schedule = True
                 logger.warning(
                     "Spec v1 is used for eagle/eagle3/standalone speculative decoding because %s.",
-                    spec_v1_reason or "overlap schedule is disabled",
+                    spec_v1_reason,
                 )
             else:
                 logger.warning(

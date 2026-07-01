@@ -88,6 +88,10 @@ tracing = [
   "opentelemetry-exporter-otlp-proto-grpc",
 ]
 
+fastokens = [
+  "fastokens>=0.1.1,<0.2.0",
+]
+
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
 # => base docker rocm/vllm-dev:20250114, not from public vllm whl
 srt_hip = [
@@ -113,6 +117,7 @@ srt_hpu = ["sglang[runtime_common]"]
 # https://docs.sglang.io/platforms/mthreads_gpu.md
 srt_musa = [
   "sglang[runtime_common]",
+  "sglang[fastokens]",
   "torch",
   "torch_musa",
   "torchada>=0.1.56",
