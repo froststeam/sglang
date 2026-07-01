@@ -130,6 +130,60 @@ print(f"Verified torch {torch.__version__} from {torch.__file__}")
 PY
 }
 
+python_extra_exists() {
+  local extra="$1"
+  local pyproject="${REPO_ROOT}/python/pyproject.toml"
+
+  python3 - "${pyproject}" "${extra}" <<'PY'
+import re
+import sys
+
+pyproject, extra = sys.argv[1], sys.argv[2]
+in_optional_deps = False
+extra_re = re.compile(rf"^{re.escape(extra)}\s*=")
+
+with open(pyproject, encoding="utf-8") as f:
+    for line in f:
+        line = line.split("#", 1)[0].strip()
+        if line == "[project.optional-dependencies]":
+            in_optional_deps = True
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            in_optional_deps = False
+        if in_optional_deps and extra_re.match(line):
+            sys.exit(0)
+
+sys.exit(1)
+PY
+}
+
+install_checkout_sglang_extra() {
+  local extra="$1"
+  local fallback_package="${2:-}"
+
+  if [ "${SGLANG_CI_INSTALL_DEPS}" != "1" ]; then
+    echo "Skip checkout SGLang ${extra} extra because dependency installation is disabled."
+    return
+  fi
+
+  if ! python_extra_exists "${extra}"; then
+    if [ -z "${fallback_package}" ]; then
+      echo "Skip checkout SGLang ${extra} extra because python[${extra}] is not defined."
+      return
+    fi
+    echo "Install ${fallback_package} because python[${extra}] is not defined."
+    "${PIP_INSTALL[@]}" "${fallback_package}" --user
+    return
+  fi
+
+  echo "Install checkout SGLang ${extra} extra..."
+  EXTRA_INSTALL_ARGS=(-v "./python[${extra}]" --user)
+  if [ "${SGLANG_CI_EDITABLE_INSTALL}" = "1" ]; then
+    EXTRA_INSTALL_ARGS=(-v -e "./python[${extra}]" --user)
+  fi
+  (cd "${REPO_ROOT}" && "${PIP_INSTALL[@]}" "${EXTRA_INSTALL_ARGS[@]}")
+}
+
 if [ ! -d "${REPO_ROOT}/python" ] || [ ! -d "${REPO_ROOT}/sgl-kernel" ]; then
   echo "Invalid SGLang checkout: ${REPO_ROOT}" >&2
   exit 2
@@ -286,6 +340,7 @@ if [ "${SGLANG_CI_INSTALL_DEPS}" != "1" ]; then
   SGLANG_INSTALL_ARGS+=(--no-deps)
 fi
 (cd "${REPO_ROOT}" && "${PIP_INSTALL[@]}" "${SGLANG_INSTALL_ARGS[@]}")
+install_checkout_sglang_extra fastokens "fastokens>=0.1.1,<0.2.0"
 
 if [ -n "${SGLANG_CI_TEST_PACKAGES}" ]; then
   "${PIP_INSTALL[@]}" ${SGLANG_CI_TEST_PACKAGES} --user
