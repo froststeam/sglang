@@ -233,17 +233,46 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states_scale)
 
         if _is_musa and self.config.activation == "silu":
-            down_input_fp8, down_input_scale = sglang_per_token_group_quant_8bit(
-                x=gateup_output.view(-1, N),
-                dst_dtype=torch.float8_e4m3fn,
-                group_size=scale_block_size,
-                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                fuse_silu_and_mul=True,
-                enable_v2=True,
-            )
-            del gateup_output
+            if self.config.gemm1_alpha is not None:
+                # GPT-OSS clamped-swiglu (``swigluoai``, gemm1_alpha + clamp). The MUSA fused
+                # ``fuse_silu_and_mul`` fast-path (and act_and_mul) apply PLAIN silu_and_mul and
+                # silently drop gemm1_alpha and the clamp -> wrong MoE activation -> corrupted
+                # output whenever deep_gemm engages. Apply the EXACT same activation the triton
+                # MoE runner uses (moe_runner/triton.py passes gemm1_alpha + gemm1_limit=
+                # gemm1_clamp_limit); the deep_gemm gateup shares w13, so its column order
+                # matches triton's -> the ::2/1::2 gate/up split is identical. Then per-token quant.
+                from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+                    swiglu_gpt_oss_sigmoid_alpha,
+                )
+
+                # swiglu clamps by -/+ gemm1_limit, so it must be set (triton asserts this too).
+                assert self.config.gemm1_clamp_limit is not None
+                down_input = swiglu_gpt_oss_sigmoid_alpha(
+                    gateup_output.view(-1, N),
+                    self.config.gemm1_alpha,
+                    self.config.gemm1_clamp_limit,
+                )
+                del gateup_output
+                down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
+                    down_input,
+                    scale_block_size,
+                    column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                )
+                del down_input
+            else:
+                down_input_fp8, down_input_scale = sglang_per_token_group_quant_8bit(
+                    x=gateup_output.view(-1, N),
+                    dst_dtype=torch.float8_e4m3fn,
+                    group_size=scale_block_size,
+                    column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    fuse_silu_and_mul=True,
+                    enable_v2=True,
+                )
+                del gateup_output
         elif envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
 
