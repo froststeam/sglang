@@ -47,6 +47,7 @@ _is_npu = is_npu()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_musa_ace = get_bool_env_var("SGLANG_DEEPEP_USE_MUSA_ACE") and _is_musa
 
 # Imported only for the SGLANG_OPT_FIX_MEGA_MOE_MEMORY=False fallback path.
 if not (_is_npu or _is_hip) and _is_cuda:
@@ -1164,6 +1165,8 @@ def post_permute_deep_gemm_to_deepep_normal(
     quant_info: DeepGemmMoeQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
+    deepep_dispatcher=None,
+    tbo_subbatch_index: Optional[int] = None,
 ) -> DeepEPNormalCombineInput:
     from sglang.srt.layers.moe.ep_moe.kernels import ep_gather
     from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPNormalCombineInput
@@ -1172,12 +1175,23 @@ def post_permute_deep_gemm_to_deepep_normal(
     topk_ids = running_state["topk_ids"]
     topk_weights = running_state["topk_weights"]
     output_index = running_state["output_index"]
+    hidden_states_shape = running_state["hidden_states_shape"]
+    hidden_states_device = running_state["hidden_states_device"]
 
-    gather_out = torch.empty(
-        running_state["hidden_states_shape"],
-        device=running_state["hidden_states_device"],
-        dtype=torch.bfloat16,
-    )
+    if _use_musa_ace and deepep_dispatcher is not None:
+        deepep_buffer = deepep_dispatcher._inners[
+            tbo_subbatch_index or 0
+        ]._normal_dispatcher._get_buffer()
+
+        gather_out, _ = deepep_buffer.get_ace_combine_buffer(
+            hidden_states_shape[0], hidden_states_shape[1], 1, True, 0
+        )
+    else:
+        gather_out = torch.empty(
+            hidden_states_shape,
+            device=hidden_states_device,
+            dtype=torch.bfloat16,
+        )
     ep_gather(hidden_states, topk_ids, topk_weights, output_index, gather_out)
 
     return DeepEPNormalCombineInput(

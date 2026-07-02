@@ -1362,6 +1362,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             init_mooncake_transfer_engine(
                 hostname=get_local_ip_auto(),
                 gpu_id=self.gpu_id,
+                base_gpu_id=self.server_args.base_gpu_id,
                 ib_device=(
                     self.server_args.disaggregation_ib_device
                     or self.server_args.mooncake_ib_device

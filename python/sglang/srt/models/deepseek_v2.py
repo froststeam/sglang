@@ -1287,6 +1287,7 @@ class DeepseekV2MoE(nn.Module):
     def op_experts(self, state):
         state.combine_input = self.experts.run_moe_core(
             dispatch_output=state.dispatch_output,
+            tbo_subbatch_index=state.get("tbo_subbatch_index"),
         )
 
     def op_combine_a(self, state):

@@ -24,6 +24,7 @@ from sglang.srt.layers.quantization.utils import (
     quantize_weights,
     sort_weights,
 )
+from sglang.srt.utils import get_device
 
 
 class MarlinWorkspace:
@@ -37,7 +38,9 @@ class MarlinWorkspace:
 
         max_workspace_size = (out_features // min_thread_n) * max_parallel
 
-        self.scratch = torch.zeros(max_workspace_size, dtype=torch.int, device="cuda")
+        self.scratch = torch.zeros(
+            max_workspace_size, dtype=torch.int, device=get_device()
+        )
 
 
 def marlin_permute_weights(q_w, size_k, size_n, perm, tile=GPTQ_MARLIN_TILE):

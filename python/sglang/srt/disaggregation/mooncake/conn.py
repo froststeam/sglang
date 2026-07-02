@@ -574,9 +574,19 @@ class MooncakeKVManager(CommonKVManager):
             return 0
 
         src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
-        return self.engine.batch_transfer_sync(
+        # XXX(MUSA): Measure the time taken for batch transfer.
+        start_time = time.perf_counter()
+        ret = self.engine.batch_transfer_sync(
             mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
         )
+        end_time = time.perf_counter()
+        total_length = sum(lengths)
+        logger.info(
+            "Transfer kv time: %.2f ms, length: %d",
+            (end_time - start_time) * 1000,
+            total_length,
+        )
+        return ret
 
     def _send_kvcache_generic(
         self,

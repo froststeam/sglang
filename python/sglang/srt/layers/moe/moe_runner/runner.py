@@ -94,7 +94,12 @@ class MoeRunner:
             self.fused_func = None
 
     def run(
-        self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo, lora_info=None
+        self,
+        dispatch_output: DispatchOutput,
+        quant_info: MoeQuantInfo,
+        lora_info=None,
+        deepep_dispatcher=None,
+        tbo_subbatch_index: Optional[int] = None,
     ) -> CombineInput:
         # XXX (MUSA): Prevent crash when the expert receives a token value of zero
         if dispatch_output.format.is_deepep_normal():
@@ -182,9 +187,19 @@ class MoeRunner:
         self.post_permute_func = PermuteMethodPool.get_post_permute(
             runner_format, combine_format
         )
-        combine_input = self.post_permute_func(
-            runner_output, quant_info, self.config, running_state
-        )
+        if dispatch_output.format.is_deepep_normal():
+            combine_input = self.post_permute_func(
+                runner_output,
+                quant_info,
+                self.config,
+                running_state,
+                deepep_dispatcher=deepep_dispatcher,
+                tbo_subbatch_index=tbo_subbatch_index,
+            )
+        else:
+            combine_input = self.post_permute_func(
+                runner_output, quant_info, self.config, running_state
+            )
 
         return combine_input
 

@@ -70,6 +70,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_hip,
+    is_musa,
     round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -77,7 +78,9 @@ from sglang.srt.utils.custom_op import register_custom_op
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_musa = is_musa()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_musa_ace = get_bool_env_var("SGLANG_DEEPEP_USE_MUSA_ACE") and _is_musa
 
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
@@ -1088,11 +1091,26 @@ class FusedMoE(torch.nn.Module):
 
         return final_hidden_states
 
-    def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
+    def run_moe_core(
+        self,
+        dispatch_output: DispatchOutput,
+        deepep_dispatcher=None,
+        tbo_subbatch_index: Optional[int] = None,
+    ) -> CombineInput:
         # TODO: consider using symmetric memory
+        # Only thread the ACE dispatcher/subbatch through to the quant method
+        # when MUSA ACE is enabled; other quant methods' apply() do not accept
+        # these kwargs, so passing them unconditionally would break non-fp8 MoE.
+        extra_kwargs = {}
+        if _use_musa_ace:
+            extra_kwargs = {
+                "deepep_dispatcher": self.dispatcher,
+                "tbo_subbatch_index": tbo_subbatch_index,
+            }
         return self.quant_method.apply(
             layer=self,
             dispatch_output=dispatch_output,
+            **extra_kwargs,
         )
 
     @classmethod

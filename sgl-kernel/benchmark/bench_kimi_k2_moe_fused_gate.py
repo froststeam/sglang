@@ -8,8 +8,10 @@ import triton.language as tl
 from sgl_kernel import kimi_k2_moe_fused_gate
 
 from sglang.srt.layers.moe.topk import kimi_k2_biased_topk_impl
+from sglang.srt.utils import get_device, is_musa
 from sglang.utils import is_in_ci
 
+__is_musa = is_musa()
 IS_CI = is_in_ci()
 
 
@@ -79,7 +81,7 @@ configs = [(sq,) for sq in seq_length_range]
 )
 def benchmark(seq_length, provider):
     dtype = torch.float32
-    device = torch.device("cuda")
+    device = torch.device(get_device())
     num_experts, topk = 384, 6  # Kimi K2 configuration
     routed_scaling_factor = 2.872  # Kimi K2's routed scaling factor
 
@@ -88,20 +90,32 @@ def benchmark(seq_length, provider):
 
     quantiles = [0.5, 0.2, 0.8]
 
-    if provider == "torch_compile":
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
-            lambda: kimi_k2_biased_topk_torch_compile(
+    if __is_musa:
+
+        if provider == "torch_compile":
+            fn = lambda: kimi_k2_biased_topk_torch_compile(
                 scores.clone(), bias.clone(), topk, routed_scaling_factor
-            ),
-            quantiles=quantiles,
-        )
-    elif provider == "fused_kernel":
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
-            lambda: kimi_k2_biased_topk_fused_kernel(
+            )
+        elif provider == "fused_kernel":
+            fn = lambda: kimi_k2_biased_topk_fused_kernel(
                 scores.clone(), bias.clone(), topk, routed_scaling_factor
-            ),
-            quantiles=quantiles,
-        )
+            )
+        ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
+    else:
+        if provider == "torch_compile":
+            ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+                lambda: kimi_k2_biased_topk_torch_compile(
+                    scores.clone(), bias.clone(), topk, routed_scaling_factor
+                ),
+                quantiles=quantiles,
+            )
+        elif provider == "fused_kernel":
+            ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+                lambda: kimi_k2_biased_topk_fused_kernel(
+                    scores.clone(), bias.clone(), topk, routed_scaling_factor
+                ),
+                quantiles=quantiles,
+            )
 
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
