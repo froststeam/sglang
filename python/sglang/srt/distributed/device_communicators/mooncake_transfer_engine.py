@@ -12,7 +12,9 @@ logger = logging.getLogger(__name__)
 _mooncake_transfer_engine: Optional["MooncakeTransferEngine"] = None
 
 
-def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optional[str]:
+def get_ib_devices_for_gpu(
+    ib_device_str: Optional[str], gpu_id: int, base_gpu_id: int = 0
+) -> Optional[str]:
     """
     Parse IB device string and get IB devices for a specific GPU ID.
 
@@ -24,6 +26,8 @@ def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optiona
     Args:
         ib_device_str: The original IB device string or path to JSON file
         gpu_id: The GPU ID to get devices for
+        base_gpu_id: The base (physical) GPU offset, used to derive the logical
+            GPU ID when round-robining the old comma-separated format
 
     Returns:
         IB devices string for the GPU, or None if not available
@@ -86,7 +90,14 @@ def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optiona
             raise RuntimeError(
                 f"Failed to parse JSON content from file {ib_device_str}"
             )
-        # Not JSON format, treat as old format - return same devices for all GPUs
+        # Not JSON format, treat as old (comma-separated) format.
+        # When mapping is enabled, round-robin the device list across GPUs by
+        # logical GPU ID; otherwise return the same devices for all GPUs.
+        if envs.SGLANG_DISAGGREGATION_MAPPING_IB_DEVICE_TO_GPU.get():
+            ib_devices = [d.strip() for d in ib_device_str.split(",") if d.strip()]
+            if ib_devices:
+                logic_gpu_id = gpu_id - base_gpu_id
+                return ib_devices[logic_gpu_id % len(ib_devices)]
         return ib_device_str
 
 
@@ -98,6 +109,7 @@ class MooncakeTransferEngine:
         hostname: str,
         gpu_id: Optional[int] = None,
         ib_device: Optional[str] = None,
+        base_gpu_id: int = 0,
     ):
         try:
             from mooncake.engine import TransferEngine
@@ -111,7 +123,10 @@ class MooncakeTransferEngine:
         self.engine = TransferEngine()
         self.hostname = hostname
         self.gpu_id = gpu_id if gpu_id is not None else 0
-        self.ib_device = get_ib_devices_for_gpu(ib_device, self.gpu_id)
+        self.base_gpu_id = base_gpu_id
+        self.ib_device = get_ib_devices_for_gpu(
+            ib_device, self.gpu_id, self.base_gpu_id
+        )
 
         self.initialize(
             hostname=self.hostname,
@@ -265,6 +280,7 @@ def init_mooncake_transfer_engine(
     hostname: str,
     gpu_id: Optional[int] = None,
     ib_device: Optional[str] = None,
+    base_gpu_id: int = 0,
 ) -> MooncakeTransferEngine:
     """
     Initialize the shared MooncakeTransferEngine. Note: if already
@@ -276,7 +292,7 @@ def init_mooncake_transfer_engine(
     if _mooncake_transfer_engine is not None:
         return _mooncake_transfer_engine
     _mooncake_transfer_engine = MooncakeTransferEngine(
-        hostname=hostname, gpu_id=gpu_id, ib_device=ib_device
+        hostname=hostname, gpu_id=gpu_id, ib_device=ib_device, base_gpu_id=base_gpu_id
     )
     return _mooncake_transfer_engine
 

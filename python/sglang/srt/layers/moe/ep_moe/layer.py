@@ -40,7 +40,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
-from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip, is_npu
+from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip, is_musa, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -51,8 +51,10 @@ if TYPE_CHECKING:
 
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_musa = is_musa()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_musa_ace = get_bool_env_var("SGLANG_DEEPEP_USE_MUSA_ACE") and _is_musa
 
 if _use_aiter:
     from aiter import ActivationType, QuantType
@@ -227,11 +229,14 @@ class DeepEPMoE(FusedMoE):
     def run_moe_core(
         self,
         dispatch_output: DispatchOutput,
+        tbo_subbatch_index: Optional[int] = None,
     ):
 
         if self.deprecate_flag:
             return super().run_moe_core(
                 dispatch_output,
+                deepep_dispatcher=self.dispatcher,
+                tbo_subbatch_index=tbo_subbatch_index,
             )
 
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker

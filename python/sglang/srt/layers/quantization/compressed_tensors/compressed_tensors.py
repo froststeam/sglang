@@ -685,6 +685,11 @@ class CompressedTensorsConfig(QuantizationConfig):
                 elif _is_hip:
                     logger.info_once("Using CompressedTensorsWNA16TritonMoE (ROCm)")
                     return CompressedTensorsWNA16TritonMoE(self)
+                elif _is_musa:
+                    # MUSA, like ROCm/HIP, does not support fused_marlin_moe, so
+                    # route WNA16 (W4A16/int4) MoE through the Triton kernels.
+                    logger.info_once("Using CompressedTensorsWNA16TritonMoE (MUSA)")
+                    return CompressedTensorsWNA16TritonMoE(self)
                 else:
                     moe_backend = get_moe_runner_backend()
                     if moe_backend.is_triton():

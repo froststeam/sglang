@@ -46,10 +46,14 @@ ScalarType, scalar_types = get_scalar_types()
 
 
 def _module_path_match(ignored: str, prefix: str) -> bool:
-    # Match on dotted module-path boundaries so that `mlp.gate` does NOT
-    # match `mlp.gate_up_proj`. Needed for quant configs (e.g. Qwen3.6-FP8)
-    # whose `modules_to_not_convert` lists MoE-template names like `mlp.gate`
-    # that collide with fused dense MLP names by plain substring.
+    # An ``ignored`` entry prefixed with ``re:`` is treated as a regex matched
+    # against the full module path (e.g. Kimi K2.5 FP8 configs list regex ignore
+    # patterns). Otherwise match on dotted module-path boundaries so that
+    # `mlp.gate` does NOT match `mlp.gate_up_proj`. Needed for quant configs
+    # (e.g. Qwen3.6-FP8) whose `modules_to_not_convert` lists MoE-template names
+    # like `mlp.gate` that collide with fused dense MLP names by plain substring.
+    if ignored.startswith("re:"):
+        return re.match(ignored[3:], prefix) is not None
     if ignored == prefix:
         return True
     if prefix.startswith(ignored + "."):

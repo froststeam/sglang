@@ -199,7 +199,11 @@ __global__ void kimi_k2_moe_fused_gate_kernel(
     }
   }
 
+#ifndef USE_MUSA
   __syncthreads();
+#else
+  __syncwarp();
+#endif
 
   for (int k = 0; k < topk; k++) {
     float max_val = -FLT_MAX;
@@ -237,7 +241,12 @@ __global__ void kimi_k2_moe_fused_gate_kernel(
     __syncwarp();
   }
 
+#ifndef USE_MUSA
   __syncthreads();
+#else
+  __syncwarp();
+#endif
+
 
   if (renormalize && lane_id == 0) {
     float sum = 0.0f;

@@ -30,11 +30,14 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_blackwell,
     is_hip,
+    is_musa,
     is_npu,
     load_json_config,
 )
 
 _is_npu = is_npu()
+_is_musa = is_musa()
+_use_musa_ace = get_bool_env_var("SGLANG_DEEPEP_USE_MUSA_ACE") and _is_musa
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
@@ -238,6 +241,7 @@ class DeepEPBuffer:
                     f"Consider using --deepep-config to change the behavior."
                 )
 
+        extra_kargs = {"use_ace": _use_musa_ace} if _use_musa_ace else {}
         cls._buffer = Buffer(
             group,
             num_nvl_bytes,
@@ -247,6 +251,7 @@ class DeepEPBuffer:
             # TODO can be false when unneeded
             allow_mnnvl=True,
             allow_nvlink_for_low_latency_mode=envs.SGLANG_DEEPEP_LL_USE_NVLINK.get(),
+            **extra_kargs,
         )
         return cls._buffer
 

@@ -109,6 +109,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
+    is_musa,
     is_npu,
     is_pin_memory_available,
     rank0_log,
@@ -121,6 +122,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 _is_npu = is_npu()
+_is_musa = is_musa()
 # ModelOpt: QUANT_CFG_CHOICES is imported from modelopt_utils.py
 # which contains the complete mapping of quantization config choices
 
@@ -241,7 +243,7 @@ def _get_quantization_config(
 
         if isinstance(quant_config, Fp8Config):
             quant_config.is_fp4_experts = model_config.is_fp4_experts
-        if not _is_npu:
+        if not (_is_npu or _is_musa):
             major, minor = get_device_capability()
 
             if major is not None and minor is not None:
