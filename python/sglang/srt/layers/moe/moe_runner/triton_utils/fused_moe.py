@@ -71,7 +71,7 @@ elif _is_xpu:
     from sgl_kernel import moe_sum_reduce, silu_and_mul
 elif _is_musa:
     from sglang.srt.hardware_backend.musa.jit_kernel import (
-        act_and_mul as moe_act_and_mul,
+        act_and_mul,
     )
     from sglang.srt.hardware_backend.musa.jit_kernel import (
         moe_sum_reduce,
@@ -89,6 +89,23 @@ if not _is_cuda and not _is_hip and not _is_xpu and not _is_musa:
         _has_vllm_ops = False
 
 padding_size = get_moe_padding_size(_use_aiter)
+
+if _is_cuda or _is_hip:
+
+    def act_and_mul(
+        gateup_output: torch.Tensor,
+        down_input: torch.Tensor,
+        *,
+        topk_ids: Optional[torch.Tensor] = None,
+        activation: str = "silu",
+        **_: Any,
+    ) -> None:
+        if activation == "silu":
+            silu_and_mul(gateup_output, down_input)
+        elif activation == "gelu":
+            gelu_and_mul(gateup_output, down_input)
+        else:
+            raise ValueError(f"Unsupported gated activation: {activation}")
 
 
 @register_custom_op(mutates_args=["hidden_states"])
@@ -577,7 +594,7 @@ def _fused_moe_kernel_sequence(
             #   fusion=False: explicit clamp_ on intermediate_cache1 (path checker)
             assert swiglu_limit == 10
             assert intermediate_cache1.shape == (total_tokens, N)
-            assert _is_cuda or _is_hip, "DeepSeek V4 only supports CUDA/HIP downstream"
+            assert _is_cuda or _is_musa or _is_hip, "DeepSeek V4 only supports CUDA/HIP downstream"
 
             swiglu_limit_for_triton: Optional[float] = None
             swiglu_limit_for_silu_and_mul_clamp: Optional[float] = None
@@ -587,7 +604,7 @@ def _fused_moe_kernel_sequence(
                     swiglu_limit_for_triton = swiglu_limit
                 else:
                     assert (
-                        _is_cuda
+                        _is_cuda or _is_musa
                     ), "fused silu_and_mul_clamp kernel is CUDA-only; HIP must disable SWIGLU_CLAMP_FUSION"
                     swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
             else:
@@ -607,7 +624,12 @@ def _fused_moe_kernel_sequence(
                         swiglu_limit_for_silu_and_mul_clamp,
                     )
                 else:
-                    silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                    act_and_mul(
+                        intermediate_cache1.view(-1, N),
+                        intermediate_cache2,
+                        topk_ids=topk_ids,
+                        activation=activation,
+                    )
             else:
                 act_and_mul_triton(
                     intermediate_cache1.view(-1, N),
@@ -632,7 +654,7 @@ def _fused_moe_kernel_sequence(
             else:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
         elif _is_musa:
-            moe_act_and_mul(
+            act_and_mul(
                 intermediate_cache1.view(-1, N),
                 intermediate_cache2,
                 config,
@@ -664,7 +686,7 @@ def _fused_moe_kernel_sequence(
                     expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
                 )
             elif _is_musa:
-                moe_act_and_mul(
+                act_and_mul(
                     intermediate_cache1.view(-1, N),
                     intermediate_cache2,
                     config,
@@ -777,19 +799,26 @@ def _fused_moe_kernel_sequence(
                 out=out_hidden_states,
             ).squeeze(dim=1)
         else:
-            # According to micro benchmark results, torch.compile can get better performance for small token.
-            if num_tokens <= 32:
-                moe_sum_reduce_torch_compile(
-                    intermediate_cache3.view(*intermediate_cache3.shape),
-                    out_hidden_states,
-                    routed_scaling_factor,
-                )
-            else:
+            if _is_musa:
                 moe_sum_reduce(
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states,
                     routed_scaling_factor,
                 )
+            else:
+                # According to micro benchmark results, torch.compile can get better performance for small token.
+                if num_tokens <= 32:
+                    moe_sum_reduce_torch_compile(
+                        intermediate_cache3.view(*intermediate_cache3.shape),
+                        out_hidden_states,
+                        routed_scaling_factor,
+                    )
+                else:
+                    moe_sum_reduce(
+                        intermediate_cache3.view(*intermediate_cache3.shape),
+                        out_hidden_states,
+                        routed_scaling_factor,
+                    )
     elif _is_hip:
         if _use_aiter:
             moe_sum(

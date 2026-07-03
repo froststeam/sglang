@@ -8,7 +8,7 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
-#include <cuda_runtime.h>
+#include <musa_runtime.h>
 #include <stdexcept>
 #include <stdint.h>
 #include <string>
@@ -431,7 +431,7 @@ void load_cache_to_device_buffer(
   auto launch = [&](auto kernel_fn, const auto* seq_lens_ptr, const auto* req_pool_indices_ptr) {
     constexpr size_t smem_bytes = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::BYTES;
     if constexpr (smem_bytes > 48u * 1024u) {
-      cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+      musaFuncSetAttribute(kernel_fn, musaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     }
     LaunchKernel(bs, BLOCK_SIZE, device, smem_bytes)(
         kernel_fn,

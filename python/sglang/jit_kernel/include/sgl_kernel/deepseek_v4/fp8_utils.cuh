@@ -5,7 +5,7 @@
 #include <sgl_kernel/utils.cuh>
 
 #include <cstdint>
-#include <cuda_fp8.h>
+#include <musa_fp8.h>
 
 // Small helpers shared by the DeepSeek-V4 FP8/UE8M0 quantization kernels
 // (silu_and_mul_masked_post_quant, store, mega_moe_pre_dispatch, ...).

@@ -379,6 +379,13 @@ class DecodePreallocQueue:
 
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
+        kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
+        kv_args.prefill_end_layer = self.token_to_kv_pool.end_layer
+        kv_args.mla_compression_ratios = None
+        if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+            kv_args.mla_compression_ratios = list(
+                self.token_to_kv_pool.compression_ratios
+            )
         if self.scheduler.enable_hisparse:
             # Direct-to-host: register host pool pointers so P writes to D's host memory
             host_pool = self.scheduler.hisparse_coordinator.mem_pool_host

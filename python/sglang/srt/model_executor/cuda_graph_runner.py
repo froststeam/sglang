@@ -161,6 +161,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
         max_bs: int,
         max_num_token: int,
         hidden_size: int,
+        pp_proxy_hidden_size: Optional[int],
+        pp_proxy_tensor_names: Optional[Tuple[str, ...]],
         vocab_size: int,
         dtype: torch.dtype,
         dp_size: int,
@@ -210,9 +212,21 @@ class DecodeInputBuffers(ForwardInputBuffers):
             if pp_size > 1:
                 # mHC (e.g. DSV4) flattens residual into hidden_states (size = hc_hidden_size).
                 is_mhc = hc_hidden_size is not None
-                hs = hc_hidden_size if is_mhc else hidden_size
+                pp_proxy_hidden_size = pp_proxy_hidden_size or hidden_size
+                pp_proxy_tensor_names = pp_proxy_tensor_names or (
+                    ("hidden_states",) if is_mhc else ("hidden_states", "residual")
+                )
                 pp_proxy_tensors = {
-                    "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
+                    name: torch.zeros(
+                        (
+                            max_bs,
+                            hc_hidden_size
+                            if is_mhc and name == "hidden_states"
+                            else pp_proxy_hidden_size,
+                        ),
+                        dtype=dtype,
+                    )
+                    for name in pp_proxy_tensor_names
                 }
                 if not is_mhc:
                     pp_proxy_tensors["residual"] = torch.zeros(
@@ -707,6 +721,12 @@ class CudaGraphRunner:
             max_bs=self.max_bs,
             max_num_token=self.max_num_token,
             hidden_size=self.model_runner.model_config.hidden_size,
+            pp_proxy_hidden_size=getattr(
+                self.model_runner.model, "pp_proxy_hidden_size", None
+            ),
+            pp_proxy_tensor_names=getattr(
+                self.model_runner.model, "pp_proxy_tensor_names", None
+            ),
             vocab_size=self.model_runner.model_config.vocab_size,
             dtype=self.model_runner.model_config.dtype,
             dp_size=self.dp_size,
@@ -1226,7 +1246,7 @@ class CudaGraphRunner:
         )
 
         # If the current hidden mode is no longer aligned with the required hidden mode, we need to set it to what is required and re-capture
-        if self.capture_hidden_mode != required_capture_hidden_mode:
+        if self.capture_hidden_mode < required_capture_hidden_mode:
             self.capture_hidden_mode = required_capture_hidden_mode
             self.capture()
 

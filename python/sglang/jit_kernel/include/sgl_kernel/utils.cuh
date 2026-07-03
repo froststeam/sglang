@@ -20,14 +20,20 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/extra/c_env_api.h>
 
-#include <concepts>
 #include <cstddef>
 #include <type_traits>
 #ifndef USE_ROCM
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
-#include <cuda_runtime.h>
+#include <musa_bf16.h>
+#include <musa_fp16.h>
+#include <musa_fp8.h>
+#include <musa_runtime.h>
+#ifndef __grid_constant__
+#define __grid_constant__
+#endif
+using cudaStream_t = musaStream_t;
+#define cudaMemcpy musaMemcpy
+#define cudaMemcpyAsync musaMemcpyAsync
+#define cudaMemcpyHostToDevice musaMemcpyHostToDevice
 #else
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
@@ -49,15 +55,15 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #ifndef USE_ROCM
 using fp32_t = float;
 using fp16_t = __half;
-using bf16_t = __nv_bfloat16;
-using fp8_e4m3_t = __nv_fp8_e4m3;
-using fp8_e5m2_t = __nv_fp8_e5m2;
+using bf16_t = __mt_bfloat16;
+using fp8_e4m3_t = __mt_fp8_e4m3;
+using fp8_e5m2_t = __mt_fp8_e5m2;
 
 using fp32x2_t = float2;
 using fp16x2_t = __half2;
-using bf16x2_t = __nv_bfloat162;
-using fp8x2_e4m3_t = __nv_fp8x2_e4m3;
-using fp8x2_e5m2_t = __nv_fp8x2_e5m2;
+using bf16x2_t = __mt_bfloat162;
+using fp8x2_e4m3_t = __mt_fp8x2_e4m3;
+using fp8x2_e5m2_t = __mt_fp8x2_e5m2;
 
 using fp32x4_t = float4;
 #else
@@ -92,24 +98,19 @@ namespace device {
 // available in both host and device compilation passes, whereas __CUDA_ARCH__
 // is only defined by nvcc during the device pass.
 #if !defined(USE_ROCM)
-#if !defined(SGL_CUDA_ARCH)
-#error "SGL_CUDA_ARCH is not defined. JIT compilation must inject -DSGL_CUDA_ARCH via load_jit()."
-#endif
 #if defined(__CUDA_ARCH__)
 static_assert(
     __CUDA_ARCH__ == SGL_CUDA_ARCH, "SGL_CUDA_ARCH mismatch: injected arch flag does not match device target");
 #endif
-#define SGL_ARCH_HOPPER_OR_GREATER (SGL_CUDA_ARCH >= 900)
-#define SGL_ARCH_BLACKWELL_OR_GREATER ((SGL_CUDA_ARCH >= 1000) && (CUDA_VERSION >= 12090))
+#define SGL_ARCH_BLACKWELL_OR_GREATER 0
 #else  // USE_ROCM
-#define SGL_ARCH_HOPPER_OR_GREATER 0
 #define SGL_ARCH_BLACKWELL_OR_GREATER 0
 #endif
 
 // Maximum vector size in bytes supported by current architecture.
 // Pre-Blackwell / AMD: 128-bit (16 bytes)
 // Blackwell or greater: 256-bit (32 bytes)
-inline constexpr std::size_t kMaxVecBytes = SGL_ARCH_BLACKWELL_OR_GREATER ? 32 : 16;
+inline constexpr std::size_t kMaxVecBytes = 16;
 
 /// \brief Number of threads per warp (always 32 on NVIDIA/AMD GPUs).
 inline constexpr auto kWarpThreads = 32u;
@@ -125,11 +126,6 @@ inline constexpr auto kFullMask = 0xffffffffu;
  */
 template <bool kUsePDL>
 SGL_DEVICE void PDLWaitPrimary() {
-#if SGL_ARCH_HOPPER_OR_GREATER
-  if constexpr (kUsePDL) {
-    asm volatile("griddepcontrol.wait;" ::: "memory");
-  }
-#endif
 }
 
 /**
@@ -140,17 +136,21 @@ SGL_DEVICE void PDLWaitPrimary() {
  */
 template <bool kUsePDL>
 SGL_DEVICE void PDLTriggerSecondary() {
-#if SGL_ARCH_HOPPER_OR_GREATER
-  if constexpr (kUsePDL) {
-    asm volatile("griddepcontrol.launch_dependents;" :::);
-  }
-#endif
 }
 
-template <std::integral T, std::integral U>
+template <typename T, typename U,
+          typename = std::enable_if_t<std::is_integral<T>::value && std::is_integral<U>::value>>
 SGL_DEVICE constexpr auto div_ceil(T a, U b) {
   return (a + b - 1) / b;
 }
+
+template <typename T>
+struct type_identity {
+  using type = T;
+};
+
+template <typename T>
+using type_identity_t = typename type_identity<T>::type;
 
 /**
  * \brief Load data with the specified type and offset from a void pointer.
@@ -173,7 +173,7 @@ SGL_DEVICE T load_as(const void* ptr, int64_t offset = 0) {
  * the template parameter `T`, which can avoid accidentally using the wrong type.
  */
 template <typename T>
-SGL_DEVICE void store_as(void* ptr, std::type_identity_t<T> val, int64_t offset = 0) {
+SGL_DEVICE void store_as(void* ptr, type_identity_t<T> val, int64_t offset = 0) {
   static_cast<T*>(ptr)[offset] = val;
 }
 
@@ -182,12 +182,14 @@ namespace pointer {
 
 // we only allow void * pointer arithmetic for safety
 
-template <typename T = char, std::integral... U>
+template <typename T = char, typename... U,
+          typename = std::enable_if_t<(std::is_integral<U>::value && ...)>>
 SGL_DEVICE auto offset(void* ptr, U... offset) -> void* {
   return static_cast<T*>(ptr) + (... + offset);
 }
 
-template <typename T = char, std::integral... U>
+template <typename T = char, typename... U,
+          typename = std::enable_if_t<(std::is_integral<U>::value && ...)>>
 SGL_DEVICE auto offset(const void* ptr, U... offset) -> const void* {
   return static_cast<const T*>(ptr) + (... + offset);
 }
@@ -201,16 +203,16 @@ namespace host {
 /**
  * \brief Check the CUDA error code and panic with location info on failure.
  */
-inline void RuntimeDeviceCheck(::cudaError_t error, DebugInfo location = {}) {
-  if (error != ::cudaSuccess) {
+inline void RuntimeDeviceCheck(::musaError_t error, DebugInfo location = {}) {
+  if (error != ::musaSuccess) {
     [[unlikely]];
-    ::host::panic(location, "CUDA error: ", ::cudaGetErrorString(error));
+    ::host::panic(location, "CUDA error: ", ::musaGetErrorString(error));
   }
 }
 
 /// \brief Check the last CUDA error (calls `cudaGetLastError`).
 inline void RuntimeDeviceCheck(DebugInfo location = {}) {
-  return RuntimeDeviceCheck(::cudaGetLastError(), location);
+  return RuntimeDeviceCheck(::musaGetLastError(), location);
 }
 
 /**
@@ -241,7 +243,7 @@ struct LaunchKernel {
   explicit LaunchKernel(
       dim3 grid_dim,
       dim3 block_dim,
-      cudaStream_t stream,
+      musaStream_t stream,
       std::size_t dynamic_shared_mem_bytes = 0,
       DebugInfo location = {}) noexcept
       : m_config(s_make_config(grid_dim, block_dim, stream, dynamic_shared_mem_bytes)), m_location(location) {}
@@ -249,8 +251,8 @@ struct LaunchKernel {
   LaunchKernel(const LaunchKernel&) = delete;
   LaunchKernel& operator=(const LaunchKernel&) = delete;
 
-  static auto resolve_device(DLDevice device) -> cudaStream_t {
-    return static_cast<cudaStream_t>(::TVMFFIEnvGetStream(device.device_type, device.device_id));
+  static auto resolve_device(DLDevice device) -> musaStream_t {
+    return static_cast<musaStream_t>(::TVMFFIEnvGetStream(device.device_type, device.device_id));
   }
 
   auto enable_pdl(bool enabled = true) -> LaunchKernel& {
@@ -260,7 +262,7 @@ struct LaunchKernel {
 #else
     if (enabled) {
       auto& attr = m_attrs[m_config.numAttrs++];
-      attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attr.id = musaLaunchAttributeIgnore;
       attr.val.programmaticStreamSerializationAllowed = true;
       m_config.attrs = m_attrs;
     }
@@ -273,7 +275,7 @@ struct LaunchKernel {
     (void)cluster_dim;
 #else
     auto& attr = m_attrs[m_config.numAttrs++];
-    attr.id = cudaLaunchAttributeClusterDimension;
+    attr.id = musaLaunchAttributeClusterDimension;
     attr.val.clusterDim = {cluster_dim.x, cluster_dim.y, cluster_dim.z};
     m_config.attrs = m_attrs;
 #endif
@@ -292,7 +294,7 @@ struct LaunchKernel {
         std::forward<Args>(args)...);
     RuntimeDeviceCheck(m_location);
 #else
-    RuntimeDeviceCheck(::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
+    RuntimeDeviceCheck(::musaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
 #endif
   }
 
@@ -300,9 +302,9 @@ struct LaunchKernel {
   static auto s_make_config(  // Make a config for kernel launch
       dim3 grid_dim,
       dim3 block_dim,
-      cudaStream_t stream,
-      std::size_t smem) -> cudaLaunchConfig_t {
-    auto config = ::cudaLaunchConfig_t{};
+      musaStream_t stream,
+      std::size_t smem) -> musaLaunchConfig_t {
+    auto config = ::musaLaunchConfig_t{};
     config.gridDim = grid_dim;
     config.blockDim = block_dim;
     config.dynamicSmemBytes = smem;
@@ -311,9 +313,9 @@ struct LaunchKernel {
     return config;
   }
 
-  cudaLaunchConfig_t m_config;
+  musaLaunchConfig_t m_config;
   const DebugInfo m_location;
-  cudaLaunchAttribute m_attrs[2];
+  musaLaunchAttribute m_attrs[2];
 };
 
 }  // namespace host

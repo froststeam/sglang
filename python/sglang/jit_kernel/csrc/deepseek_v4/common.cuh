@@ -24,8 +24,8 @@ inline constexpr uint32_t kBlockSize = 1024;
 
 #define PLAN_KERNEL __global__ __launch_bounds__(kBlockSize, 1) inline
 
-PLAN_KERNEL void plan_prefill_cuda(const __grid_constant__ CompressParams params) {
-  const auto &[
+PLAN_KERNEL void plan_prefill_cuda(const CompressParams params) {
+  const auto& [
     compress_plan, write_plan, seq_lens, extend_lens, // pointers
     batch_size, num_tokens, compress_ratio, is_overlap // values
   ] = params;
@@ -58,8 +58,8 @@ PLAN_KERNEL void plan_prefill_cuda(const __grid_constant__ CompressParams params
     if (batch_id >= batch_size) [[unlikely]]
       break;
     const uint32_t seq_len = seq_lens[batch_id];
-    const uint32_t extend_len = extend_lens[batch_id];
-    const uint32_t prefix_len = seq_len - extend_len;
+    const uint32_t extend_len_cur = extend_lens[batch_id];
+    const uint32_t prefix_len = seq_len - extend_len_cur;
     const uint32_t ratio = compress_ratio * (1 + is_overlap);
     const uint32_t window_len = j + 1 < ratio ? ratio - (j + 1) : 0;
     const uint32_t position = prefix_len + j;
@@ -69,11 +69,9 @@ PLAN_KERNEL void plan_prefill_cuda(const __grid_constant__ CompressParams params
         .position = position,
         .window_len = window_len,
     };
-    const uint32_t start_write_pos = [seq_len, compress_ratio, is_overlap] {
-      const uint32_t pos = seq_len / compress_ratio * compress_ratio;
-      if (!is_overlap) return pos;
-      return pos >= compress_ratio ? pos - compress_ratio : 0;
-    }();
+    const uint32_t aligned_pos = seq_len / compress_ratio * compress_ratio;
+    const uint32_t start_write_pos =
+        !is_overlap ? aligned_pos : (aligned_pos >= compress_ratio ? aligned_pos - compress_ratio : 0);
     if ((position + 1) % compress_ratio == 0) {
       const auto write_pos = atomicAdd(&compress_counter, 1);
       compress_plan[write_pos] = plan;
@@ -97,7 +95,7 @@ PLAN_KERNEL void plan_prefill_cuda(const __grid_constant__ CompressParams params
 }
 
 inline PlanResult plan_prefill_host(const CompressParams& params, const bool use_cuda_graph) {
-  const auto &[
+  const auto& [
     compress_ptr, write_ptr, seq_lens_ptr, extend_lens_ptr, // pointers
     batch_size, num_tokens, compress_ratio, is_overlap // values
   ] = params;
@@ -112,12 +110,10 @@ inline PlanResult plan_prefill_host(const CompressParams& params, const bool use
     const uint32_t prefix_len = seq_len - extend_len;
     RuntimeCheck(0 < extend_len && extend_len <= seq_len);
     /// NOTE: `start_write_pos` must be a multiple of `compress_ratio`
-    const uint32_t start_write_pos = [seq_len, compress_ratio, is_overlap] {
-      const uint32_t pos = seq_len / compress_ratio * compress_ratio;
-      if (!is_overlap) return pos;
-      /// NOTE: to avoid unsigned integer underflow, don't use `pos - compress_ratio`
-      return pos >= compress_ratio ? pos - compress_ratio : 0;
-    }();
+    const uint32_t aligned_pos = seq_len / compress_ratio * compress_ratio;
+    /// NOTE: to avoid unsigned integer underflow, don't use `aligned_pos - compress_ratio`
+    const uint32_t start_write_pos =
+        !is_overlap ? aligned_pos : (aligned_pos >= compress_ratio ? aligned_pos - compress_ratio : 0);
     /// NOTE: `position` is within [prefix_len, seq_len)
     for (const auto j : irange(extend_len)) {
       const uint32_t position = prefix_len + j;
@@ -170,14 +166,14 @@ inline PlanResult plan_prefill(
       return false;
     }
   }();
-  TensorMatcher({N})  // extend_lens and seq_lens
+  TensorMatcher({host::details::SizeRef(N)})  // extend_lens and seq_lens
       .with_dtype<int64_t>()
-      .with_device(device)
+      .with_device(host::details::DeviceRef(device))
       .verify(extend_lens)
       .verify(seq_lens);
-  TensorMatcher({M, kPrefillPlanDim})  // compress_plan and write_plan
+  TensorMatcher({host::details::SizeRef(M), host::details::SizeRef(kPrefillPlanDim)})  // compress_plan and write_plan
       .with_dtype<PrefillPlanTensorDtype>()
-      .with_device(device)
+      .with_device(host::details::DeviceRef(device))
       .verify(compress_plan)
       .verify(write_plan);
 

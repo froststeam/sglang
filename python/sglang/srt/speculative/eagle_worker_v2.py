@@ -12,6 +12,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_r
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
 )
+from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
@@ -310,21 +311,34 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.draft_attn_backend, AiterMultiStepDraftBackend
             )
 
-        supports_cuda_draft_extend_graph = _is_cuda and (
-            isinstance(self.draft_extend_attn_backend, TritonAttnBackend)
-            or isinstance(self.draft_extend_attn_backend, TRTLLMMLABackend)
+        extend_backend = self.draft_extend_attn_backend
+        supports_cuda_draft_extend_graph = _is_cuda and isinstance(
+            extend_backend, (TritonAttnBackend, TRTLLMMLABackend)
         )
         supports_musa_draft_extend_graph = False
-        if _is_musa:
+        if _is_musa and extend_backend is not None:
             from sglang.srt.hardware_backend.musa.attention.flashattention_backend import (
                 MusaFlashAttentionBackend,
             )
 
             supports_musa_draft_extend_graph = isinstance(
-                self.draft_extend_attn_backend, TritonAttnBackend
-            ) or isinstance(self.draft_extend_attn_backend, MusaFlashAttentionBackend)
-        # Capture extend
-        # TODO: support draft extend cuda graph for more attention backends
+                extend_backend, (TritonAttnBackend, MusaFlashAttentionBackend)
+            )
+        supports_dsv4_extend_graph = (
+            (_is_cuda or _is_musa)
+            and extend_backend is not None
+            and envs.SGLANG_DSV4_EAGLE_DRAFT_EXTEND_CUDA_GRAPH.get()
+            and isinstance(extend_backend, DeepseekV4AttnBackend)
+        )
+        if supports_dsv4_extend_graph:
+            supports_cuda_draft_extend_graph = supports_cuda_draft_extend_graph or _is_cuda
+            supports_musa_draft_extend_graph = supports_musa_draft_extend_graph or _is_musa
+            log_info_on_rank0(
+                logger,
+                "EAGLE draft-extend cuda graph enabled for DeepseekV4AttnBackend "
+                "(SGLANG_DSV4_EAGLE_DRAFT_EXTEND_CUDA_GRAPH=1).",
+            )
+        # Capture extend (Triton/TRTLLM, MUSA FlashAttention, or DSV4 when enabled).
         if self.draft_extend_attn_backend and (
             _is_npu
             or supports_cuda_draft_extend_graph

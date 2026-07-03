@@ -89,7 +89,7 @@ struct KernelTrait {
   using DType2 = packed_t<DType>;
   using Storage = device::AlignedVector<DType2, kVecSize>;
 
-  static_assert(std::has_single_bit(kNumGPU), "must be pow of 2");
+  static_assert(host::has_single_bit(kNumGPU), "must be pow of 2");
   static_assert(kQDim % kNumGPU == 0);
   static_assert(kKDim % kNumGPU == 0);
   static_assert(kLocalQDim % (kVecSize * 2) == 0);

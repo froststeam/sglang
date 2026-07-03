@@ -48,8 +48,6 @@ Some other notes:
     c4_sparse: means "compressed by 4" but only attend to top-512 tokens.
                all related length will be clipped to 512.
 """
-
-
 def copy_metadata(
     *,
     src,
@@ -108,7 +106,11 @@ class PagedIndexerMetadata:
         else:
             import deep_gemm
 
-            if envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get():
+            use_jit_indexer = (
+                envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
+                or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+            )
+            if use_jit_indexer:
                 from sglang.jit_kernel.deepseek_v4 import get_paged_mqa_logits_metadata
             else:
                 from deep_gemm import get_paged_mqa_logits_metadata

@@ -56,7 +56,7 @@ if _use_aiter and not _use_aiter_preshuffle:
         "(needs Triton>=3.5.0 or AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1); "
         "falling back to legacy page_size=1 / KVBlockSize=1 path."
     )
-if _is_cuda:
+if _is_cuda or _is_musa:
     try:
         import deep_gemm
     except ImportError as e:
@@ -167,6 +167,8 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     # from sgl_kernel import hadamard_transform
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
+    elif _is_musa:
+        from sgl_kernel import hadamard_transform
     else:
         from sglang.jit_kernel.hadamard import hadamard_transform
 
@@ -356,6 +358,8 @@ class Indexer(MultiPlatformOp):
             )
             key, _ = self.wk(x)
             key = self.k_norm(key)
+            if self._try_fused_neox_rope_hadamard(query, key, positions):
+                return query, key
             k_rope, _ = torch.split(
                 key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
@@ -415,6 +419,8 @@ class Indexer(MultiPlatformOp):
         # Compute only key, skip query
         key, _ = self.wk(x)
         key = self.k_norm(key)
+        if self._try_fused_neox_rope_hadamard(None, key, positions):
+            return key
         k_rope, _ = torch.split(
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
         )
@@ -424,6 +430,49 @@ class Indexer(MultiPlatformOp):
         key = rotate_activation(key)
 
         return key
+
+    def _try_fused_neox_rope_hadamard(
+        self,
+        query: Optional[torch.Tensor],
+        key: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> bool:
+        if not get_bool_env_var("SGLANG_OPT_DSV4_MUSA_FUSED_NSA_ROPE_HADAMARD"):
+            return False
+        if key.device.type != "musa" or self.head_dim != 128 or self.rope_head_dim != 64:
+            return False
+        from sglang.srt.hardware_backend.layers.deepseek_v4_musa.ops.norm_rope_ops import (
+            _try_tilelang_neox_rope_hadamard_inplace_musa,
+        )
+
+        tensors = [("key", key)]
+        if query is not None:
+            tensors.insert(0, ("query", query))
+        if self.rotary_emb.cos_sin_cache.device != key.device:
+            return False
+        if self.rotary_emb.cos_sin_cache.dtype != torch.float32:
+            return False
+        if positions.device != key.device or positions.dim() != 1:
+            return False
+        for _name, tensor in tensors:
+            if tensor.dtype not in (torch.float32, torch.bfloat16):
+                return False
+            if tensor.shape[-1] != 128 or not tensor.is_contiguous():
+                return False
+            if tensor.shape[0] != positions.shape[0]:
+                return False
+        for name, tensor in tensors:
+            ok, reason = _try_tilelang_neox_rope_hadamard_inplace_musa(
+                tensor,
+                self.rotary_emb.cos_sin_cache,
+                positions,
+            )
+            if not ok:
+                raise NotImplementedError(
+                    "DeepSeekV4 MUSA fused NSA Neox RoPE+Hadamard failed after "
+                    f"preflight on {name}; fallback may be numerically unsafe. Reason: {reason}"
+                )
+        return True
 
     @staticmethod
     def _update_rope_guarded(dst: torch.Tensor, src: torch.Tensor) -> None:

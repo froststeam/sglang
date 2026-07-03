@@ -12,9 +12,8 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
-#include <bit>
 #include <cstdint>
-#include <cuda_fp8.h>
+#include <musa_fp8.h>
 
 namespace {
 
@@ -27,17 +26,18 @@ struct FusedStoreCacheParam {
   void* __restrict__ cache;
   const void* __restrict__ indices;
   uint32_t num_tokens;
+  uint32_t cache_pages;
 };
 
 template <typename Float, typename IndicesT, uint32_t kPageBits, bool kUsePDL>
-__global__ void fused_store_flashmla_cache(const __grid_constant__ FusedStoreCacheParam param) {
+__global__ void fused_store_flashmla_cache(const FusedStoreCacheParam param) {
   using namespace device;
 
   /// NOTE: 584 = 576 + 8
   constexpr int64_t kPageBytes = host::div_ceil(584 << kPageBits, 576) * 576;
 
   // each warp handles 64 elements, 8 warps, each block handles 1 row
-  const auto& [input, cache, indices, num_tokens] = param;
+  const auto& [input, cache, indices, num_tokens, cache_pages] = param;
   const uint32_t bid = blockIdx.x;
   const uint32_t tid = threadIdx.x;
   const uint32_t wid = tid / 32;
@@ -46,6 +46,11 @@ __global__ void fused_store_flashmla_cache(const __grid_constant__ FusedStoreCac
 
   // prefetch the index
   const auto index = static_cast<const IndicesT*>(indices)[bid];
+  const auto index_i64 = static_cast<int64_t>(index);
+  if (index_i64 < 0 || index_i64 >= (static_cast<int64_t>(cache_pages) << kPageBits)) {
+    PDLTriggerSecondary<kUsePDL>();
+    return;
+  }
   // always load the value from input (don't store if invalid)
   using Float2 = packed_t<Float>;
   const auto elems = static_cast<const Float2*>(input)[tid + bid * 256];
@@ -76,14 +81,14 @@ __global__ void fused_store_flashmla_cache(const __grid_constant__ FusedStoreCac
 }
 
 template <typename Float, typename IndicesT, uint32_t kPageBits, bool kUsePDL>
-__global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCacheParam param) {
+__global__ void fused_store_indexer_cache(const FusedStoreCacheParam param) {
   using namespace device;
 
   /// NOTE: 132 = 128 + 4
   constexpr int64_t kPageBytes = 132 << kPageBits;
 
   // each warp handles 128 elements, 1 warp, each block handles multiple rows
-  const auto& [input, cache, indices, num_tokens] = param;
+  const auto& [input, cache, indices, num_tokens, cache_pages] = param;
   const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
   const auto global_wid = global_tid / 32;
   const auto lane_id = threadIdx.x % 32;
@@ -94,6 +99,11 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
 
   // prefetch the index
   const auto index = static_cast<const IndicesT*>(indices)[global_wid];
+  const auto index_i64 = static_cast<int64_t>(index);
+  if (index_i64 < 0 || index_i64 >= (static_cast<int64_t>(cache_pages) << kPageBits)) {
+    PDLTriggerSecondary<kUsePDL>();
+    return;
+  }
   // always load the value from input (don't store if invalid)
   using Float2 = packed_t<Float>;
   using InStorage = AlignedVector<Float2, 2>;
@@ -122,12 +132,12 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
 
 template <typename Float, typename IndicesT, uint32_t kPageSize, bool kUsePDL>
 struct FusedStoreCacheFlashMLAKernel {
-  static constexpr int32_t kLogSize = std::countr_zero(kPageSize);
+  static constexpr int32_t kLogSize = __builtin_ctz(kPageSize);
   static constexpr int64_t kPageBytes = host::div_ceil(584 * kPageSize, 576) * 576;
   static constexpr auto kernel = fused_store_flashmla_cache<Float, IndicesT, kLogSize, kUsePDL>;
 
-  static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
-  static_assert(1 << kLogSize == kPageSize);
+  static_assert(kPageSize > 0 && (kPageSize & (kPageSize - 1)) == 0, "kPageSize must be a power of 2");
+  static_assert((1u << kLogSize) == kPageSize);
 
   static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView cache, tvm::ffi::TensorView indices) {
     using namespace host;
@@ -135,18 +145,18 @@ struct FusedStoreCacheFlashMLAKernel {
     auto N = SymbolicSize{"num_tokens"};
     auto device_ = SymbolicDevice{};
     device_.set_options<kDLCUDA>();
-    TensorMatcher({N, 512})  // input
+    TensorMatcher({host::details::SizeRef(N), host::details::SizeRef(512)})  // input
         .with_dtype<Float>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(input);
-    TensorMatcher({-1, -1})  // cache
-        .with_strides({kPageBytes, 1})
+    TensorMatcher({host::details::SizeRef(-1), host::details::SizeRef(-1)})  // cache
+        .with_strides({host::details::SizeRef(kPageBytes), host::details::SizeRef(1)})
         .with_dtype<uint8_t>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(cache);
-    TensorMatcher({N})  // indices
+    TensorMatcher({host::details::SizeRef(N)})  // indices
         .with_dtype<IndicesT>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(indices);
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
     const auto params = FusedStoreCacheParam{
@@ -154,6 +164,7 @@ struct FusedStoreCacheFlashMLAKernel {
         .cache = cache.data_ptr(),
         .indices = indices.data_ptr(),
         .num_tokens = num_tokens,
+        .cache_pages = static_cast<uint32_t>(cache.shape()[0]),
     };
     const auto kBlockSize = 256;
     const auto num_blocks = num_tokens;
@@ -163,12 +174,12 @@ struct FusedStoreCacheFlashMLAKernel {
 
 template <typename Float, typename IndicesT, uint32_t kPageSize, bool kUsePDL>
 struct FusedStoreCacheIndexerKernel {
-  static constexpr int32_t kLogSize = std::countr_zero(kPageSize);
+  static constexpr int32_t kLogSize = __builtin_ctz(kPageSize);
   static constexpr int64_t kPageBytes = 132 * kPageSize;
   static constexpr auto kernel = fused_store_indexer_cache<Float, IndicesT, kLogSize, kUsePDL>;
 
-  static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
-  static_assert(1 << kLogSize == kPageSize);
+  static_assert(kPageSize > 0 && (kPageSize & (kPageSize - 1)) == 0, "kPageSize must be a power of 2");
+  static_assert((1u << kLogSize) == kPageSize);
 
   static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView cache, tvm::ffi::TensorView indices) {
     using namespace host;
@@ -176,18 +187,18 @@ struct FusedStoreCacheIndexerKernel {
     auto N = SymbolicSize{"num_tokens"};
     auto device_ = SymbolicDevice{};
     device_.set_options<kDLCUDA>();
-    TensorMatcher({N, 128})  // input
+    TensorMatcher({host::details::SizeRef(N), host::details::SizeRef(128)})  // input
         .with_dtype<Float>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(input);
-    TensorMatcher({-1, -1})  // cache
-        .with_strides({kPageBytes, 1})
+    TensorMatcher({host::details::SizeRef(-1), host::details::SizeRef(-1)})  // cache
+        .with_strides({host::details::SizeRef(kPageBytes), host::details::SizeRef(1)})
         .with_dtype<uint8_t>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(cache);
-    TensorMatcher({N})  // indices
+    TensorMatcher({host::details::SizeRef(N)})  // indices
         .with_dtype<IndicesT>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(indices);
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
     const auto params = FusedStoreCacheParam{
@@ -195,6 +206,7 @@ struct FusedStoreCacheIndexerKernel {
         .cache = cache.data_ptr(),
         .indices = indices.data_ptr(),
         .num_tokens = num_tokens,
+        .cache_pages = static_cast<uint32_t>(cache.shape()[0]),
     };
     const auto kBlockSize = 128;
     const auto num_blocks = div_ceil(num_tokens * 32, kBlockSize);

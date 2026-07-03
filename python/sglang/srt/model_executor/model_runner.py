@@ -1651,15 +1651,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         new_expert_location_metadata: ExpertLocationMetadata,
         update_layer_ids: List[int],
     ):
-        p2p_missing_logical_experts = self.expert_location_updater.update(
+        p2p_missing_logical_experts = yield from self.expert_location_updater.update(
             self.model.routed_experts_weights_of_layer,
             new_expert_location_metadata,
             update_layer_ids=update_layer_ids,
+            rebalance_experts_per_chunk=rebalance_experts_per_chunk,
             nnodes=self.server_args.nnodes,
             rank=self.tp_rank,
         )
 
-        if len(p2p_missing_logical_experts) > 0:
+        if p2p_missing_logical_experts and len(p2p_missing_logical_experts) > 0:
             # Load the missing expert weights from disk
             if callable(getattr(self.model, "generate_weight_name_filter", None)):
                 # Filter and load only missing expert weights
@@ -2665,6 +2666,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             max_bs=batch_size,
             max_num_token=num_tokens,
             hidden_size=self.model_config.hidden_size,
+            pp_proxy_hidden_size=getattr(self.model, "pp_proxy_hidden_size", None),
+            pp_proxy_tensor_names=getattr(self.model, "pp_proxy_tensor_names", None),
             vocab_size=self.model_config.vocab_size,
             dtype=self.model_config.dtype,
             dp_size=self.server_args.dp_size,

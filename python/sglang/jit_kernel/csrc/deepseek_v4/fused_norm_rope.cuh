@@ -39,9 +39,8 @@ enum class ForwardMode {
 };
 
 template <typename DType, int64_t kHeadDim, int64_t kRopeDim, ForwardMode kMode, bool kUsePDL>
-__global__ void fused_norm_rope(const __grid_constant__ FusedNormRopeParams params) {
+__global__ void fused_norm_rope(const FusedNormRopeParams params) {
   using namespace device;
-  using enum ForwardMode;
 
   constexpr int64_t kMaxVecSize = 16 / sizeof(DType);
   constexpr int64_t kVecSize = std::min(kMaxVecSize, kHeadDim / kWarpThreads);
@@ -68,18 +67,18 @@ __global__ void fused_norm_rope(const __grid_constant__ FusedNormRopeParams para
 
   DType* input;
   int32_t position;
-  if constexpr (kMode == CompressExtend) {
+  if constexpr (kMode == ForwardMode::CompressExtend) {
     const auto plan = static_cast<const Plan*>(handle)[work_id];
     input = static_cast<DType*>(_input) + plan.ragged_id * kHeadDim;
     position = plan.position + 1 - compress_ratio;
     if (plan.ragged_id == 0xFFFFFFFF) [[unlikely]]
       return;
-  } else if constexpr (kMode == CompressDecode) {
+  } else if constexpr (kMode == ForwardMode::CompressDecode) {
     input = static_cast<DType*>(_input) + work_id * kHeadDim;
     const auto seq_len = static_cast<const int32_t*>(handle)[work_id];
     if (seq_len % compress_ratio != 0) return;
     position = seq_len - compress_ratio;
-  } else if constexpr (kMode == DefaultForward) {
+  } else if constexpr (kMode == ForwardMode::DefaultForward) {
     input = static_cast<DType*>(_input) + work_id * kHeadDim;
     position = static_cast<const int64_t*>(handle)[work_id];
   } else {
@@ -180,7 +179,6 @@ struct FusedNormRopeKernel {
       float eps,
       uint32_t compress_ratio) {
     using namespace host;
-    using enum ForwardMode;
 
     const auto mode = static_cast<ForwardMode>(_mode);
 
@@ -189,37 +187,37 @@ struct FusedNormRopeKernel {
     auto device_ = SymbolicDevice{};
     device_.set_options<kDLCUDA>();
 
-    TensorMatcher({B, kHeadDim})  // input
+    TensorMatcher({host::details::SizeRef(B), host::details::SizeRef(kHeadDim)})  // input
         .with_dtype<DType>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(input);
-    TensorMatcher({kHeadDim})  // weight
+    TensorMatcher({host::details::SizeRef(kHeadDim)})  // weight
         .with_dtype<DType>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(weight);
-    TensorMatcher({-1, kRopeDim})  // freqs_cis
+    TensorMatcher({host::details::SizeRef(-1), host::details::SizeRef(kRopeDim)})  // freqs_cis
         .with_dtype<float>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(freqs_cis);
     switch (mode) {
-      case CompressExtend:
-        TensorMatcher({N, compress::kPrefillPlanDim})  // plan
+      case ForwardMode::CompressExtend:
+        TensorMatcher({host::details::SizeRef(N), host::details::SizeRef(compress::kPrefillPlanDim)})  // plan
             .with_dtype<compress::PrefillPlanTensorDtype>()
-            .with_device(device_)
+            .with_device(host::details::DeviceRef(device_))
             .verify(handle);
         RuntimeCheck(compress_ratio > 0);
         break;
-      case CompressDecode:
-        TensorMatcher({N})  // seq_len
+      case ForwardMode::CompressDecode:
+        TensorMatcher({host::details::SizeRef(N)})  // seq_len
             .with_dtype<int32_t>()
-            .with_device(device_)
+            .with_device(host::details::DeviceRef(device_))
             .verify(handle);
         RuntimeCheck(compress_ratio > 0);
         break;
-      case DefaultForward:
-        TensorMatcher({N})  // position
+      case ForwardMode::DefaultForward:
+        TensorMatcher({host::details::SizeRef(N)})  // position
             .with_dtype<int64_t>()
-            .with_device(device_)
+            .with_device(host::details::DeviceRef(device_))
             .verify(handle);
         RuntimeCheck(compress_ratio == 0);
         break;
@@ -240,11 +238,11 @@ struct FusedNormRopeKernel {
         .compress_ratio = compress_ratio,
     };
     const auto num_blocks = div_ceil(num_compress_tokens, kNumWarps);
-    using KernelType = std::decay_t<decltype(fused_norm_rope<DType, kHeadDim, kRopeDim, CompressExtend, kUsePDL>)>;
+    using KernelType = std::decay_t<decltype(fused_norm_rope<DType, kHeadDim, kRopeDim, ForwardMode::CompressExtend, kUsePDL>)>;
     static constexpr KernelType kernel_table[3] = {
-        [static_cast<int>(CompressExtend)] = fused_kernel<CompressExtend>,
-        [static_cast<int>(CompressDecode)] = fused_kernel<CompressDecode>,
-        [static_cast<int>(DefaultForward)] = fused_kernel<DefaultForward>,
+        fused_kernel<ForwardMode::CompressExtend>,
+        fused_kernel<ForwardMode::CompressDecode>,
+        fused_kernel<ForwardMode::DefaultForward>,
     };
     const auto kernel = kernel_table[static_cast<int>(mode)];
     LaunchKernel(num_blocks, kBlockSize, device_.unwrap()).enable_pdl(kUsePDL)(kernel, params);

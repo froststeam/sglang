@@ -309,8 +309,12 @@ class _SinglePassGatherer(ABC):
 
         if server_args.expert_distribution_recorder_mode == "stat_approx":
             if server_args.moe_a2a_backend != "none" and (
-                server_args.deepep_mode == "normal"
+                server_args.deepep_mode in ("normal", "auto")
             ):
+                if server_args.deepep_mode == "auto":
+                    return _DeepepAutoSinglePassGatherer(
+                        expert_location_metadata, rank
+                    )
                 return _DeepepNormalSinglePassGatherer(expert_location_metadata, rank)
             else:
                 raise NotImplementedError
@@ -322,6 +326,8 @@ class _SinglePassGatherer(ABC):
                 return _DeepepLowLatencySinglePassGatherer(
                     expert_location_metadata, rank
                 )
+            elif server_args.deepep_mode == "auto":
+                return _DeepepAutoSinglePassGatherer(expert_location_metadata, rank)
             else:
                 raise NotImplementedError
 
@@ -565,6 +571,55 @@ class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
     ):
         # Most naive implementation, can optimize later
         self._data[layer_idx, :] += local_physical_count_of_layer
+
+
+class _DeepepAutoSinglePassGatherer(_SinglePassGatherer):
+    """Expert distribution gatherer for deepep_mode=auto (prefill=normal, decode=low_latency)."""
+
+    def __init__(self, expert_location_metadata: ExpertLocationMetadata, rank: int):
+        super().__init__(expert_location_metadata, rank)
+        self._normal_gatherer = _DeepepNormalSinglePassGatherer(
+            expert_location_metadata, rank
+        )
+        self._low_latency_gatherer = _DeepepLowLatencySinglePassGatherer(
+            expert_location_metadata, rank
+        )
+
+    def on_deepep_dispatch_normal(
+        self,
+        layer_idx: int,
+        local_physical_count_of_layer: List[int],
+        num_tokens_per_rank,
+        num_tokens_per_rdma_rank,
+        num_tokens_per_expert,
+    ):
+        self._normal_gatherer.on_deepep_dispatch_normal(
+            layer_idx,
+            local_physical_count_of_layer,
+            num_tokens_per_rank,
+            num_tokens_per_rdma_rank,
+            num_tokens_per_expert,
+        )
+
+    def on_deepep_dispatch_low_latency(
+        self, layer_idx: int, local_physical_count_of_layer: torch.Tensor
+    ):
+        self._low_latency_gatherer.on_deepep_dispatch_low_latency(
+            layer_idx, local_physical_count_of_layer
+        )
+
+    def reset(self):
+        self._normal_gatherer.reset()
+        self._low_latency_gatherer.reset()
+
+    def collect(self) -> Dict:
+        normal_result = self._normal_gatherer.collect()
+        low_latency_result = self._low_latency_gatherer.collect()
+        normal_count = normal_result["global_physical_count"]
+        # Each forward pass uses only one deepep path; avoid CPU/GPU add.
+        if normal_count.sum() != 0:
+            return dict(global_physical_count=normal_count)
+        return low_latency_result
 
 
 def _convert_per_token_to_global_physical_count(

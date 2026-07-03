@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import torch
@@ -18,6 +19,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_hip
 
@@ -415,6 +417,8 @@ class C4IndexerBackendMixin:
             raw_indices = hisparse_coordinator.raw_indices_buffer[
                 : core_metadata.c4_sparse_page_indices.size(0)
             ]
+        elif core_metadata.c4_sparse_raw_indices is not None:
+            raw_indices = core_metadata.c4_sparse_raw_indices
 
         if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
             topk_transform_512_pytorch_vectorized(
@@ -462,7 +466,6 @@ class C4IndexerBackendMixin:
                         core_metadata.c4_sparse_page_indices
                     )
                 )
-
         if capture_enabled:
             compress_layer_id = token_to_kv_pool.layer_mapping[
                 c4_indexer.layer_id

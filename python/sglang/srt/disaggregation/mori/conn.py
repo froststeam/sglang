@@ -611,15 +611,17 @@ class MoriKVManager(CommonKVManager):
         self, dst_mem_descs: List[MemoryDesc]
     ) -> tuple[List[MemoryDesc], List[MemoryDesc], int]:
         src_descs = self.kv_mem_descs
-        num_local_layers = len(src_descs)
-        start_layer = self.kv_args.prefill_start_layer
-        end_layer = start_layer + num_local_layers
-        if end_layer > len(dst_mem_descs):
-            raise ValueError(
-                "Destination MLA KV descriptors do not match prefill pp configuration"
-            )
-        dst_slice = dst_mem_descs[start_layer:end_layer]
-        return src_descs, dst_slice, num_local_layers
+        if not src_descs:
+            raise RuntimeError("KV memory descriptors are empty on prefill side")
+
+        src_indices, dst_indices, layers_current_pp_stage = self.get_mla_kv_ptrs_with_pp(
+            list(range(len(src_descs))), list(range(len(dst_mem_descs)))
+        )
+        return (
+            [src_descs[int(idx)] for idx in src_indices],
+            [dst_mem_descs[int(idx)] for idx in dst_indices],
+            layers_current_pp_stage,
+        )
 
     def _submit_batch_transfer_plan(
         self,
@@ -942,7 +944,10 @@ class MoriKVManager(CommonKVManager):
                 f"decode_tp_size={peer_info.decode_tp_size})"
             )
 
-        if len(peer_info.dst_state_mem_descs) != len(self.state_mem_descs):
+        if (
+            not self.is_mla_backend
+            and len(peer_info.dst_state_mem_descs) != len(self.state_mem_descs)
+        ):
             raise RuntimeError(
                 f"PD state transfer failed: state descriptor count mismatch "
                 f"(local={len(self.state_mem_descs)}, remote={len(peer_info.dst_state_mem_descs)}), "
@@ -1095,10 +1100,19 @@ class MoriKVManager(CommonKVManager):
             *group_concurrent_contiguous(src_state_indices, dst_state_indices)
         )
 
+        src_state_descs = self.state_mem_descs
+        dst_state_descs = peer_info.dst_state_mem_descs
+        if self.is_mla_backend:
+            src_indices, dst_indices, _ = self.get_mla_kv_ptrs_with_pp(
+                list(range(len(src_state_descs))), list(range(len(dst_state_descs)))
+            )
+            src_state_descs = [src_state_descs[int(idx)] for idx in src_indices]
+            dst_state_descs = [dst_state_descs[int(idx)] for idx in dst_indices]
+
         statuses = []
-        for i in range(len(self.state_mem_descs)):
-            src_desc = self.state_mem_descs[i]
-            dst_desc = peer_info.dst_state_mem_descs[i]
+        for i in range(len(src_state_descs)):
+            src_desc = src_state_descs[i]
+            dst_desc = dst_state_descs[i]
             state_item_len = self.kv_args.state_item_lens[i]
 
             statuses.extend(

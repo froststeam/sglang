@@ -32,7 +32,7 @@ struct MoEHashTopKParams {
 };
 
 template <auto Fn, bool kUsePDL>
-__global__ void moe_hash_topk_fused(const MoEHashTopKParams __grid_constant__ params) {
+__global__ void moe_hash_topk_fused(const MoEHashTopKParams params) {
   using namespace device;
   const auto& [
     router_logits, input_id, tid2eid, topk_ids, topk_weights, // pointers
@@ -69,23 +69,19 @@ __global__ void moe_hash_topk_fused(const MoEHashTopKParams __grid_constant__ pa
 
 struct TopKParams {
   int32_t* __restrict__ topk_ids;
-  // Exactly one is active: ntn_ptr == nullptr means use ntn_value.
-  const int32_t* __restrict__ ntn_ptr;
-  int32_t ntn_value;
+  const int32_t* __restrict__ num_token_non_padded;
   int64_t stride;
   uint32_t topk;
   uint32_t num_tokens;
 };
 
-__global__ void mask_topk_ids_padded_region(const TopKParams __grid_constant__ params) {
+__global__ void mask_topk_ids_padded_region(const TopKParams params) {
   const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   const uint32_t warp_id = tid / device::kWarpThreads;
   const uint32_t lane_id = tid % device::kWarpThreads;
   if (warp_id >= params.num_tokens || lane_id >= params.topk) return;
   device::PDLWaitPrimary<true>();
-  const uint32_t num = (params.ntn_ptr != nullptr)  //
-                           ? static_cast<uint32_t>(params.ntn_ptr[0])
-                           : static_cast<uint32_t>(params.ntn_value);
+  const uint32_t num = params.num_token_non_padded[0];
   if (warp_id >= num) params.topk_ids[warp_id * params.stride + lane_id] = -1;
   device::PDLTriggerSecondary<true>();
 }
@@ -109,25 +105,25 @@ struct HashTopKKernel {
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({N, E})  //
+    TensorMatcher({host::details::SizeRef(N), host::details::SizeRef(E)})  //
         .with_dtype<float>()
-        .with_device(device)
+        .with_device(host::details::DeviceRef(device))
         .verify(router_logits);
-    TensorMatcher({N})  //
+    TensorMatcher({host::details::SizeRef(N)})  //
         .with_dtype<int64_t>()
-        .with_device(device)
+        .with_device(host::details::DeviceRef(device))
         .verify(input_id);
-    TensorMatcher({-1, -1})  //
+    TensorMatcher({host::details::SizeRef(-1), host::details::SizeRef(-1)})  //
         .with_dtype<int32_t>()
-        .with_device(device)
+        .with_device(host::details::DeviceRef(device))
         .verify(tid2eid);
-    TensorMatcher({N, K})  //
+    TensorMatcher({host::details::SizeRef(N), host::details::SizeRef(K)})  //
         .with_dtype<float>()
-        .with_device(device)
+        .with_device(host::details::DeviceRef(device))
         .verify(topk_weights);
-    TensorMatcher({N, K})  //
+    TensorMatcher({host::details::SizeRef(N), host::details::SizeRef(K)})  //
         .with_dtype<int32_t>()
-        .with_device(device)
+        .with_device(host::details::DeviceRef(device))
         .verify(topk_ids);
 
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
@@ -157,7 +153,6 @@ struct HashTopKKernel {
   }
 };
 
-// TODO this may not be related to *hash* topk, thus may move
 struct MaskKernel {
   static constexpr auto kernel = mask_topk_ids_padded_region;
 
@@ -169,36 +164,17 @@ struct MaskKernel {
     auto D = SymbolicSize{"stride"};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
-    TensorMatcher({N, K})  //
-        .with_strides({D, 1})
+    TensorMatcher({host::details::SizeRef(N), host::details::SizeRef(K)})  //
+        .with_strides({host::details::SizeRef(D), host::details::SizeRef(1)})
         .with_dtype<int32_t>()
-        .with_device(device)
+        .with_device(host::details::DeviceRef(device))
         .verify(topk_ids);
     RuntimeCheck(num_token_non_padded.numel() == 1, "num_token_non_padded should be a scalar");
     RuntimeCheck(K.unwrap() <= device::kWarpThreads, "MaskKernel requires topk <= warp size");
-    const int32_t* ntn_ptr = nullptr;
-    int32_t ntn_value = 0;
-    const auto ntn_dev = num_token_non_padded.device().device_type;
-    if (ntn_dev == kDLCUDA) {
-      RuntimeCheck(is_type<int32_t>(num_token_non_padded.dtype()), "num_token_non_padded on CUDA must be int32");
-      ntn_ptr = static_cast<const int32_t*>(num_token_non_padded.data_ptr());
-    } else if (ntn_dev == kDLCPU) {
-      if (is_type<int32_t>(num_token_non_padded.dtype())) {
-        ntn_value = *static_cast<const int32_t*>(num_token_non_padded.data_ptr());
-      } else if (is_type<int64_t>(num_token_non_padded.dtype())) {
-        ntn_value = static_cast<int32_t>(*static_cast<const int64_t*>(num_token_non_padded.data_ptr()));
-      } else {
-        RuntimeCheck(false, "num_token_non_padded on CPU must be int32 or int64");
-      }
-    } else {
-      RuntimeCheck(false, "num_token_non_padded must be on CPU or CUDA");
-    }
-
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
     const auto params = TopKParams{
         .topk_ids = static_cast<int32_t*>(topk_ids.data_ptr()),
-        .ntn_ptr = ntn_ptr,
-        .ntn_value = ntn_value,
+        .num_token_non_padded = static_cast<int32_t*>(num_token_non_padded.data_ptr()),
         .stride = static_cast<int64_t>(D.unwrap()),
         .topk = static_cast<uint32_t>(K.unwrap()),
         .num_tokens = num_tokens,

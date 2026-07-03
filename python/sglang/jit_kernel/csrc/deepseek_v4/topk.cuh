@@ -6,7 +6,6 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
-#include <bit>
 #include <cstdint>
 
 namespace {
@@ -209,7 +208,6 @@ SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict_
           } else {
             const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
             if (pos < SMEM_INPUT_SIZE) {
-              /// NOTE: (dark) fuse the histogram computation here
               [[likely]] s_input_idx[r_idx ^ 1][pos] = idx;
               const auto bin = convert_to_uint32(raw_input);
               const auto sub_bin = (bin >> (offset - 8)) & 0xFF;
@@ -224,14 +222,13 @@ SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict_
 }
 
 template <bool kUsePDL>
-__global__ void topk_512_transform(const __grid_constant__ TopK512Params params) {
-  const auto &[
+__global__ void topk_512_transform(const TopK512Params params) {
+  const auto& [
     scores, seq_lens, page_table, page_indices, raw_indices, // pointers
     score_stride, page_table_stride, page_bits // sizes
   ] = params;
   const uint32_t work_id = blockIdx.x;
 
-  /// NOTE: dangerous prefetch seq_len before PDL wait
   const uint32_t seq_len = seq_lens[work_id];
   const auto score_ptr = scores + work_id * score_stride;
   const auto page_ptr = page_table + work_id * page_table_stride;
@@ -262,8 +259,8 @@ template <auto* f, size_t kMaxDynamicSMEM>
 void setup_kernel_smem_once(host::DebugInfo where = {}) {
   [[maybe_unused]]
   static const auto result = [] {
-    const auto fptr = std::bit_cast<const void*>(f);
-    return ::cudaFuncSetAttribute(fptr, ::cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
+    const void* fptr = reinterpret_cast<const void*>(f);
+    return ::musaFuncSetAttribute(fptr, ::musaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
   }();
   host::RuntimeDeviceCheck(result, where);
 }
@@ -286,41 +283,41 @@ struct TopK512Kernel {
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({B, -1})  // strided scores
-        .with_strides({S, 1})
+    TensorMatcher({host::details::SizeRef(B), host::details::SizeRef(-1)})  // strided scores
+        .with_strides({host::details::SizeRef(S), host::details::SizeRef(1)})
         .with_dtype<float>()
-        .with_device(device)
+        .with_device(host::details::DeviceRef(device))
         .verify(scores);
-    TensorMatcher({B})  // seq_lens, must be contiguous
+    TensorMatcher({host::details::SizeRef(B)})  // seq_lens, must be contiguous
         .with_dtype<int32_t>()
-        .with_device(device)
+        .with_device(host::details::DeviceRef(device))
         .verify(seq_lens);
-    TensorMatcher({B, -1})  // strided page table
-        .with_strides({P, 1})
+    TensorMatcher({host::details::SizeRef(B), host::details::SizeRef(-1)})  // strided page table
+        .with_strides({host::details::SizeRef(P), host::details::SizeRef(1)})
         .with_dtype<int32_t>()
-        .with_device(device)
+        .with_device(host::details::DeviceRef(device))
         .verify(page_table);
-    TensorMatcher({B, 512})  // output, must be contiguous
+    TensorMatcher({host::details::SizeRef(B), host::details::SizeRef(512)})  // output, must be contiguous
         .with_dtype<int32_t>()
-        .with_device(device)
+        .with_device(host::details::DeviceRef(device))
         .verify(page_indices);
 
     int32_t* raw_indices_ptr = nullptr;
     if (raw_indices.has_value()) {
-      TensorMatcher({B, 512})  // optional raw indices output, must be contiguous
+      TensorMatcher({host::details::SizeRef(B), host::details::SizeRef(512)})  // optional raw indices output, must be contiguous
           .with_dtype<int32_t>()
-          .with_device(device)
+          .with_device(host::details::DeviceRef(device))
           .verify(raw_indices.value());
       raw_indices_ptr = static_cast<int32_t*>(raw_indices.value().data_ptr());
     }
 
-    RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
-    const auto page_bits = static_cast<uint32_t>(std::countr_zero(page_size));
+    RuntimeCheck(page_size > 0 && (page_size & (page_size - 1)) == 0, "page_size must be power of 2");
+    const auto page_bits = static_cast<uint32_t>(__builtin_ctz(page_size));
     const auto batch_size = static_cast<uint32_t>(B.unwrap());
     const auto params = TopK512Params{
-        .scores = static_cast<float*>(scores.data_ptr()),
-        .seq_lens = static_cast<int32_t*>(seq_lens.data_ptr()),
-        .page_table = static_cast<int32_t*>(page_table.data_ptr()),
+        .scores = static_cast<const float*>(scores.data_ptr()),
+        .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
+        .page_table = static_cast<const int32_t*>(page_table.data_ptr()),
         .page_indices = static_cast<int32_t*>(page_indices.data_ptr()),
         .raw_indices = raw_indices_ptr,
         .score_stride = S.unwrap(),

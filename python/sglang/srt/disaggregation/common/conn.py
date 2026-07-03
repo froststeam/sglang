@@ -556,6 +556,11 @@ class CommonKVManager(BaseKVManager):
                 + list(dst_kv_ptrs[c4_full + c4_off_s : c4_full + c4_off_e])
                 + list(dst_kv_ptrs[2 * c4_full + c128_off_s : 2 * c4_full + c128_off_e])
             )
+            if len(src_kv_ptrs) != len(sliced_dst):
+                raise ValueError(
+                    f"Compressed-MLA src/dst pointer count mismatch after PP slicing: "
+                    f"src={len(src_kv_ptrs)}, dst={len(sliced_dst)}."
+                )
             return src_kv_ptrs, sliced_dst
 
         # State-data layout. ``swa_L`` is derived from the actual dst
@@ -599,6 +604,11 @@ class CommonKVManager(BaseKVManager):
                 ]
             )
         )
+        if len(src_kv_ptrs) != len(sliced_dst):
+            raise ValueError(
+                f"Compressed-MLA src/dst pointer count mismatch after PP slicing: "
+                f"src={len(src_kv_ptrs)}, dst={len(sliced_dst)}."
+            )
 
         return src_kv_ptrs, sliced_dst
 
@@ -694,10 +704,15 @@ class CommonKVSender(BaseKVSender):
         state_indices: Optional[List],
     ):
         self._transfer_num_kv_indices += len(kv_indices)
-        if state_indices:
-            for component_indices in state_indices:
-                if component_indices is not None:
-                    self._transfer_num_state_indices += len(component_indices)
+        if state_indices is not None:
+            if isinstance(state_indices, np.ndarray) or (
+                len(state_indices) > 0 and not hasattr(state_indices[0], "__len__")
+            ):
+                self._transfer_num_state_indices += len(state_indices)
+            else:
+                for component_indices in state_indices:
+                    if component_indices is not None:
+                        self._transfer_num_state_indices += len(component_indices)
 
     def send(
         self,
@@ -910,7 +925,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self,
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
-        state_indices: Optional[List[int]] = None,
+        state_indices: Optional[List] = None,
     ):
         raise NotImplementedError
 

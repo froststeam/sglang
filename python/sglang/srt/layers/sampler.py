@@ -555,7 +555,7 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
         sampled_index = multinomial_with_seed(logprobs, sampling_seed, positions)
 
     # int32 range is enough to represent the token ids
-    probs_idx = probs_idx.to(torch.int32)
+    probs_idx = probs_idx.to(torch.int64)
     batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
     return batch_next_token_ids
 
@@ -672,7 +672,7 @@ def sampling_from_probs_torch(
         sampled_index = multinomial_with_seed(
             torch.log(probs), sampling_seed, positions
         )
-    batch_next_token_ids = sampled_index.view(-1).to(torch.int32)
+    batch_next_token_ids = sampled_index.view(-1).to(torch.int64)
     return batch_next_token_ids
 
 

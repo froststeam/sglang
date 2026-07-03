@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
+from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -275,6 +276,12 @@ class EAGLEDraftExtendCudaGraphRunner:
         with ctx:
             self.graphs[self.bs].replay()
 
+    @staticmethod
+    def _set_replay_forward_batch(attn_backend, forward_batch: Optional[ForwardBatch]):
+        """DSV4 replay metadata needs forward_batch.out_cache_loc (see cuda_graph_runner)."""
+        if hasattr(attn_backend, "_replay_forward_batch"):
+            attn_backend._replay_forward_batch = forward_batch
+
     def capture(self):
         CudaGraphRunner.capture(self)
 
@@ -383,15 +390,27 @@ class EAGLEDraftExtendCudaGraphRunner:
             padded_static_len=self.padded_static_len,
         )
 
-        self.draft_extend_attn_backend.init_forward_metadata_capture_cuda_graph(
-            bs=bs,
-            num_tokens=num_tokens,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            encoder_lens=None,
-            forward_mode=self.forward_mode,
-            spec_info=spec_info,
-        )
+        if isinstance(self.draft_extend_attn_backend, DeepseekV4AttnBackend):
+            self.draft_extend_attn_backend.init_forward_metadata_capture_cuda_graph(
+                bs=bs,
+                num_tokens=num_tokens,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                encoder_lens=None,
+                forward_mode=self.forward_mode,
+                spec_info=spec_info,
+                out_cache_loc=out_cache_loc,
+            )
+        else:
+            self.draft_extend_attn_backend.init_forward_metadata_capture_cuda_graph(
+                bs=bs,
+                num_tokens=num_tokens,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                encoder_lens=None,
+                forward_mode=self.forward_mode,
+                spec_info=spec_info,
+            )
 
         # Run and capture
         def run_once():
@@ -519,17 +538,22 @@ class EAGLEDraftExtendCudaGraphRunner:
             forward_batch.spec_info.num_correct_drafts = buffers.num_correct_drafts[:bs]
             forward_batch.spec_info.num_accept_tokens = buffers.num_accept_tokens[:bs]
 
-        self.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=buffers.req_pool_indices,
-            seq_lens=buffers.seq_lens,
-            seq_lens_sum=forward_batch.seq_lens_sum
-            + (bs - raw_bs) * self.seq_len_fill_value,
-            encoder_lens=None,
-            forward_mode=self.forward_mode,
-            spec_info=forward_batch.spec_info,
-            seq_lens_cpu=buffers.seq_lens_cpu,
-        )
+        attn_backend = self.draft_extend_attn_backend
+        self._set_replay_forward_batch(attn_backend, forward_batch)
+        try:
+            attn_backend.init_forward_metadata_replay_cuda_graph(
+                bs=bs,
+                req_pool_indices=buffers.req_pool_indices,
+                seq_lens=buffers.seq_lens,
+                seq_lens_sum=forward_batch.seq_lens_sum
+                + (bs - raw_bs) * self.seq_len_fill_value,
+                encoder_lens=None,
+                forward_mode=self.forward_mode,
+                spec_info=forward_batch.spec_info,
+                seq_lens_cpu=buffers.seq_lens_cpu,
+            )
+        finally:
+            self._set_replay_forward_batch(attn_backend, None)
 
         # Replay
         self.raw_bs = raw_bs

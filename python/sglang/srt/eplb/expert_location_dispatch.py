@@ -89,6 +89,14 @@ def topk_ids_logical_to_physical(
 def _topk_ids_logical_to_physical_static(
     topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
 ) -> torch.Tensor:
+    if topk_ids.device.type == "musa":
+        from sglang.srt.hardware_backend.layers.deepseek_v4_musa_ops import (
+            topk_ids_logical_to_physical_static_musa,
+        )
+
+        return topk_ids_logical_to_physical_static_musa(
+            topk_ids, info.partial_logical_to_rank_dispatch_physical_map
+        )
     return info.partial_logical_to_rank_dispatch_physical_map[topk_ids]
 
 

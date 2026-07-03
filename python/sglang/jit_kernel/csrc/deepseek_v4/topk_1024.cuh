@@ -263,7 +263,7 @@ void setup_kernel_smem_once(host::DebugInfo where = {}) {
   [[maybe_unused]]
   static const auto result = [] {
     const auto fptr = std::bit_cast<const void*>(f);
-    return ::cudaFuncSetAttribute(fptr, ::cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
+    return ::musaFuncSetAttribute(fptr, ::musaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
   }();
   host::RuntimeDeviceCheck(result, where);
 }
@@ -314,8 +314,8 @@ struct TopK1024Kernel {
       raw_indices_ptr = static_cast<int32_t*>(raw_indices.value().data_ptr());
     }
 
-    RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
-    const auto page_bits = static_cast<uint32_t>(std::countr_zero(page_size));
+    RuntimeCheck(host::has_single_bit(page_size), "page_size must be power of 2");
+    const auto page_bits = static_cast<uint32_t>(host::countr_zero(page_size));
     const auto batch_size = static_cast<uint32_t>(B.unwrap());
     const auto params = TopK1024Params{
         .scores = static_cast<float*>(scores.data_ptr()),

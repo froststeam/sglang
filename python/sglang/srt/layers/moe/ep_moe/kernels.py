@@ -1294,6 +1294,656 @@ def fill_gateup_input_triton_kernel(
                     tl.store(scale_dst_ptr + offset, in_scale, mask=mask)
 
 
+@triton.jit
+def _deepgemm_compact_count_kernel(
+    topk_ids_ptr,
+    counts_ptr,
+    route_ranks_ptr,
+    num_routes,
+    num_experts: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    route_mask = offsets < num_routes
+    expert = tl.load(topk_ids_ptr + offsets, mask=route_mask, other=-1)
+    valid = route_mask & (expert >= 0) & (expert < num_experts)
+    safe_expert = tl.where(valid, expert, 0)
+    rank = tl.atomic_add(counts_ptr + safe_expert, 1, sem="relaxed", mask=valid)
+    tl.store(route_ranks_ptr + offsets, tl.where(valid, rank, -1), mask=route_mask)
+
+
+@triton.jit
+def _deepgemm_compact_prefix_sum_kernel(
+    counts_ptr,
+    padded_counts_ptr,
+    offsets_ptr,
+    num_experts: tl.constexpr,
+    block_m: tl.constexpr,
+    BLOCK_EXPERT_NUM: tl.constexpr,
+):
+    expert_offsets = tl.arange(0, BLOCK_EXPERT_NUM)
+    mask = expert_offsets < num_experts
+    counts = tl.load(counts_ptr + expert_offsets, mask=mask, other=0)
+    padded_counts = ((counts + block_m - 1) // block_m) * block_m
+    cumsum = tl.cumsum(padded_counts, 0)
+    tl.store(padded_counts_ptr + expert_offsets, padded_counts, mask=mask)
+    tl.store(offsets_ptr + expert_offsets, cumsum - padded_counts, mask=mask)
+
+
+def _deepgemm_compact_prefix_sum_musa(
+    counts: torch.Tensor,
+    num_local_experts: int,
+    block_m: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    padded_counts = torch.empty_like(counts)
+    offsets = torch.empty_like(counts)
+    if _is_musa and num_local_experts <= 1024:
+        _deepgemm_compact_prefix_sum_kernel[(1,)](
+            counts,
+            padded_counts,
+            offsets,
+            num_local_experts,
+            int(block_m),
+            BLOCK_EXPERT_NUM=triton.next_power_of_2(num_local_experts),
+        )
+    else:
+        padded_counts.copy_(
+            torch.div(
+                counts + block_m - 1,
+                block_m,
+                rounding_mode="floor",
+            )
+            * block_m
+        )
+        offsets.copy_(torch.cumsum(padded_counts, dim=0, dtype=torch.int32) - padded_counts)
+    return padded_counts, offsets
+
+
+@triton.jit
+def _deepgemm_static_cap_count_src2dst_kernel(
+    topk_ids_ptr,
+    counts_ptr,
+    src2dst_ptr,
+    overflow_flag_ptr,
+    num_routes,
+    num_experts: tl.constexpr,
+    cap_per_expert: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    route_mask = offsets < num_routes
+    expert = tl.load(topk_ids_ptr + offsets, mask=route_mask, other=-1)
+    valid = route_mask & (expert >= 0) & (expert < num_experts)
+    safe_expert = tl.where(valid, expert, 0)
+    rank = tl.atomic_add(counts_ptr + safe_expert, 1, sem="relaxed", mask=valid)
+    in_cap = valid & (rank < cap_per_expert)
+    dst = expert * cap_per_expert + rank
+    tl.store(src2dst_ptr + offsets, tl.where(in_cap, dst, -1), mask=route_mask)
+    overflow = tl.sum(tl.where(valid & ~in_cap, 1, 0), axis=0)
+    tl.atomic_add(overflow_flag_ptr, overflow, sem="relaxed", mask=overflow > 0)
+
+
+@triton.jit
+def _deepgemm_compact_fill_m_indices_kernel(
+    offsets_ptr,
+    padded_counts_ptr,
+    m_indices_ptr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    expert_id = tl.program_id(0)
+    block_id = tl.program_id(1)
+    rel = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    count = tl.load(padded_counts_ptr + expert_id)
+    start = tl.load(offsets_ptr + expert_id)
+    mask = rel < count
+    tl.store(m_indices_ptr + start + rel, expert_id, mask=mask)
+
+
+@triton.jit
+def _deepgemm_compact_fill_m_indices_fixed_bucket_kernel(
+    offsets_ptr,
+    padded_counts_ptr,
+    m_indices_ptr,
+    MAX_ROWS_PER_EXPERT: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    expert_id = tl.program_id(0)
+    vec = tl.arange(0, BLOCK_SIZE)
+    count = tl.load(padded_counts_ptr + expert_id)
+    start = tl.load(offsets_ptr + expert_id)
+
+    for block_start in tl.range(0, MAX_ROWS_PER_EXPERT, BLOCK_SIZE):
+        rel = block_start + vec
+        mask = rel < count
+        tl.store(m_indices_ptr + start + rel, expert_id, mask=mask)
+
+
+@triton.jit
+def _deepgemm_compact_fixed_bucket_init_kernel(
+    compact_scale_ptr,
+    m_indices_ptr,
+    total_rows,
+    scale_size: tl.constexpr,
+    default_expert: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_SCALE: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    scales = tl.arange(0, BLOCK_SCALE)
+    scale_mask = (rows[:, None] < total_rows) & (scales[None, :] < scale_size)
+    tl.store(
+        compact_scale_ptr + rows[:, None] * scale_size + scales[None, :],
+        0.0,
+        mask=scale_mask,
+    )
+    tl.store(m_indices_ptr + rows, default_expert, mask=rows < total_rows)
+
+
+@triton.jit
+def _deepgemm_compact_fill_m_indices_fixed_bucket_tp8_kernel(
+    offsets_ptr,
+    padded_counts_ptr,
+    m_indices_ptr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    expert_id = tl.program_id(0)
+    block_id = tl.program_id(1)
+    rel = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    count = tl.load(padded_counts_ptr + expert_id)
+    start = tl.load(offsets_ptr + expert_id)
+    mask = rel < count
+    tl.store(m_indices_ptr + start + rel, expert_id, mask=mask)
+
+
+@triton.jit
+def _deepgemm_compact_make_src2dst_kernel(
+    topk_ids_ptr,
+    offsets_ptr,
+    route_ranks_ptr,
+    src2dst_ptr,
+    num_routes,
+    num_experts: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    route_offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    route_mask = route_offsets < num_routes
+    expert = tl.load(topk_ids_ptr + route_offsets, mask=route_mask, other=-1)
+    rank = tl.load(route_ranks_ptr + route_offsets, mask=route_mask, other=-1)
+    valid = route_mask & (expert >= 0) & (expert < num_experts) & (rank >= 0)
+    safe_expert = tl.where(valid, expert, 0)
+    expert_start = tl.load(offsets_ptr + safe_expert, mask=valid, other=0)
+    dst = expert_start + rank
+    tl.store(src2dst_ptr + route_offsets, tl.where(valid, dst, -1), mask=route_mask)
+
+
+@triton.jit
+def _deepgemm_compact_scatter_kernel(
+    input_ptr,
+    scale_ptr,
+    compact_input_ptr,
+    compact_scale_ptr,
+    topk_ids_ptr,
+    offsets_ptr,
+    route_ranks_ptr,
+    src2dst_ptr,
+    num_experts: tl.constexpr,
+    topk: tl.constexpr,
+    hidden_size: tl.constexpr,
+    scale_size: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    src_ptr = input_ptr + token_id * hidden_size
+    scale_src_ptr = scale_ptr + token_id * scale_size
+    vec = tl.arange(0, BLOCK_SIZE)
+
+    for idx in range(topk):
+        route_id = token_id * topk + idx
+        expert_id = tl.load(topk_ids_ptr + route_id)
+        if expert_id >= 0:
+            if expert_id < num_experts:
+                route_rank = tl.load(route_ranks_ptr + route_id)
+                expert_start = tl.load(offsets_ptr + expert_id)
+                dst_idx = expert_start + route_rank
+                tl.store(src2dst_ptr + route_id, dst_idx)
+
+                dst_ptr = compact_input_ptr + dst_idx * hidden_size
+                for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+                    offset = start_offset + vec
+                    mask = offset < hidden_size
+                    data = tl.load(src_ptr + offset, mask=mask)
+                    tl.store(dst_ptr + offset, data, mask=mask)
+
+                scale_dst_ptr = compact_scale_ptr + dst_idx * scale_size
+                for start_offset in tl.range(0, scale_size, BLOCK_SIZE):
+                    offset = start_offset + vec
+                    mask = offset < scale_size
+                    scale = tl.load(scale_src_ptr + offset, mask=mask)
+                    tl.store(scale_dst_ptr + offset, scale, mask=mask)
+
+
+_DEEPGEMM_STATIC_CAP_M_INDICES_CACHE = {}
+_DEEPGEMM_COMPACT_FIXED_BUCKET_MIN_TOKENS = 8192
+_DEEPGEMM_COMPACT_FIXED_BUCKET_DEFAULT_MAX_TOKENS = 16384
+_DEEPGEMM_COMPACT_FIXED_BUCKET_HARD_MAX_TOKENS = 32768
+
+
+def _get_deepgemm_compact_fixed_bucket_max_tokens() -> int:
+    max_tokens = _DEEPGEMM_COMPACT_FIXED_BUCKET_DEFAULT_MAX_TOKENS
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        chunked_prefill_size = get_global_server_args().chunked_prefill_size
+    except Exception:
+        chunked_prefill_size = None
+
+    if chunked_prefill_size is not None and chunked_prefill_size > 0:
+        max_tokens = max(
+            max_tokens,
+            min(
+                int(chunked_prefill_size),
+                _DEEPGEMM_COMPACT_FIXED_BUCKET_HARD_MAX_TOKENS,
+            ),
+        )
+    return max_tokens
+
+
+def select_moe_ep_deepgemm_compact_fixed_bucket_rows_musa(
+    num_tokens: int,
+    num_local_experts: int,
+    top_k: int,
+    block_m: int | None = None,
+    chunked_prefill_size: int | None = None,
+) -> tuple[int, int] | None:
+    """Safe fixed-bucket compact rows for TP8 long-prefill chunks.
+
+    The bucket is an upper bound for exact compact rows:
+    sum(ceil(count_e / block_m) * block_m) <= routes + experts * (block_m - 1).
+    This avoids host-side sum/max .item() while preserving all routes.  Keep it
+    bounded to validated long chunks, and expand with the runtime
+    chunked-prefill size up to a conservative hard cap.
+    """
+
+    if not _is_musa:
+        return None
+    if num_local_experts != 256 or top_k != 6:
+        return None
+    if block_m is None:
+        block_m = deep_gemm_wrapper.DEEPGEMM_BLOCK_M
+    if chunked_prefill_size is None:
+        max_num_tokens = _get_deepgemm_compact_fixed_bucket_max_tokens()
+    elif chunked_prefill_size > 0:
+        max_num_tokens = max(
+            _DEEPGEMM_COMPACT_FIXED_BUCKET_DEFAULT_MAX_TOKENS,
+            min(
+                int(chunked_prefill_size),
+                _DEEPGEMM_COMPACT_FIXED_BUCKET_HARD_MAX_TOKENS,
+            ),
+        )
+    else:
+        max_num_tokens = _DEEPGEMM_COMPACT_FIXED_BUCKET_DEFAULT_MAX_TOKENS
+    if (
+        num_tokens < _DEEPGEMM_COMPACT_FIXED_BUCKET_MIN_TOKENS
+        or num_tokens > max_num_tokens
+    ):
+        return None
+    num_routes = int(num_tokens) * int(top_k)
+    bucket_rows = triton.cdiv(
+        num_routes + int(num_local_experts) * (int(block_m) - 1),
+        int(block_m),
+    ) * int(block_m)
+    # torch.topk returns unique experts for one token, so a single expert sees
+    # at most one route per token.  This bounds the fixed m_indices fill without
+    # reading padded_counts.max() back to host.
+    max_rows_per_expert = triton.cdiv(int(num_tokens), int(block_m)) * int(block_m)
+    return int(bucket_rows), int(max_rows_per_expert)
+
+
+def select_moe_ep_deepgemm_static_cap_tp8_musa(
+    num_tokens: int,
+    num_local_experts: int,
+    top_k: int,
+    chunked_prefill_size: int | None = 8192,
+) -> int | None:
+    """Benchmark-only TP8 static-cap table.
+
+    Serving dispatch intentionally does not call this helper yet: real TP8
+    routing can overflow small caps and must fall back to compact allocation.
+    """
+    if not _is_musa:
+        return None
+    if num_local_experts != 256 or top_k != 6:
+        return None
+    if chunked_prefill_size is None or chunked_prefill_size > 8192:
+        return None
+    if num_tokens < 3600 or num_tokens > 8192:
+        return None
+    return 128 if num_tokens <= 6144 else 256
+
+
+def _get_deepgemm_static_cap_m_indices_musa(
+    device: torch.device,
+    num_local_experts: int,
+    cap_per_expert: int,
+) -> torch.Tensor:
+    device_index = device.index
+    if device_index is None:
+        device_index = getattr(torch, "musa").current_device()
+    key = (device.type, int(device_index), int(num_local_experts), int(cap_per_expert))
+    cached = _DEEPGEMM_STATIC_CAP_M_INDICES_CACHE.get(key)
+    if cached is not None and cached.device == device:
+        return cached
+
+    m_indices = torch.arange(
+        num_local_experts, device=device, dtype=torch.int32
+    ).repeat_interleave(int(cap_per_expert)).contiguous()
+    _DEEPGEMM_STATIC_CAP_M_INDICES_CACHE[key] = m_indices
+    return m_indices
+
+
+def moe_ep_deepgemm_static_cap_preprocess_musa(
+    topk_ids: torch.Tensor,
+    num_local_experts: int,
+    hidden_states: torch.Tensor,
+    top_k: int,
+    block_shape,
+    cap_per_expert: int,
+    use_tilelang_quant_scatter: bool = True,
+    use_src2dst_count: bool = False,
+    zero_scales: bool = True,
+):
+    """Build a TP8 static-cap contiguous DeepGEMM input without prefix .item() sync.
+
+    Rows are laid out as expert_id * cap_per_expert + local_route_rank.  The
+    caller must check overflow_flag before trusting the result for unknown
+    routing distributions.
+    """
+    assert _is_musa, "static-cap DeepGEMM preprocess is MUSA-only"
+    assert hidden_states.dim() == 2
+    assert topk_ids.dim() == 2
+    assert topk_ids.shape[1] == top_k
+    if cap_per_expert <= 0:
+        raise ValueError(f"cap_per_expert must be positive, got {cap_per_expert}")
+
+    if block_shape is None:
+        block_shape = [128, 128]
+    assert len(block_shape) == 2
+    _, block_k = block_shape[0], block_shape[1]
+
+    num_tokens = hidden_states.shape[0]
+    hidden_size = hidden_states.shape[1]
+    num_routes = topk_ids.numel()
+    scale_size = hidden_size // block_k
+    all_tokens = int(num_local_experts) * int(cap_per_expert)
+
+    counts = torch.zeros(num_local_experts, device=topk_ids.device, dtype=torch.int32)
+    route_ranks = None
+
+    compact_input = torch.empty(
+        (all_tokens, hidden_size),
+        device=hidden_states.device,
+        dtype=torch.float8_e4m3fn,
+    )
+    compact_scale = torch.empty(
+        (all_tokens, scale_size),
+        device=hidden_states.device,
+        dtype=torch.float32,
+    )
+    if zero_scales:
+        compact_scale.zero_()
+
+    m_indices = _get_deepgemm_static_cap_m_indices_musa(
+        topk_ids.device, num_local_experts, cap_per_expert
+    )
+    src2dst = torch.empty_like(topk_ids, dtype=torch.int32)
+    overflow_flag = torch.zeros((1,), device=topk_ids.device, dtype=torch.int32)
+
+    grid = lambda meta: (triton.cdiv(num_routes, meta["BLOCK_SIZE"]),)
+    if use_src2dst_count:
+        _deepgemm_static_cap_count_src2dst_kernel[grid](
+            topk_ids,
+            counts,
+            src2dst,
+            overflow_flag,
+            num_routes,
+            num_local_experts,
+            cap_per_expert,
+            BLOCK_SIZE=256,
+        )
+    else:
+        route_ranks = torch.empty(num_routes, device=topk_ids.device, dtype=torch.int32)
+        _deepgemm_compact_count_kernel[grid](
+            topk_ids,
+            counts,
+            route_ranks,
+            num_routes,
+            num_local_experts,
+            BLOCK_SIZE=256,
+        )
+
+    used_tilelang = False
+    if use_tilelang_quant_scatter:
+        try:
+            if use_src2dst_count:
+                from sglang.srt.hardware_backend.layers.deepseek_v4_musa.ops.moe_prefill_ops import (
+                    try_moe_deepgemm_static_cap_src2dst_quant_scatter_tilelang_musa,
+                )
+
+                used_tilelang = try_moe_deepgemm_static_cap_src2dst_quant_scatter_tilelang_musa(
+                    hidden_states,
+                    compact_input,
+                    compact_scale,
+                    src2dst,
+                    top_k,
+                    block_k,
+                )
+            else:
+                from sglang.srt.hardware_backend.layers.deepseek_v4_musa.ops.moe_prefill_ops import (
+                    try_moe_deepgemm_static_cap_quant_scatter_tilelang_musa,
+                )
+
+                used_tilelang = try_moe_deepgemm_static_cap_quant_scatter_tilelang_musa(
+                    hidden_states,
+                    compact_input,
+                    compact_scale,
+                    topk_ids,
+                    route_ranks,
+                    src2dst,
+                    overflow_flag,
+                    num_local_experts,
+                    cap_per_expert,
+                    top_k,
+                    block_k,
+                )
+        except Exception:
+            used_tilelang = False
+
+    if not used_tilelang:
+        raise RuntimeError("static-cap DeepGEMM preprocess requires TileLang quant scatter")
+
+    return src2dst, compact_input, compact_scale, m_indices, all_tokens, overflow_flag
+
+
+def moe_ep_deepgemm_compact_preprocess_musa(
+    topk_ids: torch.Tensor,
+    num_local_experts: int,
+    hidden_states: torch.Tensor,
+    top_k: int,
+    block_shape,
+    use_tilelang_quant_scatter: bool = True,
+):
+    """Build a compact contiguous DeepGEMM input for large-M DSV4 MUSA prefill.
+
+    The allocation is bounded by valid local routes plus per-expert block-M
+    padding instead of all top-k routes or num_experts * max_m padding.
+    """
+    assert _is_musa, "compact DeepGEMM preprocess is MUSA-only"
+    assert hidden_states.dim() == 2
+    assert topk_ids.dim() == 2
+    assert topk_ids.shape[1] == top_k
+
+    if block_shape is None:
+        block_shape = [128, 128]
+    assert len(block_shape) == 2
+    _, block_k = block_shape[0], block_shape[1]
+
+    num_tokens = hidden_states.shape[0]
+    hidden_size = hidden_states.shape[1]
+    num_routes = topk_ids.numel()
+    block_m = deep_gemm_wrapper.DEEPGEMM_BLOCK_M
+
+    counts = torch.zeros(num_local_experts, device=topk_ids.device, dtype=torch.int32)
+    route_ranks = torch.empty(num_routes, device=topk_ids.device, dtype=torch.int32)
+    grid = lambda meta: (triton.cdiv(num_routes, meta["BLOCK_SIZE"]),)
+    _deepgemm_compact_count_kernel[grid](
+        topk_ids,
+        counts,
+        route_ranks,
+        num_routes,
+        num_local_experts,
+        BLOCK_SIZE=256,
+    )
+
+    padded_counts, offsets = _deepgemm_compact_prefix_sum_musa(
+        counts, num_local_experts, block_m
+    )
+
+    # DeepGEMM contiguous receives dense tensors whose row count is a Python
+    # allocation size.  For validated TP8 long-prefill chunks, use a safe fixed
+    # bucket to avoid host-side sum/max .item() synchronizations.
+    fixed_bucket = select_moe_ep_deepgemm_compact_fixed_bucket_rows_musa(
+        num_tokens,
+        num_local_experts,
+        top_k,
+        block_m,
+    )
+    if fixed_bucket is None:
+        raise RuntimeError(
+            "DSV4 MUSA compact DeepGEMM prefill requires fixed_bucket; "
+            "caller should fall back to the standard pre-permute path"
+        )
+    all_tokens, max_m_per_expert = fixed_bucket
+
+    scale_size = hidden_size // block_k
+    compact_input = torch.empty(
+        (all_tokens, hidden_size),
+        device=hidden_states.device,
+        dtype=torch.float8_e4m3fn,
+    )
+    compact_scale = torch.empty(
+        (all_tokens, scale_size),
+        device=hidden_states.device,
+        dtype=torch.float32,
+    )
+    m_indices = torch.empty(all_tokens, device=topk_ids.device, dtype=torch.int32)
+    if fixed_bucket is not None and all_tokens > 0:
+        # Padding rows are never gathered back.  Zero scales make unread FP8
+        # padding contribute zero if a grouped GEMM tail block consumes it.
+        # The same pass tags fixed-bucket tail rows as the last expert.
+        _deepgemm_compact_fixed_bucket_init_kernel[
+            (triton.cdiv(all_tokens, 16),)
+        ](
+            compact_scale,
+            m_indices,
+            all_tokens,
+            scale_size,
+            num_local_experts - 1,
+            BLOCK_ROWS=16,
+            BLOCK_SCALE=triton.next_power_of_2(scale_size),
+        )
+    else:
+        # MUSA muDNN does not support fill/zero for fp8 tensors, so zero scales
+        # instead of compact_input for exact compact padding rows.
+        compact_scale.zero_()
+    if all_tokens > 0:
+        if fixed_bucket is None:
+            fill_grid = (num_local_experts, triton.cdiv(max_m_per_expert, 256))
+            _deepgemm_compact_fill_m_indices_kernel[fill_grid](
+                offsets,
+                padded_counts,
+                m_indices,
+                BLOCK_SIZE=256,
+            )
+        else:
+            _deepgemm_compact_fill_m_indices_fixed_bucket_tp8_kernel[
+                (num_local_experts, triton.cdiv(max_m_per_expert, 1024))
+            ](
+                offsets,
+                padded_counts,
+                m_indices,
+                BLOCK_SIZE=1024,
+            )
+
+    src2dst = torch.empty_like(topk_ids, dtype=torch.int32)
+    used_tilelang = False
+    if use_tilelang_quant_scatter:
+        try:
+            from sglang.srt.hardware_backend.layers.deepseek_v4_musa.ops.moe_prefill_ops import (
+                try_moe_deepgemm_compact_quant_scatter_tilelang_musa,
+                try_moe_deepgemm_compact_src2dst_quant_scatter_tilelang_musa,
+            )
+
+            if fixed_bucket is not None:
+                make_src2dst_grid = (
+                    triton.cdiv(num_routes, 256),
+                )
+                _deepgemm_compact_make_src2dst_kernel[make_src2dst_grid](
+                    topk_ids,
+                    offsets,
+                    route_ranks,
+                    src2dst,
+                    num_routes,
+                    num_local_experts,
+                    BLOCK_SIZE=256,
+                )
+                used_tilelang = (
+                    try_moe_deepgemm_compact_src2dst_quant_scatter_tilelang_musa(
+                        hidden_states,
+                        compact_input,
+                        compact_scale,
+                        src2dst,
+                        top_k,
+                        block_k,
+                    )
+                )
+            if not used_tilelang:
+                used_tilelang = try_moe_deepgemm_compact_quant_scatter_tilelang_musa(
+                    hidden_states,
+                    compact_input,
+                    compact_scale,
+                    topk_ids,
+                    offsets,
+                    route_ranks,
+                    src2dst,
+                    num_local_experts,
+                    top_k,
+                    block_k,
+                )
+        except Exception:
+            used_tilelang = False
+
+    if not used_tilelang:
+        hidden_states_fp8, scale = per_token_group_quant_fp8(hidden_states, block_k)
+        compact_scale.zero_()
+        _deepgemm_compact_scatter_kernel[(num_tokens,)](
+            hidden_states_fp8,
+            scale,
+            compact_input,
+            compact_scale,
+            topk_ids,
+            offsets,
+            route_ranks,
+            src2dst,
+            num_local_experts,
+            top_k,
+            hidden_size,
+            scale_size,
+            BLOCK_SIZE=1024,
+        )
+
+    return src2dst, compact_input, compact_scale, m_indices, all_tokens
+
+
 def moe_ep_deepgemm_preprocess(
     topk_ids: torch.Tensor,
     num_local_experts: int,
