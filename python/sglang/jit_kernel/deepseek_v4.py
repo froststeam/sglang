@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Optional, Tuple, Union
 
 import torch
@@ -21,6 +22,23 @@ if TYPE_CHECKING:
 _linear_bf16_fp32_algo = envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.get()
 
 
+def _is_musa_tensor(tensor: torch.Tensor) -> bool:
+    return tensor.device.type == "musa"
+
+
+def _env_enabled(name: str, default: str = "1") -> bool:
+    return os.environ.get(name, default).strip().lower() not in ("0", "false", "off", "no")
+
+
+def _musa_tilelang_rope_enabled() -> bool:
+    # Keep TileLang RoPE opt-in until the MUSA graph-capture issue is fixed.
+    return _env_enabled("SGLANG_OPT_DSV4_MUSA_TILELANG_ROPE", default="0")
+
+
+def _musa_tilelang_compress_enabled() -> bool:
+    return _env_enabled("SGLANG_OPT_DSV4_MUSA_TILELANG_COMPRESS")
+
+
 def make_name(name: str) -> str:
     return f"dpsk_v4_{name}"
 
@@ -28,8 +46,8 @@ def make_name(name: str) -> str:
 @cache_once
 def _jit_common_module() -> Module:
     return load_jit(
-        make_name("common"),
-        cuda_files=["deepseek_v4/common.cuh"],
+        make_name(f"common"),
+        cuda_files=[f"deepseek_v4/common.cuh"],
         cuda_wrappers=[("plan_compress_prefill", "plan_compress_prefill")],
     )
 
@@ -71,6 +89,26 @@ def _jit_topk_module() -> Module:
         *args,
         cuda_files=["deepseek_v4/topk.cuh"],
         cuda_wrappers=[("topk_transform", f"TopK512Kernel<{args}>::transform")],
+    )
+
+
+@cache_once
+def _jit_topk_musa_module() -> Module:
+    return load_jit(
+        make_name("topk_musa"),
+        cuda_files=["deepseek_v4/topk_musa.cuh"],
+        cuda_wrappers=[("topk_transform", "MusaTopK512Kernel::transform")],
+        extra_cuda_cflags=["-use_fast_math"],
+    )
+
+
+@cache_once
+def _jit_topk1024_musa_module() -> Module:
+    return load_jit(
+        make_name("topk1024_musa"),
+        cuda_files=["deepseek_v4/topk_1024_musa.cuh"],
+        cuda_wrappers=[("topk_transform", "MusaTopK1024Kernel::transform")],
+        extra_cuda_cflags=["-use_fast_math"],
     )
 
 
@@ -171,9 +209,9 @@ def _jit_norm_rope_module(
 ) -> Module:
     args = make_cpp_args(dtype, head_dim, rope_dim, is_arch_support_pdl())
     return load_jit(
-        make_name("fused_norm_rope"),
+        make_name(f"fused_norm_rope"),
         *args,
-        cuda_files=["deepseek_v4/fused_norm_rope.cuh"],
+        cuda_files=[f"deepseek_v4/fused_norm_rope.cuh"],
         cuda_wrappers=[
             ("forward", f"FusedNormRopeKernel<{args}>::forward"),
         ],
@@ -311,6 +349,40 @@ def _jit_silu_and_mul_clamp_module(dtype: torch.dtype) -> Module:
     )
 
 
+# ---------------------------------------------------------------------------
+# Byte-equal fallbacks: when SGLANG_OPT_FIX_MEGA_MOE_MEMORY is off, route
+# silu_and_mul_masked_post_quant / silu_and_mul_clamp through these _tmp
+# modules, which load a copy of the optimize-branch kernel (different
+# precision behavior ??? bf16 silu roundtrip, expf, fp32 clamp).
+# ---------------------------------------------------------------------------
+
+
+@cache_once
+def _jit_silu_mul_quant_tmp_module(
+    quant_group_size: int, scale_ue8m0: bool, apply_swiglu_limit: bool
+) -> Module:
+    args = make_cpp_args(
+        quant_group_size, scale_ue8m0, is_arch_support_pdl(), apply_swiglu_limit
+    )
+    return load_jit(
+        make_name("silu_mul_quant_tmp"),
+        *args,
+        cuda_files=["deepseek_v4/silu_and_mul_masked_post_quant_tmp.cuh"],
+        cuda_wrappers=[("run", f"SiluAndMulMaskedPostQuantKernel<{args}>::run")],
+    )
+
+
+@cache_once
+def _jit_silu_and_mul_clamp_tmp_module(dtype: torch.dtype) -> Module:
+    args = make_cpp_args(dtype, is_arch_support_pdl())
+    return load_jit(
+        make_name("silu_and_mul_clamp_tmp"),
+        *args,
+        cuda_files=["deepseek_v4/silu_and_mul_masked_post_quant_tmp.cuh"],
+        cuda_wrappers=[("run", f"SiluAndMulClampKernel<{args}>::run")],
+    )
+
+
 @cache_once
 def _jit_mega_moe_pre_dispatch_module(quant_group_size: int) -> Module:
     args = make_cpp_args(quant_group_size, is_arch_support_pdl())
@@ -337,6 +409,18 @@ def hisparse_offload_to_host(
     gpu_indices: torch.Tensor,
     cpu_indices: torch.Tensor,
 ) -> None:
+    if (
+        _is_musa_tensor(gpu_ptrs)
+        or _is_musa_tensor(cpu_ptrs)
+        or _is_musa_tensor(gpu_indices)
+        or _is_musa_tensor(cpu_indices)
+    ):
+        from sglang.srt.hardware_backend.layers.deepseek_v4_musa_ops import (
+            hisparse_offload_to_host_musa,
+        )
+
+        hisparse_offload_to_host_musa(gpu_ptrs, cpu_ptrs, gpu_indices, cpu_indices)
+        return
     module = _jit_hisparse_transfer_module()
     module.hisparse_transfer(gpu_ptrs, cpu_ptrs, gpu_indices, cpu_indices)
 
@@ -349,6 +433,36 @@ def topk_transform_512(
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
+    if _is_musa_tensor(scores):
+        if (
+            envs.SGLANG_DEEPSEEK_V4_MUSA_ENABLE_JIT_TOPK512.get()
+            and out_page_indices.shape[1] == 512
+        ):
+            module = _jit_topk_musa_module()
+            module.topk_transform(
+                scores,
+                seq_lens,
+                page_tables,
+                out_page_indices,
+                page_size,
+                out_raw_indices,
+            )
+            return
+        if (
+            envs.SGLANG_DEEPSEEK_V4_MUSA_ENABLE_JIT_TOPK1024.get()
+            and out_page_indices.shape[1] == 1024
+        ):
+            module = _jit_topk1024_musa_module()
+            module.topk_transform(
+                scores,
+                seq_lens,
+                page_tables,
+                out_page_indices,
+                page_size,
+                out_raw_indices,
+            )
+            return
+
     if out_page_indices.shape[1] == 512:
         module = _jit_topk_module()
     else:
@@ -392,6 +506,8 @@ def topk_transform_512_v2(
     )
 
 
+
+
 def hash_topk(
     router_logits: torch.Tensor,
     input_ids: torch.Tensor,
@@ -400,6 +516,18 @@ def hash_topk(
     routed_scaling_factor: float = 1.0,
     scoring_func: str = "sqrtsoftplus",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    if _is_musa_tensor(router_logits):
+        from sglang.srt.hardware_backend.layers.deepseek_v4_musa_ops import hash_topk_musa
+
+        return hash_topk_musa(
+            router_logits,
+            input_ids,
+            tid2eid,
+            num_fused_shared_experts,
+            routed_scaling_factor,
+            scoring_func,
+        )
+
     assert scoring_func == "sqrtsoftplus"
     num_tokens = router_logits.size(0)
     topk_routed = tid2eid.size(1)
@@ -423,6 +551,11 @@ def hash_topk(
 
 
 def mask_topk_ids(topk_ids: torch.Tensor, num_token_non_padded: torch.Tensor):
+    if _is_musa_tensor(topk_ids):
+        from sglang.srt.hardware_backend.layers.deepseek_v4_musa_ops import mask_topk_ids_musa
+
+        return mask_topk_ids_musa(topk_ids, num_token_non_padded)
+
     return _jit_mask_topk_module().run(topk_ids, num_token_non_padded)
 
 
@@ -445,12 +578,14 @@ class CompressorPrefillPlan(NamedTuple):
         device: torch.device,
         use_cuda_graph: bool = False,
     ) -> CompressorPrefillPlan:
-        from sglang.srt.environ import envs
-
         # Online c128 keeps the same NamedTuple shape (compress_plan, write_plan)
         # so call sites that splat `*plan[1:]` continue to work, but the C++
         # plan struct semantics differ (last-token coords + window_len).
-        if compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+        if (
+            compress_ratio == 128
+            and not _is_musa_device(device)
+            and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+        ):
             return CompressorPrefillPlan._generate_online(
                 num_q_tokens=num_q_tokens,
                 seq_lens=seq_lens,
@@ -461,6 +596,16 @@ class CompressorPrefillPlan(NamedTuple):
         assert seq_lens.device == extend_lens.device
         seq_lens = seq_lens.to(torch.int64)
         extend_lens = extend_lens.to(torch.int64)
+        if (seq_lens.device.type == "musa" or _is_musa_device(device)) and os.environ.get(
+            "SGLANG_DSV4_MUSA_COMPRESS_PREFILL_PLAN_BACKEND", "jit"
+        ).lower() == "cpu":
+            return _musa_compress_prefill_plan(
+                compress_ratio,
+                num_q_tokens,
+                seq_lens,
+                extend_lens,
+                torch.device(device),
+            )
         plan_tensor = torch.empty(
             (2, num_q_tokens, 16),
             dtype=torch.uint8,
@@ -534,6 +679,67 @@ class CompressorDecodePlan(NamedTuple):
         return True
 
 
+def _is_musa_device(device: torch.device) -> bool:
+    if device is None:
+        return False
+    try:
+        return torch.device(device).type == "musa"
+    except (RuntimeError, TypeError):
+        return False
+
+
+def _pack_prefill_plan_rows(rows: list[tuple[int, int, int, int]], device: torch.device) -> torch.Tensor:
+    if not rows:
+        return torch.empty((0, 16), dtype=torch.uint8, device=device)
+    plan_u32 = torch.tensor(rows, dtype=torch.int32, device="cpu")
+    return plan_u32.view(torch.uint8).reshape(len(rows), 16).to(device, non_blocking=True)
+
+
+def _musa_compress_prefill_plan(
+    compress_ratio: Literal[4, 128],
+    num_q_tokens: int,
+    seq_lens: torch.Tensor,
+    extend_lens: torch.Tensor,
+    device: torch.device,
+) -> CompressorPrefillPlan:
+    assert seq_lens.shape == extend_lens.shape
+    seq_lens_cpu = seq_lens.to(device="cpu", dtype=torch.int64)
+    extend_lens_cpu = extend_lens.to(device="cpu", dtype=torch.int64)
+    is_overlap = compress_ratio == 4
+    effective_ratio = compress_ratio * (1 + int(is_overlap))
+    compress_rows: list[tuple[int, int, int, int]] = []
+    write_rows: list[tuple[int, int, int, int]] = []
+    counter = 0
+    for batch_id, (seq_len_tensor, extend_len_tensor) in enumerate(zip(seq_lens_cpu, extend_lens_cpu)):
+        seq_len = int(seq_len_tensor.item())
+        extend_len = int(extend_len_tensor.item())
+        assert 0 < extend_len <= seq_len
+        prefix_len = seq_len - extend_len
+        base_pos = seq_len // compress_ratio * compress_ratio
+        start_write_pos = base_pos
+        if is_overlap:
+            start_write_pos = base_pos - compress_ratio if base_pos >= compress_ratio else 0
+        for j in range(extend_len):
+            position = prefix_len + j
+            row = (
+                counter + j,
+                batch_id,
+                position,
+                effective_ratio - min(j + 1, effective_ratio),
+            )
+            if (position + 1) % compress_ratio == 0:
+                compress_rows.append(row)
+            if position >= start_write_pos:
+                write_rows.append(row)
+        counter += extend_len
+    assert counter == num_q_tokens, f"input size {counter} != num_q_tokens {num_q_tokens}"
+    return CompressorPrefillPlan(
+        compress_ratio,
+        _pack_prefill_plan_rows(compress_rows, device),
+        _pack_prefill_plan_rows(write_rows, device),
+    )
+
+
 def compress_plan(
     compress_ratio: Literal[4, 128],
     num_q_tokens: int,
@@ -541,6 +747,15 @@ def compress_plan(
     extend_lens: Optional[torch.Tensor],
     device: torch.device,
 ) -> Union[CompressorDecodePlan, CompressorPrefillPlan]:
+    if extend_lens is not None and _is_musa_device(device):
+        # Avoid CUDA JIT plan_prefill_host on MUSA; build the same byte-row layout locally.
+        return _musa_compress_prefill_plan(
+            compress_ratio,
+            num_q_tokens,
+            seq_lens,
+            extend_lens,
+            torch.device(device),
+        )
     if extend_lens is not None:
         return CompressorPrefillPlan.generate(
             compress_ratio,
@@ -569,6 +784,52 @@ def compress_forward(
     seq_lens: Optional[torch.Tensor] = None,
     extend_lens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if _is_musa_tensor(kv_score_input) and _musa_tilelang_compress_enabled():
+        assert head_dim % 128 == 0
+        num_q_tokens = kv_score_input.shape[0]
+        if out is None:
+            out = kv_score_input.new_empty((num_q_tokens, head_dim))
+        if plan is None:
+            assert seq_lens is not None
+            if extend_lens is not None:
+                plan = _musa_compress_prefill_plan(
+                    compress_ratio,
+                    num_q_tokens,
+                    seq_lens,
+                    extend_lens,
+                    kv_score_input.device,
+                )
+            else:
+                plan = compress_plan(
+                    compress_ratio,
+                    num_q_tokens,
+                    seq_lens,
+                    extend_lens,
+                    kv_score_input.device,
+                )
+        assert plan.compress_ratio == compress_ratio, "Mismatched compress ratio in plan!"
+
+        from sglang.srt.hardware_backend.layers.deepseek_v4_musa_ops import compress_forward_musa
+
+        try:
+            return compress_forward_musa(
+                kv_score_buffer,
+                kv_score_input,
+                ape,
+                indices,
+                plan,
+                extra_data,
+                head_dim=head_dim,
+                compress_ratio=compress_ratio,
+                out=out,
+            )
+        except NotImplementedError as exc:
+            raise NotImplementedError(
+                f"{exc}; "
+                f"compress_forward_plan_metadata="
+                f"{_compress_forward_musa_failure_metadata(kv_score_buffer, kv_score_input, ape, indices, plan, extra_data, out, head_dim, compress_ratio)}"
+            ) from exc
+
     assert head_dim % 128 == 0
     num_q_tokens = kv_score_input.shape[0]
     if out is None:
@@ -595,9 +856,75 @@ def compress_forward(
         out.dtype,
         compress_ratio,
     )
-    F = module.decode if plan.is_decode else module.prefill
+    F = module.decode if isinstance(plan, CompressorDecodePlan) else module.prefill
     F(kv_score_buffer, kv_score_input, out, ape, indices, *plan[1:], extra_data)
     return out
+
+
+def _deepseek_v4_tensor_metadata(name: str, tensor: torch.Tensor) -> str:
+    return (
+        f"{name}=device:{tensor.device},dtype:{tensor.dtype},shape:{tuple(tensor.shape)},"
+        f"stride:{tensor.stride()},contiguous:{tensor.is_contiguous()}"
+    )
+
+
+def _deepseek_v4_optional_tensor_metadata(name: str, tensor: Optional[torch.Tensor]) -> str:
+    if tensor is None:
+        return f"{name}=None"
+    return _deepseek_v4_tensor_metadata(name, tensor)
+
+
+def _deepseek_v4_plan_metadata(
+    plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
+) -> list[str]:
+    fields = [f"plan_type={type(plan).__name__}"]
+    for field in getattr(plan, "_fields", ()):  # NamedTuple plan metadata.
+        value = getattr(plan, field)
+        if isinstance(value, torch.Tensor):
+            fields.append(_deepseek_v4_tensor_metadata(f"plan.{field}", value))
+        else:
+            fields.append(f"plan.{field}={value}")
+    return fields
+
+
+def _compress_forward_musa_failure_metadata(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    ape: torch.Tensor,
+    indices: torch.Tensor,
+    plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
+    extra_data: Optional[torch.Tensor],
+    out: torch.Tensor,
+    head_dim: int,
+    compress_ratio: Literal[4, 128],
+) -> str:
+    fields = [
+        *_deepseek_v4_plan_metadata(plan),
+        _deepseek_v4_tensor_metadata("kv_score_buffer", kv_score_buffer),
+        _deepseek_v4_tensor_metadata("kv_score_input", kv_score_input),
+        _deepseek_v4_tensor_metadata("ape", ape),
+        _deepseek_v4_tensor_metadata("indices", indices),
+        _deepseek_v4_optional_tensor_metadata("extra_data", extra_data),
+        _deepseek_v4_tensor_metadata("out", out),
+        f"head_dim={head_dim}",
+        f"compress_ratio={compress_ratio}",
+    ]
+    return "; ".join(fields)
+
+
+def _compress_fused_norm_rope_musa_failure_metadata(
+    kv: torch.Tensor,
+    weight: torch.Tensor,
+    freq_cis: torch.Tensor,
+    plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
+) -> str:
+    fields = [
+        *_deepseek_v4_plan_metadata(plan),
+        _deepseek_v4_tensor_metadata("kv", kv),
+        _deepseek_v4_tensor_metadata("weight", weight),
+        _deepseek_v4_tensor_metadata("freq_cis", freq_cis),
+    ]
+    return "; ".join(fields)
 
 
 def compress_fused_norm_rope_inplace(
@@ -607,6 +934,31 @@ def compress_fused_norm_rope_inplace(
     freq_cis: torch.Tensor,
     plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
 ) -> None:
+    if _is_musa_tensor(kv) and _musa_tilelang_compress_enabled() and _musa_tilelang_rope_enabled():
+        from sglang.srt.hardware_backend.layers.deepseek_v4_musa_ops import (
+            compress_fused_norm_rope_inplace_musa,
+            compress_fused_norm_rope_prefill_inplace_musa,
+        )
+
+        if isinstance(plan, CompressorPrefillPlan):
+            compress_fused_norm_rope_prefill_inplace_musa(
+                kv,
+                weight,
+                eps,
+                freq_cis,
+                plan.compress_plan,
+            )
+            return
+
+        try:
+            compress_fused_norm_rope_inplace_musa(kv, weight, eps, freq_cis, plan.seq_lens, plan.compress_ratio)
+        except NotImplementedError as exc:
+            raise NotImplementedError(
+                f"{exc}; "
+                f"decode_plan_metadata={_compress_fused_norm_rope_musa_failure_metadata(kv, weight, freq_cis, plan)}"
+            ) from exc
+        return
+
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     module = _jit_norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
     module.forward(
@@ -614,7 +966,7 @@ def compress_fused_norm_rope_inplace(
         weight,
         plan[1],
         freq_cis,
-        int(plan.is_decode),
+        1 if isinstance(plan, CompressorDecodePlan) else 0,
         eps,
         plan.compress_ratio,
     )
@@ -627,6 +979,14 @@ def fused_norm_rope_inplace(
     freq_cis: torch.Tensor,
     positions: torch.Tensor,
 ) -> None:
+    if _is_musa_tensor(kv) and _musa_tilelang_rope_enabled():
+        from sglang.srt.hardware_backend.layers.deepseek_v4_musa_ops import (
+            fused_norm_rope_inplace_musa,
+        )
+
+        fused_norm_rope_inplace_musa(kv, weight, eps, freq_cis, positions)
+        return
+
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     module = _jit_norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
     module.forward(
@@ -647,6 +1007,12 @@ def fused_rope(
     positions: torch.Tensor,
     inverse: bool = False,
 ) -> None:
+    if _is_musa_tensor(q) and _musa_tilelang_rope_enabled():
+        from sglang.srt.hardware_backend.layers.deepseek_v4_musa_ops import fused_rope_musa
+
+        fused_rope_musa(q, k, freqs_cis, positions, inverse)
+        return
+
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
     module = _jit_fused_rope_module()
     module.forward(q, k, freqs_real, positions, inverse)
@@ -708,6 +1074,82 @@ def fused_k_norm_rope_flashmla(
     module.forward(kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps)
 
 
+@cache_once
+def _tilelang_make_swa_indices_kernel(swa_window_size: int, threads: int = 128) -> Any:
+    import tilelang
+    import tilelang.language as T
+
+    batch_size = T.dynamic("batch_size")
+    batch_size_plus_1 = T.dynamic("batch_size_plus_1")
+    num_q_tokens = T.dynamic("num_q_tokens")
+    num_warps = threads // 32
+    assert swa_window_size % 32 == 0
+
+    @tilelang.jit
+    def make_swa_prefill_indices(
+        seq_lens_k: T.Tensor[(batch_size,), T.int32],
+        seq_lens_q: T.Tensor[(batch_size,), T.int32],
+        cu_seqlens_q: T.Tensor[(batch_size_plus_1,), T.int32],
+        swa_indices: T.Tensor[(num_q_tokens, swa_window_size), T.int32],
+    ):
+        _ = batch_size_plus_1
+        with T.Kernel(T.ceildiv(num_q_tokens, num_warps), threads=threads) as bx:
+            tx = T.get_thread_binding()
+            warp_id = tx // 32
+            lane_id = tx % 32
+            s_batch_id = T.alloc_shared((num_warps,), dtype=T.int32)
+
+            token_id = warp_id + bx * num_warps
+            if token_id >= num_q_tokens:
+                return
+            for i in T.serial(0, batch_size, step=32):
+                j = i + lane_id
+                if cu_seqlens_q[j] <= token_id < cu_seqlens_q[j + 1]:
+                    s_batch_id[warp_id] = j
+            T.sync_warp()
+
+            seq_idx = s_batch_id[warp_id]
+            kv_len = seq_lens_k[seq_idx]
+            qo_len = seq_lens_q[seq_idx]
+            cum_qo_len = cu_seqlens_q[seq_idx]
+            prefix_len = kv_len - qo_len
+            curr_seq_qo_idx = token_id - cum_qo_len
+            end_abs_pos = prefix_len + curr_seq_qo_idx + 1
+            start_abs_pos = T.max(end_abs_pos - swa_window_size, 0)
+            old_kv_start = seq_idx * swa_window_size
+            new_kv_start = batch_size * swa_window_size + cum_qo_len
+
+            for i in T.unroll(0, swa_window_size, step=32):
+                j = i + lane_id
+                abs_pos = start_abs_pos + j
+                swa_indices[token_id, j] = T.if_then_else(
+                    abs_pos < end_abs_pos,
+                    T.if_then_else(
+                        abs_pos < prefix_len,
+                        old_kv_start + abs_pos % swa_window_size,
+                        new_kv_start + (abs_pos - prefix_len),
+                    ),
+                    -1,
+                )
+
+    return make_swa_prefill_indices
+
+
+def tilelang_make_swa_prefill_indices(
+    seq_lens_k: torch.Tensor,
+    seq_lens_q: torch.Tensor,
+    swa_indices: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if cu_seqlens_q is None:
+        cu_seqlens_q = torch.cumsum(seq_lens_q, dim=0, dtype=torch.int32)
+        cu_seqlens_q = torch.nn.functional.pad(cu_seqlens_q, (1, 0), value=0)
+    swa_window_size = swa_indices.shape[1]
+    kernel = _tilelang_make_swa_indices_kernel(swa_window_size)
+    kernel(seq_lens_k, seq_lens_q, cu_seqlens_q, swa_indices)
+    return swa_indices
+
+
 @triton.jit
 def create_paged_compress_data_kernel(
     req_pool_indices_ptr,
@@ -759,8 +1201,8 @@ def create_paged_compress_data_kernel(
         pos = tl.maximum(pos, 0)
         loc = tl.load(
             req_to_token_ptr
-            + rid.to(tl.int64) * stride_req_to_token_0
-            + pos.to(tl.int64) * stride_req_to_token_1,
+            + rid * stride_req_to_token_0
+            + pos * stride_req_to_token_1,
             mask=mask,
             other=0,
         ).to(tl.int32)
@@ -830,7 +1272,6 @@ def triton_create_paged_compress_data(
         ring_size=ring_size,
         BLOCK=block,
     )
-
     if not is_overlap:
         out_1.squeeze_(1)
     return out_0, out_1
@@ -844,6 +1285,18 @@ def fused_store_cache(
     page_size: int,
     type: Literal["flashmla", "indexer"],
 ) -> None:
+    if _is_musa_tensor(input):
+        from sglang.srt.hardware_backend.layers.deepseek_v4_musa_ops import fused_store_cache_musa
+
+        fused_store_cache_musa(
+            input,
+            cache,
+            indices,
+            page_size=page_size,
+            type=type,
+        )
+        return
+
     module = _jit_fused_store_module(
         name=type,
         input_dtype=input.dtype,
@@ -853,12 +1306,35 @@ def fused_store_cache(
     module.run(input, cache, indices)
 
 
+def _musa_swiglu_quant_enabled() -> bool:
+    return os.environ.get("SGLANG_DSV4_MUSA_SWIGLU_QUANT_OPT_IN", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def silu_and_mul_clamp(
     input: torch.Tensor,
     output: torch.Tensor,
     swiglu_limit: float,
 ) -> None:
-    module = _jit_silu_and_mul_clamp_module(input.dtype)
+    if _is_musa_tensor(input) and _musa_swiglu_quant_enabled():
+        from sglang.srt.hardware_backend.layers.deepseek_v4_musa_ops import silu_and_mul_clamp_musa
+
+        silu_and_mul_clamp_musa(input, output, swiglu_limit)
+        return
+
+    # Fallback path is hacky on purpose: when the mega-moe-memory flag is off
+    # we must be bitwise-identical to the optimize branch, which used the
+    # pre-refactor kernel.
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
+        module = _jit_silu_and_mul_clamp_module(input.dtype)
+    else:
+        module = _jit_silu_and_mul_clamp_tmp_module(input.dtype)
     module.run(input, output, float(swiglu_limit))
 
 
@@ -874,10 +1350,19 @@ def silu_and_mul_masked_post_quant(
     swiglu_limit: Optional[float] = None,
     swizzle: bool = False,
 ) -> None:
+    # Keep masked MoE SwiGLU quant on the original JIT path. The current
+    # TileKernels opt-in packs expert rows via bool-mask indexing, which lowers
+    # to aten::nonzero on MUSA and adds D2H count syncs in EP decode.
+
     apply_swiglu_limit = swiglu_limit is not None
-    module = _jit_silu_mul_quant_varlen_module(
-        quant_group_size, scale_ue8m0, swizzle, apply_swiglu_limit
-    )
+    if swizzle:
+        module = _jit_silu_mul_quant_varlen_module(
+            quant_group_size, scale_ue8m0, swizzle, apply_swiglu_limit
+        )
+    else:
+        module = _jit_silu_mul_quant_tmp_module(
+            quant_group_size, scale_ue8m0, apply_swiglu_limit
+        )
     module.run(
         input,
         output,
@@ -899,6 +1384,23 @@ def silu_and_mul_contig_post_quant(
     swiglu_limit: Optional[float] = None,
     swizzle: bool = False,
 ) -> None:
+    if _is_musa_tensor(input) and _musa_swiglu_quant_enabled():
+        from sglang.srt.hardware_backend.layers.deepseek_v4_musa_ops import (
+            silu_and_mul_contig_post_quant_musa,
+        )
+
+        silu_and_mul_contig_post_quant_musa(
+            input,
+            output,
+            output_scale,
+            quant_group_size,
+            scale_ue8m0,
+            transposed,
+            swiglu_limit,
+            swizzle,
+        )
+        return
+
     apply_swiglu_limit = swiglu_limit is not None
     module = _jit_silu_mul_quant_contig_module(
         quant_group_size, scale_ue8m0, swizzle, apply_swiglu_limit
@@ -935,6 +1437,13 @@ def mega_moe_pre_dispatch(
 
 
 def get_paged_mqa_logits_metadata(seq_lens: torch.Tensor, page_size: int, num_sm: int):
+    if _is_musa_tensor(seq_lens):
+        from sglang.srt.hardware_backend.layers.deepseek_v4_musa_ops import (
+            get_paged_mqa_logits_metadata_musa,
+        )
+
+        return get_paged_mqa_logits_metadata_musa(seq_lens, page_size, num_sm)
+
     assert page_size == 64
     seq_lens = seq_lens.view(-1).to(torch.int32)
     metadata = seq_lens.new_empty(num_sm + 1, 2)
@@ -946,6 +1455,17 @@ def get_paged_mqa_logits_metadata(seq_lens: torch.Tensor, page_size: int, num_sm
 def rmsnorm_self(
     q: torch.Tensor, eps: float, out: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
+    if _is_musa_tensor(q):
+        from sglang.srt.hardware_backend.layers.deepseek_v4_musa_ops import (
+            rmsnorm_self_musa,
+        )
+
+        result = rmsnorm_self_musa(q, eps)
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
+
     module = _jit_rmsnorm_head_module(q.shape[-1], q.dtype)
     if out is None:
         out = q.new_empty(q.shape)
@@ -1014,7 +1534,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
 
 def linear_bf16_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    return _dispatch_bf16_fp32_backend(x, y, algo=_linear_bf16_fp32_algo)
+    # TODO(dsv4-musa): add a real MUSA bf16xbf16->fp32 GEMM backend. The CUDA
+    # backends below are cublas/deep_gemm-specific; production MUSA runs should
+    # only use a known MUSA-safe backend or an explicitly accepted fallback.
+    # if _is_musa_tensor(x):
+    #     from sglang.srt.hardware_backend.layers.deepseek_v4_musa_ops import linear_bf16_fp32_musa
+    #
+    #     return linear_bf16_fp32_musa(x, y)
+
+    from sglang.srt.environ import envs
+
+    algo = envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.get()
+
+    if algo == "auto":
+        from sglang.srt.layers.linear_bf16_fp32.selector import pick_backend
+
+        algo = pick_backend(m=x.size(0), n=y.size(0), k=x.size(1))
+
+    return _dispatch_bf16_fp32_backend(x, y, algo=algo)
 
 
 def _dispatch_bf16_fp32_backend(
@@ -1027,5 +1564,113 @@ def _dispatch_bf16_fp32_backend(
         z = torch.empty(x.size(0), y.size(0), dtype=torch.float32, device=x.device)
         deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, y, z)
         return z
+    elif algo in ("torch", "mudnn", "tilelang_musa"):
+        return torch.nn.functional.linear(x.float(), y.float())
     else:
         return torch.nn.functional.linear(x.float(), y.float())
+
+
+def _compile_one(*input_tuple) -> None:
+    name, job_fn, *args = input_tuple
+    print(f"Compiling {name}...", flush=True)
+    job_fn(*args)
+    print(f"Finished compiling {name}.", flush=True)
+
+
+def compile_aot():
+    c_dtype = torch.float32
+    jobs = [
+        ("cublas", _jit_torch_cublas_bf16_fp32),
+        ("common", _jit_common_module),
+        ("mask_topk", _jit_mask_topk_module),
+        ("topk", _jit_topk_module),
+        ("topk_v2", _jit_topk_v2_module),
+        ("hash_topk", _jit_hash_topk_module),
+        ("rope", _jit_fused_rope_module),
+        ("metadata", _jit_metadata_module),
+        (
+            "compress_128_4",
+            _jit_compress_module,
+            128,
+            c_dtype,
+            c_dtype,
+            4,
+        ),
+        (
+            "compress_512_4",
+            _jit_compress_module,
+            512,
+            c_dtype,
+            c_dtype,
+            4,
+        ),
+        (
+            "compress_512_128",
+            _jit_compress_module,
+            512,
+            c_dtype,
+            c_dtype,
+            128,
+        ),
+        (
+            "norm_rope_128_64",
+            _jit_norm_rope_module,
+            c_dtype,
+            128,
+            64,
+        ),
+        (
+            "norm_rope_512_64",
+            _jit_norm_rope_module,
+            c_dtype,
+            512,
+            64,
+        ),
+        (
+            "store_flashmla_bf16_swa_256",
+            _jit_fused_store_module,
+            "flashmla",
+            torch.bfloat16,
+            torch.int32,
+            256,
+        ),
+        (
+            "store_flashmla_fp32_c4_64",
+            _jit_fused_store_module,
+            "flashmla",
+            torch.float32,
+            torch.int32,
+            64,
+        ),
+        (
+            "store_flashmla_fp32_c128_2",
+            _jit_fused_store_module,
+            "flashmla",
+            torch.float32,
+            torch.int32,
+            2,
+        ),
+        (
+            "store_indexer_fp32_c4_64",
+            _jit_fused_store_module,
+            "indexer",
+            torch.float32,
+            torch.int32,
+            64,
+        ),
+        (
+            "rmsnorm_head_512_bf16",
+            _jit_rmsnorm_head_module,
+            512,
+            torch.bfloat16,
+        ),
+    ]
+    import multiprocessing
+
+    max_parallel_jobs = min(len(jobs), multiprocessing.cpu_count())
+    with multiprocessing.Pool(processes=max_parallel_jobs) as pool:
+        pool.starmap(_compile_one, jobs)
+
+
+if __name__ == "__main__":
+    compile_aot()

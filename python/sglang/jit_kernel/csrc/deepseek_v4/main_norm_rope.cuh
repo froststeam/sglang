@@ -323,9 +323,9 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
 
 template <typename DType, int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, bool kUsePDL>
 struct FusedKNormRopeFlashMLAKernel {
-  static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
+  static constexpr int32_t kLogPageSize = host::countr_zero(kPageSize);
   static constexpr int64_t kPageBytes = host::div_ceil(584 * kPageSize, 576) * 576;
-  static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
+  static_assert(host::has_single_bit(kPageSize), "kPageSize must be a power of 2");
   static_assert(1 << kLogPageSize == kPageSize);
   static_assert(kHeadDim == 512 && kRopeDim == 64, "FlashMLA layout requires (512, 64)");
 

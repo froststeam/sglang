@@ -832,7 +832,7 @@ def kimi_k2_biased_topk_impl(
     return topk_weights, topk_ids
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=(_is_npu or _is_musa))
 def biased_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -921,6 +921,67 @@ def biased_topk_jit_kernel_impl(
         routed_scaling_factor=routed_scaling_factor,
         apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
     )
+    topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    return topk_weights, topk_ids
+
+
+def biased_topk_tilelang_musa_impl(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    scoring_func: str = "sqrtsoftplus",
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: Optional[float] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    apply_routed_scaling_factor_on_output: Optional[bool] = False,
+):
+    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+
+    from sglang.srt.hardware_backend.layers.deepseek_v4_musa.ops import (
+        tilelang_moe_fused_gate_musa,
+    )
+
+    result = tilelang_moe_fused_gate_musa(
+        gating_output,
+        correction_bias,
+        topk=topk,
+        scoring_func=scoring_func,
+        num_fused_shared_experts=num_fused_shared_experts,
+        renormalize=renormalize,
+        routed_scaling_factor=routed_scaling_factor,
+        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+    )
+    if result is None:
+        if gating_output.device.type == "musa":
+            from sglang.srt.hardware_backend.layers.deepseek_v4_musa.ops import (
+                _musa_graph_capture_enabled,
+            )
+
+            if _musa_graph_capture_enabled():
+                raise NotImplementedError(
+                    "DeepSeekV4 MUSA moe_fused_gate TileLang miss during graph capture; "
+                    "fallback to the original torch topk path is disabled in graph"
+                )
+        return biased_topk_impl(
+            hidden_states=hidden_states,
+            gating_output=gating_output,
+            correction_bias=correction_bias,
+            topk=topk,
+            renormalize=renormalize,
+            scoring_func=scoring_func,
+            num_fused_shared_experts=num_fused_shared_experts,
+            routed_scaling_factor=routed_scaling_factor,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        )
+
+    topk_weights, topk_ids = result
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
@@ -1459,11 +1520,14 @@ def select_experts(
     elif custom_routing_function is None:
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         if scoring_func == "sqrtsoftplus":
-            _biased_topk = (
-                biased_topk_jit_kernel_impl
-                if envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get()
-                else biased_topk_impl
-            )
+            if _is_musa and envs.SGLANG_OPT_USE_TILELANG_MOE_FUSED_GATE.get():
+                _biased_topk = biased_topk_tilelang_musa_impl
+            else:
+                _biased_topk = (
+                    biased_topk_jit_kernel_impl
+                    if envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get()
+                    else biased_topk_impl
+                )
 
             topk_weights, topk_ids = _biased_topk(
                 hidden_states=hidden_states,

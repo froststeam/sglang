@@ -11,7 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <cuda_runtime.h>
+#include <musa_runtime.h>
 #include <type_traits>
 
 namespace {

@@ -33,8 +33,8 @@ using ExternHandle = tvm::ffi::Array<char>;
 
 inline ExternHandle to_extern_handle(void* ptr) {
   ExternHandle array;
-  cudaIpcMemHandle_t handle;
-  RuntimeDeviceCheck(cudaIpcGetMemHandle(&handle, ptr));
+  musaIpcMemHandle_t handle;
+  RuntimeDeviceCheck(musaIpcGetMemHandle(&handle, ptr));
   for (size_t i = 0; i < sizeof(handle); ++i) {
     array.push_back(handle.reserved[i]);
   }
@@ -42,24 +42,24 @@ inline ExternHandle to_extern_handle(void* ptr) {
 }
 
 inline void* from_extern_handle(const ExternHandle& array) {
-  cudaIpcMemHandle_t handle;
+  musaIpcMemHandle_t handle;
   RuntimeCheck(array.size() == sizeof(handle), "Invalid IPC handle size: ", array.size());
   for (size_t i = 0; i < sizeof(handle); ++i) {
     handle.reserved[i] = array[i];
   }
   void* ptr;
-  RuntimeDeviceCheck(cudaIpcOpenMemHandle(&ptr, handle, cudaIpcMemLazyEnablePeerAccess));
+  RuntimeDeviceCheck(musaIpcOpenMemHandle(&ptr, handle, musaIpcMemLazyEnablePeerAccess));
   return ptr;
 }
 
 struct HandleHash {
-  std::size_t operator()(const cudaIpcMemHandle_t& handle) const {
+  std::size_t operator()(const musaIpcMemHandle_t& handle) const {
     return std::hash<std::string_view>{}({handle.reserved, sizeof(handle.reserved)});
   }
 };
 
 struct HandleEqual {
-  bool operator()(const cudaIpcMemHandle_t& a, const cudaIpcMemHandle_t& b) const {
+  bool operator()(const musaIpcMemHandle_t& a, const musaIpcMemHandle_t& b) const {
     return std::memcmp(a.reserved, b.reserved, sizeof(a.reserved)) == 0;
   }
 };
@@ -100,7 +100,7 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
     const int64_t push_buffer_size_all = push_all_ranks_bytes();
     RuntimeCheck(pull_buffer_size <= kU32Max, "Pull buffer size is too large: ", pull_buffer_size);
     RuntimeCheck(push_buffer_size_all <= kU32Max, "Push buffer size is too large: ", push_buffer_size_all);
-    RuntimeDeviceCheck(cudaMalloc(&m_storage, storage_bytes()));
+    RuntimeDeviceCheck(musaMalloc(&m_storage, storage_bytes()));
   }
 
   ExternHandle share_storage() {
@@ -123,7 +123,7 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
     for (const auto ptr : std::span(m_graph_capture_inputs).subspan(m_cum_registered_count)) {
       // note: must share the base address of each allocation, or we get wrong address
       void* base_ptr;
-      const auto cu_result = cuPointerGetAttribute(&base_ptr, CU_POINTER_ATTRIBUTE_RANGE_START_ADDR, (CUdeviceptr)ptr);
+      const auto cu_result = muPointerGetAttribute(&base_ptr, MU_POINTER_ATTRIBUTE_RANGE_START_ADDR, (MUdeviceptr)ptr);
       RuntimeCheck(cu_result == CUDA_SUCCESS, "failed to get pointer attr");
       const auto offset = reinterpret_cast<char*>(ptr) - reinterpret_cast<char*>(base_ptr);
       result.push_back(InputPair{offset, get_handle(base_ptr)});
@@ -144,7 +144,7 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
 
     // set signal buffer to zero
     const auto pull_signal = get_pull_signal(m_storage);
-    RuntimeDeviceCheck(cudaMemset(pull_signal, 0, pull_signal_bytes()));
+    RuntimeDeviceCheck(musaMemset(pull_signal, 0, pull_signal_bytes()));
 
     // update the pull controller and data pointer
     RuntimeCheck(!m_pull_ctrl.has_value(), "Controller is already initialized");
@@ -154,15 +154,15 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
       data.input[i] = get_pull_buffer(m_peer_storage[i]);
     }
     const auto default_data_ptr = get_data_ptr();
-    RuntimeDeviceCheck(cudaMemcpy(default_data_ptr, &data, sizeof(AllReduceData), cudaMemcpyHostToDevice));
+    RuntimeDeviceCheck(musaMemcpy(default_data_ptr, &data, sizeof(AllReduceData), musaMemcpyHostToDevice));
 
     // update the push controller and data pointer
     RuntimeCheck(!m_push_ctrl.has_value(), "Controller is already initialized");
     const auto push_signal = get_push_signal(m_storage);
-    RuntimeDeviceCheck(cudaMemset(push_signal, 0, push_signal_bytes()));
+    RuntimeDeviceCheck(musaMemset(push_signal, 0, push_signal_bytes()));
     m_push_ctrl.emplace(push_signal);
     const auto push_buffer = get_push_buffer(m_storage);
-    RuntimeDeviceCheck(cudaMemset(push_buffer, 0, push_all_ranks_bytes()));
+    RuntimeDeviceCheck(musaMemset(push_buffer, 0, push_all_ranks_bytes()));
   }
 
   void register_inputs(tvm::ffi::Array<tvm::ffi::Array<InputPair>> ipc_graph_inputs) {
@@ -173,14 +173,14 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
     std::vector<AllReduceData> data;
     data.resize(new_registered_count);
     const auto open_cached = [&](const ExternHandle& h) -> void* {
-      RuntimeCheck(h.size() == sizeof(cudaIpcMemHandle_t), "Invalid IPC handle size: ", h.size());
-      cudaIpcMemHandle_t handle;
+      RuntimeCheck(h.size() == sizeof(musaIpcMemHandle_t), "Invalid IPC handle size: ", h.size());
+      musaIpcMemHandle_t handle;
       for (size_t i = 0; i < sizeof(handle); ++i)
         handle.reserved[i] = h[i];
       const auto [it, success] = m_ipc_cache.try_emplace(handle, nullptr);
       if (success) {
         void* ptr;
-        RuntimeDeviceCheck(cudaIpcOpenMemHandle(&ptr, handle, cudaIpcMemLazyEnablePeerAccess));
+        RuntimeDeviceCheck(musaIpcOpenMemHandle(&ptr, handle, musaIpcMemLazyEnablePeerAccess));
         it->second = ptr;
       }
       return it->second;
@@ -206,7 +206,7 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
     const auto new_registered_bytes = sizeof(AllReduceData) * new_registered_count;
     const auto dst_ptr = get_data_ptr(m_cum_registered_count);
     m_cum_registered_count += new_registered_count;
-    RuntimeDeviceCheck(cudaMemcpy(dst_ptr, data.data(), new_registered_bytes, cudaMemcpyHostToDevice));
+    RuntimeDeviceCheck(musaMemcpy(dst_ptr, data.data(), new_registered_bytes, musaMemcpyHostToDevice));
   }
 
   void set_cuda_graph_capture(bool enabled) {
@@ -215,13 +215,13 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
 
   void free_ipc_handles() {
     for (const auto& pair : m_ipc_cache) {
-      host::RuntimeDeviceCheck(cudaIpcCloseMemHandle(pair.second));
+      host::RuntimeDeviceCheck(musaIpcCloseMemHandle(pair.second));
     }
     m_ipc_cache.clear();
   }
 
   void free_storage() {
-    host::RuntimeDeviceCheck(cudaFree(m_storage));
+    host::RuntimeDeviceCheck(musaFree(m_storage));
     m_storage = nullptr;
   }
 
@@ -317,7 +317,7 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
   void* m_storage = nullptr;
   std::vector<void*> m_graph_capture_inputs;
   std::vector<void*> m_peer_storage;
-  std::unordered_map<cudaIpcMemHandle_t, void*, HandleHash, HandleEqual> m_ipc_cache;
+  std::unordered_map<musaIpcMemHandle_t, void*, HandleHash, HandleEqual> m_ipc_cache;
 };
 
 struct CustomAllReduceRef : public tvm::ffi::ObjectRef {

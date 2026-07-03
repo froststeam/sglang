@@ -338,6 +338,12 @@ def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
                 return fn(*args, **kwargs)
             finally:
                 amdsmi_shut_down()
+        elif _is_musa:
+            pynvml.mtmlLibraryInit()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                pynvml.mtmlLibraryShutDown()
         else:
             pynvml.nvmlInit()
             try:
@@ -367,6 +373,41 @@ def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
                         logger.error("AMD 1 hop XGMI detection failed.", exc_info=error)
                         return False
         return True
+    elif _is_musa:
+        """
+        query if the set of gpus are fully connected by mtlink (1 hop)
+        """
+        handles = [pynvml.mtmlLibraryInitDeviceByIndex(i) for i in physical_device_ids]
+
+        def is_linked(a, b):
+            try:
+                peer_uuid = pynvml.mtmlDeviceGetUUID(b)
+                link_spec = pynvml.mtmlDeviceGetMtLinkSpec(a)
+                for link_idx in range(link_spec.linkNum):
+                    if (
+                        pynvml.mtmlDeviceGetMtLinkState(a, link_idx)
+                        != pynvml.MTML_MTLINK_STATE_UP
+                    ):
+                        continue
+                    remote_handle = pynvml.mtmlDeviceGetMtLinkRemoteDevice(a, link_idx)
+                    if (
+                        remote_handle
+                        and pynvml.mtmlDeviceGetUUID(remote_handle) == peer_uuid
+                    ):
+                        return True
+            except pynvml.MTMLError:
+                logger.exception(
+                    "MTLink detection failed. This is normal if your"
+                    " machine has no MTLink equipped."
+                )
+            return False
+
+        return all(
+            is_linked(a, b)
+            for i, a in enumerate(handles)
+            for j, b in enumerate(handles)
+            if i < j
+        )
     else:
         """
         query if the set of gpus are fully connected by nvlink (1 hop)

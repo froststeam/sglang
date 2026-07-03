@@ -50,7 +50,7 @@ __device__ __forceinline__ float compute_score(float x) {
 }
 
 template <uint32_t kWarpsPerToken, ScoringFunc kScoringFunc>
-__global__ void moe_fused_gate_kernel_small_token(const MoEFusedGateParams __grid_constant__ params) {
+__global__ void moe_fused_gate_kernel_small_token(const MoEFusedGateParams params) {
   const auto& [input, bias, output, indices, num_rows, num_experts, topk, num_fused_shared_experts, renormalize, routed_scaling_factor, apply_routed_scaling_factor_on_output] =
       params;
 
@@ -172,7 +172,7 @@ __global__ void moe_fused_gate_kernel_small_token(const MoEFusedGateParams __gri
 }
 
 template <ScoringFunc kScoringFunc>
-__global__ void moe_fused_gate_kernel(const MoEFusedGateParams __grid_constant__ params) {
+__global__ void moe_fused_gate_kernel(const MoEFusedGateParams params) {
   const auto& [input, bias, output, indices, num_rows, num_experts, topk, num_fused_shared_experts, renormalize, routed_scaling_factor, apply_routed_scaling_factor_on_output] =
       params;
 
@@ -300,10 +300,22 @@ struct MoEFusedGateKernel {
     K.set_value(topk);
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({N, E}).with_dtype<float>().with_device(device).verify(input);
-    TensorMatcher({E}).with_dtype<float>().with_device(device).verify(bias);
-    TensorMatcher({N, K}).with_dtype<float>().with_device(device).verify(output);
-    TensorMatcher({N, K}).with_dtype<int32_t>().with_device(device).verify(indices);
+    TensorMatcher({host::details::SizeRef(N), host::details::SizeRef(E)})
+        .with_dtype<float>()
+        .with_device(host::details::DeviceRef(device))
+        .verify(input);
+    TensorMatcher({host::details::SizeRef(E)})
+        .with_dtype<float>()
+        .with_device(host::details::DeviceRef(device))
+        .verify(bias);
+    TensorMatcher({host::details::SizeRef(N), host::details::SizeRef(K)})
+        .with_dtype<float>()
+        .with_device(host::details::DeviceRef(device))
+        .verify(output);
+    TensorMatcher({host::details::SizeRef(N), host::details::SizeRef(K)})
+        .with_dtype<int32_t>()
+        .with_device(host::details::DeviceRef(device))
+        .verify(indices);
 
     const auto num_rows = static_cast<uint32_t>(N.unwrap());
     const auto num_experts = static_cast<uint32_t>(E.unwrap());

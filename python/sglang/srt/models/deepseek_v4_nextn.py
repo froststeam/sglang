@@ -2,7 +2,6 @@ import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -13,6 +12,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.dsv4_hc_head_tp import hc_head_forward, setup_dsv4_hc_head_params
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -55,13 +55,8 @@ class DeepseekV4ModelNextN(nn.Module):
         self.rms_norm_eps = config.rms_norm_eps
 
         self.hc_eps = config.hc_eps
-        self.hc_mult = hc_mult = config.hc_mult
-        hc_dim = hc_mult * config.hidden_size
-        self.hc_head_fn = nn.Parameter(
-            torch.empty(hc_mult, hc_dim, dtype=torch.float32)
-        )
-        self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32))
-        self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
+        self.hc_mult = config.hc_mult
+        setup_dsv4_hc_head_params(self, config)
 
         self.e_proj = ReplicatedLinear(
             config.hidden_size,
@@ -100,13 +95,17 @@ class DeepseekV4ModelNextN(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ):
-        shape, dtype = x.size(), x.dtype
-        x = x.flatten(1).float()
-        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.rms_norm_eps)
-        mixes = F.linear(x, hc_fn) * rsqrt
-        pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
-        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
-        return y.to(dtype)
+        return hc_head_forward(
+            self,
+            x,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            norm_eps=self.rms_norm_eps,
+            hc_eps=self.hc_eps,
+            use_fused=True,
+            use_tilelang=False,
+        )
 
     def prewarm_mhc_token_count_buckets(
         self, max_num_tokens: int, device: torch.device

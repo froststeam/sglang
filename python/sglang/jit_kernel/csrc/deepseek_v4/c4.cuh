@@ -212,7 +212,7 @@ SGL_DEVICE void c4_forward(
 }
 
 template <int64_t kHeadDim, typename InFloat, typename OutFloat, PageMode kMode, bool kUsePDL>
-C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams params) {
+C4_KERNEL void flash_c4_decode(const Compress4DecodeParams params) {
   using namespace device;
 
   constexpr int64_t kTileDim = kTileElements * kWarpThreads;  // 128
@@ -273,7 +273,7 @@ C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams par
 }
 
 template <int64_t kHeadDim, typename InFloat, typename OutFloat, PageMode kMode, bool kWrite, bool kUsePDL>
-C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams params) {
+C4_KERNEL void flash_c4_prefill(const Compress4PrefillParams params) {
   using namespace device;
 
   constexpr int64_t kTileDim = kTileElements * kWarpThreads;  // 128
@@ -392,29 +392,29 @@ struct FlashCompress4Kernel {
     const auto extra_ptr = _get_extra_pointer(B, device_, extra);
     const auto page_size = extra_ptr != nullptr ? 4 : 8;
 
-    TensorMatcher({-1, page_size, kHeadDim * 4})  // kv score
+    TensorMatcher({host::details::SizeRef(-1), host::details::SizeRef(page_size), host::details::SizeRef(kHeadDim * 4)})  // kv score
         .with_dtype<InFloat>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(kv_score_buffer);
-    TensorMatcher({B, kHeadDim * 4})  // kv score input
+    TensorMatcher({host::details::SizeRef(B), host::details::SizeRef(kHeadDim * 4)})  // kv score input
         .with_dtype<InFloat>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(kv_score_input);
-    TensorMatcher({B, kHeadDim})  // kv compressed output
+    TensorMatcher({host::details::SizeRef(B), host::details::SizeRef(kHeadDim)})  // kv compressed output
         .with_dtype<OutFloat>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(kv_compressed_output);
-    TensorMatcher({8, kHeadDim})  // ape
+    TensorMatcher({host::details::SizeRef(8), host::details::SizeRef(kHeadDim)})  // ape
         .with_dtype<InFloat>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(ape);
-    TensorMatcher({B})  // indices
+    TensorMatcher({host::details::SizeRef(B)})  // indices
         .with_dtype<IndiceT>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(indices);
-    TensorMatcher({B})  // seq lens
+    TensorMatcher({host::details::SizeRef(B)})  // seq lens
         .with_dtype<IndiceT>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(seq_lens);
 
     const auto device = device_.unwrap();
@@ -456,33 +456,33 @@ struct FlashCompress4Kernel {
     const auto extra_ptr = _get_extra_pointer(B, device_, extra, /*is_prefill=*/true);
     const auto page_size = extra_ptr != nullptr ? 4 : 8;
 
-    TensorMatcher({-1, page_size, kHeadDim * 4})  // kv score
+    TensorMatcher({host::details::SizeRef(-1), host::details::SizeRef(page_size), host::details::SizeRef(kHeadDim * 4)})  // kv score
         .with_dtype<InFloat>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(kv_score_buffer);
-    TensorMatcher({N, kHeadDim * 4})  // kv score input
+    TensorMatcher({host::details::SizeRef(N), host::details::SizeRef(kHeadDim * 4)})  // kv score input
         .with_dtype<InFloat>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(kv_score_input);
-    TensorMatcher({N, kHeadDim})  // kv compressed output
+    TensorMatcher({host::details::SizeRef(N), host::details::SizeRef(kHeadDim)})  // kv compressed output
         .with_dtype<OutFloat>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(kv_compressed_output);
-    TensorMatcher({8, kHeadDim})  // ape
+    TensorMatcher({host::details::SizeRef(8), host::details::SizeRef(kHeadDim)})  // ape
         .with_dtype<InFloat>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(ape);
-    TensorMatcher({B})  // indices
+    TensorMatcher({host::details::SizeRef(B)})  // indices
         .with_dtype<IndiceT>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(indices);
-    TensorMatcher({X, compress::kPrefillPlanDim})  // compress plan
+    TensorMatcher({host::details::SizeRef(X), host::details::SizeRef(compress::kPrefillPlanDim)})  // compress plan
         .with_dtype<compress::PrefillPlanTensorDtype>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(compress_plan);
-    TensorMatcher({Y, compress::kPrefillPlanDim})  // write plan
+    TensorMatcher({host::details::SizeRef(Y), host::details::SizeRef(compress::kPrefillPlanDim)})  // write plan
         .with_dtype<compress::PrefillPlanTensorDtype>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(write_plan);
 
     const auto device = device_.unwrap();
@@ -532,15 +532,15 @@ struct FlashCompress4Kernel {
     /// for prefill, last 4 are:
     /// load overlap | load normal | write overlap | last written page
     /// for decode, last 1 is the write (also load) overlap
-    host::TensorMatcher({B, is_prefill ? 4 : 1})  // extra tensor
+    host::TensorMatcher({host::details::SizeRef(B), host::details::SizeRef(is_prefill ? 4 : 1)})  // extra tensor
         .with_dtype<int32_t>()
-        .with_device(device)
+        .with_device(host::details::DeviceRef(device))
         .verify(extra_tensor);
     const auto data_ptr = extra_tensor.data_ptr();
     host::RuntimeCheck(data_ptr != nullptr, "extra tensor data ptr is null");
     if (is_prefill) {
       static_assert(alignof(C4IndexBundle) == 16);
-      host::RuntimeCheck(std::bit_cast<uintptr_t>(data_ptr) % 16 == 0, "extra tensor is not properly aligned");
+      host::RuntimeCheck(reinterpret_cast<uintptr_t>(data_ptr) % 16 == 0, "extra tensor is not properly aligned");
     }
     return data_ptr;
   }

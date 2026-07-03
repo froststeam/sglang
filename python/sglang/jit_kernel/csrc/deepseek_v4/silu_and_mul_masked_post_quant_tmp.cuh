@@ -11,7 +11,7 @@
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 
 #include <cstdint>
-#include <cuda_fp8.h>
+#include <musa_fp8.h>
 
 namespace {
 
@@ -85,7 +85,7 @@ SGL_DEVICE CTAWork get_work(const SiluMulQuantParams& params) {
 
 template <bool kScaleUE8M0, bool kTransposed, bool kUsePDL, bool kApplySwigluLimit>
 __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
-    silu_mul_quant_kernel(const SiluMulQuantParams __grid_constant__ params) {
+    silu_mul_quant_kernel(const SiluMulQuantParams params) {
   using namespace device;
 
   constexpr uint32_t kGroupSize = 128u;
@@ -105,20 +105,18 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   const auto offset = expert_id * params.num_tokens + token_id;
   const auto input = params.input + offset * params.hidden_dim * 2;
   const auto output = params.output + offset * params.hidden_dim;
-  [[maybe_unused]]
-  const auto output_scale = [&] {
-    const auto num_groups = params.hidden_dim / kGroupSize;
-    if constexpr (kTransposed) {
-      const auto base = reinterpret_cast<uint8_t*>(params.output_scale);
-      // Physical layout is [E, G//4, N] int32.  Each int32 packs 4 consecutive
-      // group scales for the same token, so the byte address is:
-      //   expert_offset + (group/4)*N*4 + token*4 + group%4
-      return base + expert_id * num_groups * params.num_tokens + (work_id / 4u) * (params.num_tokens * 4u) +
-             token_id * 4u + (work_id % 4u);
-    } else {
-      return params.output_scale + offset * num_groups + work_id;
-    }
-  }();
+  const auto num_groups = params.hidden_dim / kGroupSize;
+  [[maybe_unused]] float* output_scale_ptr = params.output_scale + offset * num_groups + work_id;
+  [[maybe_unused]] uint8_t* output_scale_u8_ptr = nullptr;
+  if constexpr (kTransposed) {
+    auto base = reinterpret_cast<uint8_t*>(params.output_scale);
+    // Physical layout is [E, G//4, N] int32. Each int32 packs 4 consecutive
+    // group scales for the same token, so the byte address is:
+    //   expert_offset + (group/4)*N*4 + token*4 + group%4
+    output_scale_u8_ptr =
+        base + expert_id * num_groups * params.num_tokens + (work_id / 4u) * (params.num_tokens * 4u) +
+        token_id * 4u + (work_id % 4u);
+  }
 
   PDLWaitPrimary<kUsePDL>();
 
@@ -132,9 +130,6 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
 #pragma unroll
   for (uint32_t i = 0; i < 4; ++i) {
     if constexpr (kApplySwigluLimit) {
-      // Fused fp32 path: bf16 load ??? fp32 clamp ??? fp32 silu ??? fp32 mul ??? fp32 result.
-      // Avoids the silu???bf16???mul???fp32 round-trip of the non-fused path since we already
-      // have gate/up in fp32 registers after clamp.
       const float limit = params.swiglu_limit;
 
       const auto [g0_raw, g1_raw] = cast<fp32x2_t>(gate_vec[i]);
@@ -154,7 +149,6 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
       results[2 * i + 1] = val1;
       local_max = fmaxf(local_max, fmaxf(fabsf(val0), fabsf(val1)));
     } else {
-      // original code path ??? must stay byte-equal to pre-fusion kernel.
       const auto [g0, g1] = cast<fp32x2_t>(gate_vec[i]);
 
       float silu0 = g0 / (1.0f + expf(-g0));
@@ -195,9 +189,9 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
 
   out_vec.store(output, threadIdx.x);
   if constexpr (kTransposed) {
-    *output_scale = ue8m0_exp;
+    *output_scale_u8_ptr = static_cast<uint8_t>(ue8m0_exp);
   } else {
-    *output_scale = scale;
+    *output_scale_ptr = scale;
   }
 }
 
@@ -209,7 +203,7 @@ struct SiluAndMulClampParams {
 
 template <typename DType, bool kUsePDL>
 __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
-    silu_mul_clamp_kernel(const SiluAndMulClampParams __grid_constant__ params) {
+    silu_mul_clamp_kernel(const SiluAndMulClampParams params) {
   using namespace device;
   static_assert(sizeof(DType) == 2, "only fp16/bf16 supported");
   using DType2 = packed_t<DType>;
@@ -244,9 +238,6 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   PDLTriggerSecondary<kUsePDL>();
 }
 
-// ---- Host wrapper
-// ------------------------------------------------------------------------------------------------------------------------
-
 template <int64_t kGroupSize, bool kScaleUE8M0, bool kUsePDL, bool kApplySwigluLimit>
 struct SiluAndMulMaskedPostQuantKernel {
   static_assert(kGroupSize == 128);
@@ -271,31 +262,31 @@ struct SiluAndMulMaskedPostQuantKernel {
     auto G = SymbolicSize{"num_groups"};
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({E, T, D})  // input
+    TensorMatcher({host::details::SizeRef(E), host::details::SizeRef(T), host::details::SizeRef(D)})  // input
         .with_dtype<bf16_t>()
-        .with_device(device)
+        .with_device(host::details::DeviceRef(device))
         .verify(input);
-    TensorMatcher({E, T, N})  // output
+    TensorMatcher({host::details::SizeRef(E), host::details::SizeRef(T), host::details::SizeRef(N)})  // output
         .with_dtype<fp8_e4m3_t>()
-        .with_device(device)
+        .with_device(host::details::DeviceRef(device))
         .verify(output);
     if (!transposed) {
-      TensorMatcher({E, T, G})  //
+      TensorMatcher({host::details::SizeRef(E), host::details::SizeRef(T), host::details::SizeRef(G)})  //
           .with_dtype<fp32_t>()
-          .with_device(device)
+          .with_device(host::details::DeviceRef(device))
           .verify(output_scale);
     } else {
       RuntimeCheck(kScaleUE8M0, "transposed layout only supports scale_ue8m0=true");
       auto G_ = SymbolicSize{"G // 4"};
-      TensorMatcher({E, G_, T})  //
+      TensorMatcher({host::details::SizeRef(E), host::details::SizeRef(G_), host::details::SizeRef(T)})  //
           .with_dtype<int32_t>()
-          .with_device(device)
+          .with_device(host::details::DeviceRef(device))
           .verify(output_scale);
       G.set_value(G_.unwrap() * 4);
     }
-    TensorMatcher({E})  //
+    TensorMatcher({host::details::SizeRef(E)})  //
         .with_dtype<int32_t>()
-        .with_device(device)
+        .with_device(host::details::DeviceRef(device))
         .verify(masked_m);
 
     const auto num_experts = static_cast<uint32_t>(E.unwrap());
@@ -341,13 +332,13 @@ struct SiluAndMulClampKernel {
     auto H = SymbolicSize{"out_dim"};
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({M, D})  // input  (gate || up)
+    TensorMatcher({host::details::SizeRef(M), host::details::SizeRef(D)})  // input  (gate || up)
         .with_dtype<DType>()
-        .with_device(device)
+        .with_device(host::details::DeviceRef(device))
         .verify(input);
-    TensorMatcher({M, H})  // output
+    TensorMatcher({host::details::SizeRef(M), host::details::SizeRef(H)})  // output
         .with_dtype<DType>()
-        .with_device(device)
+        .with_device(host::details::DeviceRef(device))
         .verify(output);
     RuntimeCheck(D.unwrap() == 2 * H.unwrap(), "input last dim must be 2 * output last dim");
 

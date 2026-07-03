@@ -11,8 +11,8 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
+#include <musa_bf16.h>
+#include <musa_fp16.h>
 #include <type_traits>
 
 namespace {

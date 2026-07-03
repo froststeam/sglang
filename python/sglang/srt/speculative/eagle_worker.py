@@ -736,7 +736,10 @@ class EAGLEWorker(TpModelWorker):
             ]
 
         batch.out_cache_loc = out_cache_loc
-        batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
+        if batch.seq_lens_cpu is not None:
+            batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
+        else:
+            batch.seq_lens_sum = batch.seq_lens.sum().item()
         batch.return_hidden_states = False
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
@@ -998,13 +1001,16 @@ class EAGLEWorker(TpModelWorker):
 
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)
-        logits_output.next_token_logits = logits_output.next_token_logits[
-            res.accept_indices
-        ]
+        accept_indices = res.accept_indices.to(
+            device=logits_output.next_token_logits.device, dtype=torch.int64
+        )
+        logits_output.next_token_logits = torch.index_select(
+            logits_output.next_token_logits, 0, accept_indices
+        )
         if logits_output.hidden_states is not None:
-            logits_output.hidden_states = logits_output.hidden_states[
-                res.accept_indices
-            ]
+            logits_output.hidden_states = torch.index_select(
+                logits_output.hidden_states, 0, accept_indices
+            )
 
         if (
             self.target_worker.model_runner.hybrid_gdn_config is not None

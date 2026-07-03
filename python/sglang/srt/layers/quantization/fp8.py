@@ -126,6 +126,16 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
 
+_DSV4_MUSA_MOE_EXPERIMENTAL_MIN_TOKENS = 8192
+
+
+def _forward_batch_is_dsv4_prefill(forward_batch: Any) -> bool:
+    if forward_batch is None:
+        return False
+    forward_mode = getattr(forward_batch, "forward_mode", None)
+    # Keep decode/mixed/speculative graph paths on the existing stable runner.
+    return getattr(forward_mode, "name", None) in ("EXTEND", "SPLIT_PREFILL")
+
 
 class Fp8Config(QuantizationConfig):
     """Config class for FP8."""
@@ -1642,10 +1652,93 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             torch.cuda.empty_cache()
 
+    def _get_deepgemm_quant_info(self, layer: torch.nn.Module) -> DeepGemmMoeQuantInfo:
+        w13_weight = layer.w13_weight
+        w2_weight = layer.w2_weight
+
+        if self.block_quant:
+            block_shape = self.quant_config.weight_block_size
+            w13_scale = layer.w13_weight_scale_inv
+            w2_scale = layer.w2_weight_scale_inv
+        else:
+            # Convert per-tensor quant to per-block quant by repeating scales for forward_deepgemm.
+            scale_block_size = 128
+            block_shape = [scale_block_size, scale_block_size]
+            w13_scale_n = (w13_weight.shape[1] - 1) // scale_block_size + 1
+            w13_scale_k = (w13_weight.shape[2] - 1) // scale_block_size + 1
+            w13_scale = (
+                layer.w13_weight_scale.unsqueeze(1)
+                .repeat_interleave(w13_scale_n, dim=1)
+                .unsqueeze(2)
+                .repeat_interleave(w13_scale_k, dim=2)
+            )
+            w2_scale_n = (w2_weight.shape[1] - 1) // scale_block_size + 1
+            w2_scale_k = (w2_weight.shape[2] - 1) // scale_block_size + 1
+            w2_scale = (
+                layer.w2_weight_scale.unsqueeze(1)
+                .repeat_interleave(w2_scale_n, dim=1)
+                .unsqueeze(2)
+                .repeat_interleave(w2_scale_k, dim=2)
+            )
+
+        return DeepGemmMoeQuantInfo(
+            w13_weight=w13_weight,
+            w2_weight=w2_weight,
+            use_fp8=True,
+            w13_scale=w13_scale,
+            w2_scale=w2_scale,
+            block_shape=block_shape,
+            is_fp4_experts=self.is_fp4_expert,
+        )
+
+    def _get_forward_batch_from_layer(self, layer: torch.nn.Module) -> Any:
+        forward_batch = getattr(layer, "_sglang_forward_batch", None)
+        if forward_batch is not None:
+            return forward_batch
+        try:
+            from sglang.srt.compilation.piecewise_context_manager import (
+                get_forward_context,
+            )
+        except Exception:
+            return None
+        forward_context = get_forward_context()
+        if forward_context is None:
+            return None
+        return getattr(forward_context, "forward_batch", None)
+
+    def _should_use_dsv4_musa_prefill_deepgemm(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: DispatchOutput,
+    ) -> bool:
+        if not (_is_musa and envs.SGLANG_DSV4_MUSA_MOE_EXPERIMENTAL.get()):
+            return False
+        prefill_runner = getattr(self, "prefill_deepgemm_runner", None)
+        if prefill_runner is None:
+            return False
+        if (
+            not getattr(self, "runner", None)
+            or not self.runner.runner_backend.is_triton()
+        ):
+            return False
+        hidden_states = dispatch_output.hidden_states
+        if (
+            hidden_states.dim() != 2
+            or hidden_states.shape[0] < _DSV4_MUSA_MOE_EXPERIMENTAL_MIN_TOKENS
+        ):
+            return False
+        forward_batch = self._get_forward_batch_from_layer(layer)
+        if forward_batch is None:
+            # Some serving paths do not attach ForwardBatch to the layer; after
+            # the large-M guard above this is treated as a prefill chunk.
+            return True
+        return _forward_batch_is_dsv4_prefill(forward_batch)
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        self.prefill_deepgemm_runner = None
         moe_runner_backend = get_moe_runner_backend()
 
         if self.is_musa_contig_deepgemm_hybrid_enabled():
@@ -1693,6 +1786,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         else:
             # TODO(cwan): refactor other backends
             pass
+
+        if (
+            _is_musa
+            and envs.SGLANG_DSV4_MUSA_MOE_EXPERIMENTAL.get()
+            and moe_runner_backend.is_triton()
+        ):
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+                self.prefill_deepgemm_runner = MoeRunner(
+                    MoeRunnerBackend.DEEP_GEMM,
+                    moe_runner_config,
+                )
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         return TritonMoeQuantInfo(
@@ -1808,44 +1914,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 x.shape[0], self.triton_runner, self.deep_gemm_runner
             )
 
-        if runner.runner_backend.is_deep_gemm():
-
-            w13_weight = layer.w13_weight
-            w2_weight = layer.w2_weight
-
-            if self.block_quant:
-                block_shape = self.quant_config.weight_block_size
-                w13_scale = layer.w13_weight_scale_inv
-                w2_scale = layer.w2_weight_scale_inv
-            else:
-                # Convert per-tensor quant to per-block quant by repeating scales for forward_deepgemm
-                scale_block_size = 128
-                block_shape = [scale_block_size, scale_block_size]
-                w13_scale_n = (w13_weight.shape[1] - 1) // scale_block_size + 1
-                w13_scale_k = (w13_weight.shape[2] - 1) // scale_block_size + 1
-                w13_scale = (
-                    layer.w13_weight_scale.unsqueeze(1)
-                    .repeat_interleave(w13_scale_n, dim=1)
-                    .unsqueeze(2)
-                    .repeat_interleave(w13_scale_k, dim=2)
-                )
-                w2_scale_n = (w2_weight.shape[1] - 1) // scale_block_size + 1
-                w2_scale_k = (w2_weight.shape[2] - 1) // scale_block_size + 1
-                w2_scale = (
-                    layer.w2_weight_scale.unsqueeze(1)
-                    .repeat_interleave(w2_scale_n, dim=1)
-                    .unsqueeze(2)
-                    .repeat_interleave(w2_scale_k, dim=2)
-                )
-            quant_info = DeepGemmMoeQuantInfo(
-                w13_weight=w13_weight,
-                w2_weight=w2_weight,
-                use_fp8=True,
-                w13_scale=w13_scale,
-                w2_scale=w2_scale,
-                block_shape=block_shape,
-                is_fp4_experts=self.is_fp4_expert,
+        if self._should_use_dsv4_musa_prefill_deepgemm(layer, dispatch_output):
+            return self.prefill_deepgemm_runner.run(
+                dispatch_output,
+                self._get_deepgemm_quant_info(layer),
             )
+
+        if runner.runner_backend.is_deep_gemm():
+            quant_info = self._get_deepgemm_quant_info(layer)
         elif (
             runner.runner_backend.is_flashinfer_trtllm()
             or runner.runner_backend.is_flashinfer_trtllm_routed()

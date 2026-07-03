@@ -70,8 +70,10 @@ struct Compress128PrefillParams {
   /** \brief Shape: `[batch_size, ]`*/
   const int32_t* __restrict__ load_indices;
   /** \brief The following part is plan info. */
+
   const Plan128* __restrict__ compress_plan;
   const Plan128* __restrict__ write_plan;
+
   uint32_t num_compress;
   uint32_t num_write;
 };
@@ -242,7 +244,7 @@ SGL_DEVICE void c128_forward(
 }
 
 template <int64_t kHeadDim, typename InFloat, typename OutFloat, bool kUsePDL>
-C128_KERNEL void flash_c128_decode(const __grid_constant__ Compress128DecodeParams params) {
+C128_KERNEL void flash_c128_decode(const Compress128DecodeParams params) {
   using namespace device;
 
   constexpr int64_t kTileDim = kTileElements * kWarpThreads;  // 64
@@ -297,7 +299,7 @@ C128_KERNEL void flash_c128_decode(const __grid_constant__ Compress128DecodePara
 
 // compress kernel
 template <int64_t kHeadDim, typename InFloat, typename OutFloat, bool kWrite, bool kUsePDL>
-C128_KERNEL void flash_c128_prefill(const __grid_constant__ Compress128PrefillParams params) {
+C128_KERNEL void flash_c128_prefill(const Compress128PrefillParams params) {
   using namespace device;
 
   constexpr int64_t kTileDim = kTileElements * kWarpThreads;  // 64
@@ -391,29 +393,29 @@ struct FlashCompress128Kernel {
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({-1, 128, kHeadDim * 2})  // kv score
+    TensorMatcher({host::details::SizeRef(-1), host::details::SizeRef(128), host::details::SizeRef(kHeadDim * 2)})  // kv score
         .with_dtype<InFloat>()
-        .with_device(device)
+        .with_device(host::details::DeviceRef(device))
         .verify(kv_score_buffer);
-    TensorMatcher({B, kHeadDim * 2})  // kv score input
+    TensorMatcher({host::details::SizeRef(B), host::details::SizeRef(kHeadDim * 2)})  // kv score input
         .with_dtype<InFloat>()
-        .with_device(device)
+        .with_device(host::details::DeviceRef(device))
         .verify(kv_score_input);
-    TensorMatcher({B, kHeadDim})  // kv compressed output
+    TensorMatcher({host::details::SizeRef(B), host::details::SizeRef(kHeadDim)})  // kv compressed output
         .with_dtype<OutFloat>()
-        .with_device(device)
+        .with_device(host::details::DeviceRef(device))
         .verify(kv_compressed_output);
-    TensorMatcher({128, kHeadDim})  // ape
+    TensorMatcher({host::details::SizeRef(128), host::details::SizeRef(kHeadDim)})  // ape
         .with_dtype<InFloat>()
-        .with_device(device)
+        .with_device(host::details::DeviceRef(device))
         .verify(ape);
-    TensorMatcher({B})  // indices
+    TensorMatcher({host::details::SizeRef(B)})  // indices
         .with_dtype<IndiceT>()
-        .with_device(device)
+        .with_device(host::details::DeviceRef(device))
         .verify(indices);
-    TensorMatcher({B})  // seq lens
+    TensorMatcher({host::details::SizeRef(B)})  // seq lens
         .with_dtype<IndiceT>()
-        .with_device(device)
+        .with_device(host::details::DeviceRef(device))
         .verify(seq_lens);
 
     const auto batch_size = static_cast<uint32_t>(B.unwrap());
@@ -450,40 +452,40 @@ struct FlashCompress128Kernel {
     auto device_ = SymbolicDevice{};
     device_.set_options<kDLCUDA>();
 
-    TensorMatcher({-1, 128, kHeadDim * 2})  // kv score
+    TensorMatcher({host::details::SizeRef(-1), host::details::SizeRef(128), host::details::SizeRef(kHeadDim * 2)})  // kv score
         .with_dtype<InFloat>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(kv_score_buffer);
-    TensorMatcher({N, kHeadDim * 2})  // kv score input
+    TensorMatcher({host::details::SizeRef(N), host::details::SizeRef(kHeadDim * 2)})  // kv score input
         .with_dtype<InFloat>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(kv_score_input);
-    TensorMatcher({N, kHeadDim})  // kv compressed output
+    TensorMatcher({host::details::SizeRef(N), host::details::SizeRef(kHeadDim)})  // kv compressed output
         .with_dtype<OutFloat>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(kv_compressed_output);
-    TensorMatcher({128, kHeadDim})  // ape
+    TensorMatcher({host::details::SizeRef(128), host::details::SizeRef(kHeadDim)})  // ape
         .with_dtype<InFloat>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(ape);
-    TensorMatcher({B})  // indices
+    TensorMatcher({host::details::SizeRef(B)})  // indices
         .with_dtype<IndiceT>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(indices);
-    TensorMatcher({X, compress::kPrefillPlanDim})  // compress plan
+    TensorMatcher({host::details::SizeRef(X), host::details::SizeRef(compress::kPrefillPlanDim)})  // compress plan
         .with_dtype<compress::PrefillPlanTensorDtype>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(compress_plan);
-    TensorMatcher({Y, compress::kPrefillPlanDim})  // write plan
+    TensorMatcher({host::details::SizeRef(Y), host::details::SizeRef(compress::kPrefillPlanDim)})  // write plan
         .with_dtype<compress::PrefillPlanTensorDtype>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(write_plan);
 
     // might be needed for prefill write
     const auto load_indices = extra.value_or(indices);
-    TensorMatcher({B})  // [read_positions]
+    TensorMatcher({host::details::SizeRef(B)})  // [read_positions]
         .with_dtype<IndiceT>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(load_indices);
 
     const auto device = device_.unwrap();

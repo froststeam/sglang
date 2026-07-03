@@ -32,7 +32,7 @@ struct FusedQKRopeParams {
 
 template <bool kUsePDL, bool kInverse, typename IndexType>
 __global__ __launch_bounds__(kBlockSize, 16)  //
-    void deepseek_rope_kernel(const __grid_constant__ FusedQKRopeParams param) {
+    void deepseek_rope_kernel(const FusedQKRopeParams param) {
   using namespace device;
   using DType2 = packed_t<DType>;
 
@@ -107,29 +107,29 @@ struct FusedQKRopeKernel {
     auto device_ = SymbolicDevice{};
     device_.set_options<kDLCUDA>();
 
-    TensorMatcher({B, Q, D})  //
-        .with_strides({-1, -1, 1})
+    TensorMatcher({host::details::SizeRef(B), host::details::SizeRef(Q), host::details::SizeRef(D)})  //
+        .with_strides({host::details::SizeRef(-1), host::details::SizeRef(-1), host::details::SizeRef(1)})
         .with_dtype<DType>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(q);
     if (k.has_value()) {
-      TensorMatcher({B, K, D})  //
-          .with_strides({-1, -1, 1})
+      TensorMatcher({host::details::SizeRef(B), host::details::SizeRef(K), host::details::SizeRef(D)})  //
+          .with_strides({host::details::SizeRef(-1), host::details::SizeRef(-1), host::details::SizeRef(1)})
           .with_dtype<DType>()
-          .with_device(device_)
+          .with_device(host::details::DeviceRef(device_))
           .verify(k.value());
     } else {
       K.set_value(0);
     }
-    TensorMatcher({-1, D})  //
+    TensorMatcher({host::details::SizeRef(-1), host::details::SizeRef(D)})  //
         .with_dtype<float>()
-        .with_device(device_)
+        .with_device(host::details::DeviceRef(device_))
         .verify(freqs_cis);
 
     auto pos_dtype = SymbolicDType{};
-    TensorMatcher({B})  //
-        .with_dtype<int32_t, int64_t>(pos_dtype)
-        .with_device(device_)
+    TensorMatcher({host::details::SizeRef(B)})  //
+        .with_dtype<int32_t, int64_t>(host::details::DTypeRef(pos_dtype))
+        .with_device(host::details::DeviceRef(device_))
         .verify(positions);
     const bool pos_i32 = pos_dtype.is_type<int32_t>();
 

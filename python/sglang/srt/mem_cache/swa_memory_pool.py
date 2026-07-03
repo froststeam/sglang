@@ -588,14 +588,125 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         # NOTE: the API is not idempotent.
         if self.is_not_in_free_group:
-            self.full_attn_allocator.free(free_index)
+            self._free_allocator_indices(self.full_attn_allocator, free_index, "full")
             self.free_swa(free_index)
         else:
             self.free_group.append(free_index)
-        assert (
-            self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
+        self._repair_overfreed_allocator(self.full_attn_allocator, "full")
+        self._repair_overfreed_allocator(self.swa_attn_allocator, "swa")
+
+    def _free_allocator_indices(
+        self,
+        allocator: BaseTokenToKVPoolAllocator,
+        free_index: torch.Tensor,
+        name: str,
+    ) -> None:
+        if not (_is_musa and isinstance(allocator, PagedTokenToKVPoolAllocator)):
+            allocator.free(free_index)
+            return
+
+        if free_index.numel() == 0:
+            return
+
+        free_index_cpu = free_index.detach().to(device="cpu", dtype=torch.int64)
+        page_indices_cpu = free_index_cpu // allocator.page_size
+        valid_mask = (page_indices_cpu > 0) & (
+            page_indices_cpu <= allocator.num_pages
         )
-        assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
+        candidate_pages_cpu = torch.unique(page_indices_cpu[valid_mask], sorted=True)
+        valid_pages_cpu = candidate_pages_cpu
+
+        existing_pages_cpu = torch.cat(
+            (
+                allocator.free_pages.detach().cpu().to(torch.int64),
+                allocator.release_pages.detach().cpu().to(torch.int64),
+            )
+        )
+        if existing_pages_cpu.numel() > 0 and valid_pages_cpu.numel() > 0:
+            duplicate_mask = torch.isin(valid_pages_cpu, existing_pages_cpu)
+            duplicate_pages_cpu = valid_pages_cpu[duplicate_mask]
+            valid_pages_cpu = valid_pages_cpu[~duplicate_mask]
+        else:
+            duplicate_pages_cpu = torch.empty((0,), dtype=torch.int64)
+
+        invalid_count = int((~valid_mask).sum().item())
+        duplicate_count = int(duplicate_pages_cpu.numel())
+        raw_page_count = int(page_indices_cpu.numel())
+        candidate_page_count = int(candidate_pages_cpu.numel())
+        unique_valid_count = int(valid_pages_cpu.numel())
+        raw_min = int(free_index_cpu.min().item())
+        raw_max = int(free_index_cpu.max().item())
+        if invalid_count > 0 or duplicate_count > 0:
+            logger.warning(
+                "SWA KV allocator %s free sanitized on MUSA: raw_indices=%s, "
+                "raw_index_range=[%s,%s], raw_pages=%s, candidate_pages=%s, "
+                "new_pages=%s, new_page_sample=%s, "
+                "invalid_indices=%s, duplicate_pages=%s, duplicate_sample=%s, "
+                "available_before=%s, size=%s",
+                name,
+                free_index_cpu.numel(),
+                raw_min,
+                raw_max,
+                raw_page_count,
+                candidate_page_count,
+                unique_valid_count,
+                valid_pages_cpu[:8].tolist(),
+                invalid_count,
+                duplicate_count,
+                duplicate_pages_cpu[:8].tolist(),
+                allocator.available_size(),
+                allocator.size,
+            )
+
+        if valid_pages_cpu.numel() == 0:
+            return
+
+        pages_to_free = valid_pages_cpu.to(device=allocator.device)
+        if allocator.need_sort:
+            allocator.release_pages = torch.cat(
+                (pages_to_free, allocator.release_pages)
+            )
+        else:
+            allocator.free_pages = torch.cat((pages_to_free, allocator.free_pages))
+
+    def _repair_overfreed_allocator(
+        self, allocator: BaseTokenToKVPoolAllocator, name: str
+    ) -> None:
+        available_size = allocator.available_size()
+        if available_size <= allocator.size:
+            return
+
+        logger.warning(
+            "SWA KV allocator %s pool detected duplicate/invalid freed pages: "
+            "available_size=%s, size=%s. Deduplicating free page lists.",
+            name,
+            available_size,
+            allocator.size,
+        )
+        if isinstance(allocator, PagedTokenToKVPoolAllocator):
+            free_pages = torch.cat((allocator.free_pages, allocator.release_pages))
+            free_pages = free_pages.detach().cpu().to(torch.int64)
+            free_pages = free_pages[
+                (free_pages > 0) & (free_pages <= allocator.num_pages)
+            ]
+            allocator.free_pages = torch.unique(free_pages, sorted=True).to(
+                device=allocator.device
+            )
+            allocator.release_pages = torch.empty(
+                (0,), dtype=allocator.free_pages.dtype, device=allocator.device
+            )
+        else:
+            free_pages = torch.cat((allocator.free_pages, allocator.release_pages))
+            free_pages = free_pages.detach().cpu().to(torch.int64)
+            free_pages = free_pages[(free_pages > 0) & (free_pages <= allocator.size)]
+            allocator.free_pages = torch.unique(free_pages, sorted=True).to(
+                device=allocator.device
+            )
+            allocator.release_pages = torch.empty(
+                (0,), dtype=allocator.free_pages.dtype, device=allocator.device
+            )
+
+        assert allocator.available_size() <= allocator.size
 
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
@@ -615,9 +726,27 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_to_swa_index_mapping[full_indices] = swa_indices
 
     def free_swa(self, free_index: torch.Tensor):
+        free_index_cpu = free_index.detach().cpu().to(torch.int64)
+        valid_mask_cpu = (free_index_cpu >= 0) & (
+            free_index_cpu < self.full_to_swa_index_mapping.numel() - 1
+        )
+        if not bool(torch.all(valid_mask_cpu).item()):
+            invalid_indices = free_index_cpu[~valid_mask_cpu]
+            logger.warning(
+                "SWA KV allocator skipped invalid full->swa mapping indices: "
+                "count=%s, sample=%s, mapping_size=%s",
+                invalid_indices.numel(),
+                invalid_indices[:8].tolist(),
+                self.full_to_swa_index_mapping.numel(),
+            )
+        valid_mask = valid_mask_cpu.to(device=free_index.device)
+        free_index = free_index[valid_mask]
+        if free_index.numel() == 0:
+            return
+
         swa_indices = self.full_to_swa_index_mapping[free_index]
         swa_indices = swa_indices[swa_indices > 0]
-        self.swa_attn_allocator.free(swa_indices)
+        self._free_allocator_indices(self.swa_attn_allocator, swa_indices, "swa")
         self.full_to_swa_index_mapping[free_index] = 0
 
     def backup_state(self):

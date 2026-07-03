@@ -323,7 +323,7 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
 
 template <typename DType, int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, bool kUsePDL>
 struct FusedNormRopeKernel {
-  static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
+  static constexpr int32_t kLogPageSize = host::countr_zero(kPageSize);
   static constexpr bool kIsIndexer = (kHeadDim == 128);
   static constexpr int64_t kIndexerBytes = 132 * kPageSize;
   static constexpr int64_t kFlashMLABytes = host::div_ceil(584 * kPageSize, 576) * 576;
@@ -331,7 +331,7 @@ struct FusedNormRopeKernel {
 
   /// TODO: Let's fix the config for now.
   static_assert(kRopeDim == 64 && (kHeadDim == 128 || kHeadDim == 512));
-  static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
+  static_assert(host::has_single_bit(kPageSize), "kPageSize must be a power of 2");
 
   template <ForwardMode kMode>
   static constexpr auto select_kernel() {

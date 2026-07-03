@@ -341,6 +341,24 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.impl("musa_top_k_top_p_sampling_from_probs", torch::kMUSA, &musa_top_k_top_p_sampling_from_probs);
 
   /*
+   * From csrc/elementwise/hadamard.cpp
+   */
+  m.def("fast_hadamard_transform(Tensor x, float scale) -> Tensor");
+  m.impl("fast_hadamard_transform", torch::kMUSA, &fast_hadamard_transform);
+
+  m.def("fast_hadamard_transform_12N(Tensor x, float scale) -> Tensor");
+  m.impl("fast_hadamard_transform_12N", torch::kMUSA, &fast_hadamard_transform_12N);
+
+  m.def("fast_hadamard_transform_20N(Tensor x, float scale) -> Tensor");
+  m.impl("fast_hadamard_transform_20N", torch::kMUSA, &fast_hadamard_transform_20N);
+
+  m.def("fast_hadamard_transform_28N(Tensor x, float scale) -> Tensor");
+  m.impl("fast_hadamard_transform_28N", torch::kMUSA, &fast_hadamard_transform_28N);
+
+  m.def("fast_hadamard_transform_40N(Tensor x, float scale) -> Tensor");
+  m.impl("fast_hadamard_transform_40N", torch::kMUSA, &fast_hadamard_transform_40N);
+
+  /*
    * From csrc/memory
    */
   m.def("weak_ref_tensor(Tensor tensor) -> Tensor");

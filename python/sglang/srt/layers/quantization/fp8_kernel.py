@@ -28,6 +28,7 @@ try:
 except:
     pass
 
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import (
     ceil_align,
@@ -138,6 +139,311 @@ else:
     fp8_dtype = torch.float8_e4m3fn
     fp8_max = torch.finfo(fp8_dtype).max
 fp8_min = -fp8_max
+
+# TileKernels per-token quant is faster once there is enough row-level work,
+# while the SGLang JIT subwarp scheduler remains better for decode tiny-M.
+_MUSA_PREFILL_FP8_QUANT_MIN_GROUPS = 16 * 1024
+
+
+def _musa_prefill_fp8_quant_launch_config(rows: int, hidden: int) -> Tuple[int, int]:
+    # TileKernels uses 128 threads over a larger row tile. For this per-128-group
+    # kernel, the best subwarp packing is shape-sensitive.
+    if hidden <= 2048:
+        return 8, 4
+    if rows <= 4096:
+        return 4, 2
+    return 8, 2
+
+
+def _tilekernels_fp8_quant_min_rows(hidden: int) -> int:
+    del hidden
+    return 512
+
+
+@lru_cache(maxsize=None)
+def _tilelang_musa_per_token_group_quant_fp8_kernel(
+    input_dtype: str,
+    groups_per_cta: int,
+):
+    import tilelang
+    import tilelang.language as T
+
+    from sglang.srt.hardware_backend.layers.deepseek_v4_musa.kernels.kernel_common import (
+        _tilelang_jit,
+        _tilelang_musa_aggressive_pass_configs,
+    )
+
+    group_size = 128
+    values_per_lane = 8
+    groups_per_warp = 2
+    warps_per_cta = (groups_per_cta + groups_per_warp - 1) // groups_per_warp
+    threads = warps_per_cta * 32
+    total_elements = T.dynamic("total_elements")
+    total_groups = T.dynamic("total_groups")
+    prelude = r"""
+#include <tl_templates/musa/common.h>
+#include <tl_templates/musa/cvt.h>
+#include <tl_templates/musa/musa_fp8.h>
+__device__ __forceinline__ uint32_t tl_sglang_pack_fp8x4_e4m3_u32(float x0, float x1, float x2, float x3) {
+  fp8_e4_4_t packed = tl::cvt_float_to_fp8e4m3_x4(make_float4(x0, x1, x2, x3));
+  return *reinterpret_cast<uint32_t*>(&packed);
+}
+"""
+
+    def abs_f32(value):
+        return T.if_then_else(value < 0.0, -value, value)
+
+    @_tilelang_jit(
+        tilelang,
+        f"sglang_musa_per_token_group_quant_fp8_{input_dtype}_g{groups_per_cta}",
+        pass_configs=_tilelang_musa_aggressive_pass_configs(
+            tilelang,
+            disable_index_promotion=True,
+            compile_profile="ls",
+        ),
+    )
+    def per_token_group_quant_fp8_kernel(
+        x: T.Tensor[(total_elements,), input_dtype],
+        x_q_u8: T.Tensor[(total_elements,), T.uint8],
+        x_s: T.Tensor[(total_groups,), T.float32],
+        eps: T.float32,
+    ):
+        with T.Kernel(T.ceildiv(total_groups, groups_per_cta), threads=threads, prelude=prelude) as block_id:
+            tx = T.get_thread_binding()
+            warp = tx // 32
+            lane = tx - warp * 32
+            half_warp = lane // 16
+            sublane = lane - half_warp * 16
+            group_id = block_id * groups_per_cta + warp * groups_per_warp + half_warp
+            elem_base = group_id * group_size + sublane * values_per_lane
+            valid_group = group_id < total_groups
+
+            vals = T.alloc_local((values_per_lane,), dtype=T.float32)
+            local_amax = T.alloc_local((1,), dtype=T.float32)
+            local_amax[0] = 0.0
+
+            if valid_group:
+                for vec in T.vectorized(values_per_lane):
+                    vals[vec] = T.Cast("float32", x[T.Cast("int64", elem_base + vec)])
+                    local_amax[0] = T.max(local_amax[0], abs_f32(vals[vec]))
+
+                local_amax[0] = T.max(local_amax[0], T.shfl_xor(local_amax[0], 8))
+                local_amax[0] = T.max(local_amax[0], T.shfl_xor(local_amax[0], 4))
+                local_amax[0] = T.max(local_amax[0], T.shfl_xor(local_amax[0], 2))
+                local_amax[0] = T.max(local_amax[0], T.shfl_xor(local_amax[0], 1))
+                scale = T.max(local_amax[0], eps) / 448.0
+                inv_scale = 1.0 / scale
+                packed0 = T.call_extern(
+                    "uint32",
+                    "tl_sglang_pack_fp8x4_e4m3_u32",
+                    T.clamp(vals[0] * inv_scale, -448.0, 448.0),
+                    T.clamp(vals[1] * inv_scale, -448.0, 448.0),
+                    T.clamp(vals[2] * inv_scale, -448.0, 448.0),
+                    T.clamp(vals[3] * inv_scale, -448.0, 448.0),
+                )
+                packed1 = T.call_extern(
+                    "uint32",
+                    "tl_sglang_pack_fp8x4_e4m3_u32",
+                    T.clamp(vals[4] * inv_scale, -448.0, 448.0),
+                    T.clamp(vals[5] * inv_scale, -448.0, 448.0),
+                    T.clamp(vals[6] * inv_scale, -448.0, 448.0),
+                    T.clamp(vals[7] * inv_scale, -448.0, 448.0),
+                )
+                T.stg32(x_q_u8[T.Cast("int64", elem_base)], packed0)
+                T.stg32(x_q_u8[T.Cast("int64", elem_base + 4)], packed1)
+                if sublane == 0:
+                    x_s[group_id] = scale
+
+    return per_token_group_quant_fp8_kernel
+
+
+def _try_tilelang_musa_per_token_group_quant_fp8(
+    x: torch.Tensor,
+    x_q: torch.Tensor,
+    x_s: torch.Tensor,
+    group_size: int,
+    eps: float,
+    column_major_scales: bool,
+    scale_tma_aligned: bool,
+    scale_ue8m0: bool,
+) -> bool:
+    if (
+        x.device.type != "musa"
+        or os.environ.get("SGLANG_DISABLE_DSV4_MUSA_PREFILL_FP8_QUANT") == "1"
+        or group_size != 128
+        or column_major_scales
+        or scale_tma_aligned
+        or scale_ue8m0
+        or x_s.dtype != torch.float32
+        or x_q.dtype != fp8_dtype
+        or x.dtype not in (torch.bfloat16, torch.float16, torch.float32)
+        or not x.is_contiguous()
+        or not x_q.is_contiguous()
+        or not x_s.is_contiguous()
+    ):
+        return False
+
+    total_groups = x.numel() // group_size
+    if total_groups < _MUSA_PREFILL_FP8_QUANT_MIN_GROUPS:
+        return False
+
+    input_dtype = {
+        torch.bfloat16: "bfloat16",
+        torch.float16: "float16",
+        torch.float32: "float32",
+    }[x.dtype]
+    groups_per_cta = 8
+    try:
+        kernel = _tilelang_musa_per_token_group_quant_fp8_kernel(
+            input_dtype,
+            groups_per_cta,
+        )
+        kernel(
+            x.view(-1),
+            x_q.view(torch.uint8).view(-1),
+            x_s.view(-1),
+            float(eps),
+        )
+    except Exception:
+        return False
+    return True
+
+
+def _try_tilekernels_per_token_cast_musa(
+    x: torch.Tensor,
+    group_size: int,
+    column_major_scales: bool,
+    scale_tma_aligned: bool,
+    scale_ue8m0: bool,
+    fuse_silu_and_mul: bool,
+    masked_m: Optional[torch.Tensor],
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    # The generic TileKernels cast path is slower than Triton on large CP prefill
+    # shapes. Keep decode/small-M behavior unchanged, but do not let a large
+    # prefill miss fall through to that generic path.
+    if x.numel() // group_size >= _MUSA_PREFILL_FP8_QUANT_MIN_GROUPS:
+        return None
+    if not (_is_musa and envs.SGLANG_OPT_USE_TILEKERNELS_FP8_QUANT.get()):
+        return None
+    if x.dim() == 2 and x.shape[0] < _tilekernels_fp8_quant_min_rows(x.shape[-1]):
+        return None
+    if (
+        x.dim() != 2
+        or x.shape[0] == 0
+        or group_size != 128
+        or column_major_scales
+        or scale_tma_aligned
+        or scale_ue8m0
+        or fuse_silu_and_mul
+        or masked_m is not None
+        or x.dtype not in (torch.bfloat16, torch.float16, torch.float32)
+    ):
+        return None
+
+    try:
+        import tile_kernels.quant as tile_quant
+
+        quantized, scale = tile_quant.per_token_cast(
+            x,
+            "e4m3",
+            num_per_channels=group_size,
+            use_tma_aligned_col_major_sf=False,
+            round_sf=False,
+            use_packed_ue8m0=False,
+        )
+    except Exception:
+        return None
+
+    expected_scale_shape = x.shape[:-1] + (x.shape[-1] // group_size,)
+    if quantized.shape != x.shape or scale.shape != expected_scale_shape:
+        return None
+    return quantized, scale.to(torch.float32)
+
+
+@triton.jit
+def _per_token_group_quant_8bit_multi_group(
+    y_ptr,
+    y_q_ptr,
+    y_s_ptr,
+    total_groups,
+    eps,
+    bit8_min,
+    bit8_max,
+    GROUP_SIZE: tl.constexpr,
+    GROUPS_PER_CTA: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    groups = pid * GROUPS_PER_CTA + tl.arange(0, GROUPS_PER_CTA)
+    cols = tl.arange(0, GROUP_SIZE)
+    offsets = groups[:, None] * GROUP_SIZE + cols[None, :]
+    mask = groups[:, None] < total_groups
+
+    y = tl.load(y_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    y_absmax = tl.maximum(tl.max(tl.abs(y), axis=1), eps)
+    y_s = y_absmax / bit8_max
+    y_s_inv = 1.0 / y_s
+    y_s_inv = y_s_inv * (2.0 - y_s * y_s_inv)
+    y_q = tl.clamp(y * y_s_inv[:, None], bit8_min, bit8_max).to(
+        y_q_ptr.dtype.element_ty
+    )
+
+    tl.store(y_q_ptr + offsets, y_q, mask=mask)
+    tl.store(y_s_ptr + groups, y_s, mask=groups < total_groups)
+
+
+def _try_musa_prefill_per_token_group_quant_8bit(
+    x: torch.Tensor,
+    x_q: torch.Tensor,
+    x_s: torch.Tensor,
+    group_size: int,
+    eps: float,
+    bit8_min: float,
+    bit8_max: float,
+    column_major_scales: bool,
+    scale_tma_aligned: bool,
+    scale_ue8m0: bool,
+    fuse_silu_and_mul: bool = False,
+    masked_m: Optional[torch.Tensor] = None,
+) -> bool:
+    if (
+        not _is_musa
+        or os.environ.get("SGLANG_DISABLE_DSV4_MUSA_PREFILL_FP8_QUANT") == "1"
+        or group_size != 128
+        or column_major_scales
+        or scale_tma_aligned
+        or scale_ue8m0
+        or fuse_silu_and_mul
+        or masked_m is not None
+        or x_s.dtype != torch.float32
+    ):
+        return False
+
+    total_groups = x.numel() // group_size
+    if x_q.numel() != x.numel() or x_s.numel() != total_groups:
+        return False
+
+    if total_groups < _MUSA_PREFILL_FP8_QUANT_MIN_GROUPS:
+        return False
+
+    groups_per_cta, num_warps = _musa_prefill_fp8_quant_launch_config(
+        x.shape[0], x.shape[-1]
+    )
+    _per_token_group_quant_8bit_multi_group[
+        (triton.cdiv(total_groups, groups_per_cta),)
+    ](
+        x,
+        x_q,
+        x_s,
+        total_groups,
+        eps,
+        bit8_min=bit8_min,
+        bit8_max=bit8_max,
+        GROUP_SIZE=group_size,
+        GROUPS_PER_CTA=groups_per_cta,
+        num_warps=num_warps,
+        num_stages=1,
+    )
+    return True
 
 
 @register_custom_op(mutates_args=["C"])
@@ -299,6 +605,32 @@ def _per_token_group_quant_8bit_raw(
 
     M = x.numel() // group_size
     N = group_size
+
+    if _try_tilelang_musa_per_token_group_quant_fp8(
+        x=x,
+        x_q=x_q,
+        x_s=x_s,
+        group_size=group_size,
+        eps=eps,
+        column_major_scales=column_major_scales,
+        scale_tma_aligned=scale_tma_aligned,
+        scale_ue8m0=scale_ue8m0,
+    ):
+        return x_q, x_s
+
+    if _try_musa_prefill_per_token_group_quant_8bit(
+        x=x,
+        x_q=x_q,
+        x_s=x_s,
+        group_size=group_size,
+        eps=eps,
+        bit8_min=bit8_min,
+        bit8_max=bit8_max,
+        column_major_scales=column_major_scales,
+        scale_tma_aligned=scale_tma_aligned,
+        scale_ue8m0=scale_ue8m0,
+    ):
+        return x_q, x_s
 
     BLOCK = triton.next_power_of_2(N)
     # heuristics for number of warps
@@ -537,6 +869,34 @@ def sglang_per_token_group_quant_fp8(
         enable_v2 = group_size in _V2_KERNEL_SUPPORTED_GROUP_SIZES or _is_musa
 
     if x.shape[0] > 0:
+        if _try_musa_prefill_per_token_group_quant_8bit(
+            x=x,
+            x_q=x_q,
+            x_s=x_s,
+            group_size=group_size,
+            eps=eps,
+            bit8_min=fp8_min,
+            bit8_max=fp8_max,
+            column_major_scales=column_major_scales,
+            scale_tma_aligned=scale_tma_aligned,
+            scale_ue8m0=scale_ue8m0,
+            fuse_silu_and_mul=fuse_silu_and_mul,
+            masked_m=masked_m,
+        ):
+            return x_q, x_s
+
+        tile_result = _try_tilekernels_per_token_cast_musa(
+            x,
+            group_size,
+            column_major_scales,
+            scale_tma_aligned,
+            scale_ue8m0,
+            fuse_silu_and_mul,
+            masked_m,
+        )
+        if tile_result is not None:
+            return tile_result
+
         # Temporary
         if enable_sgl_per_token_group_quant_8bit:
             if enable_v2:

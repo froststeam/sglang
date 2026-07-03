@@ -1,0 +1,37 @@
+include:
+  - project: 'dockerfiles_musa_sdk'
+    group: 'sw'
+    ref: 'deepV4'
+    files:
+      - '.mthreads-ci.yml'
+
+stages:
+  - build
+  - test
+
+variables:
+  IMAGE_REPO: "sh-harbor.mthreads.com/qa/musa_sdk/deepseekv4_sglang"
+  OSS_BASE_PATH: "sw-pr/${REPO_NAME}/${gitlabMergeRequestIid}/${COMMIT_ID}"
+  TARGET_REPO_DIR: "${WORKSPACE}/dockerfiles_musa_sdk"
+  SGLANG_BRANCH_OVERRIDE: "${BRANCH}"
+  SGLANG_COMMIT_OVERRIDE: "${COMMIT_ID}"
+
+build-musa-sdk-image:
+  extends: ".build-musa-sdk-image-base"
+  rules:
+    - if: '$EVENT_TYPE == "mr"'
+  repositories:
+    - repo: "sw/dockerfiles_musa_sdk"
+      branch: "deepV4"
+      alias: "dockerfiles_musa_sdk"
+  workdir: "dockerfiles_musa_sdk"
+
+test-musa-sdk-benchmark:
+  extends: ".test-musa-sdk-benchmark-base"
+  rules:
+    - if: '$EVENT_TYPE == "mr"'
+  repositories:
+    - repo: "sw/dockerfiles_musa_sdk"
+      branch: "deepV4"
+      alias: "dockerfiles_musa_sdk"
+  workdir: "dockerfiles_musa_sdk"

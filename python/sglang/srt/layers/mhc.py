@@ -22,6 +22,77 @@ FP8 = "float8_e4m3"
 BF16 = "bfloat16"
 FP32 = "float32"
 INT32 = "int32"
+MHC_PRE_BACKEND_SGLANG_TILELANG = "sglang_tilelang"
+MHC_PRE_BACKEND_TILEKERNELS = "tilekernels"
+MHC_PRE_BACKEND_AUTO = "auto"
+_MHC_PRE_BACKENDS = {
+    MHC_PRE_BACKEND_SGLANG_TILELANG,
+    MHC_PRE_BACKEND_TILEKERNELS,
+    MHC_PRE_BACKEND_AUTO,
+}
+
+
+def _get_mhc_pre_backend() -> str:
+    backend = envs.SGLANG_OPT_MHC_PRE_BACKEND.get().strip().lower()
+    if backend not in _MHC_PRE_BACKENDS:
+        raise ValueError(
+            f"Unsupported SGLANG_OPT_MHC_PRE_BACKEND={backend!r}. "
+            f"Supported values are {sorted(_MHC_PRE_BACKENDS)}."
+        )
+    return backend
+
+
+def _try_sglang_tilelang_mhc_pre(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int,
+) -> tuple[bool, tuple[torch.Tensor, torch.Tensor, torch.Tensor] | str]:
+    try:
+        from sglang.srt.hardware_backend.layers.deepseek_v4_musa.ops.mhc_ops import (
+            mhc_pre_big_fuse,
+        )
+    except ImportError as exc:
+        return False, f"SGLang-local MUSA MHC pre backend is unavailable: {exc}"
+
+    if residual.shape[-2] != 4:
+        return (
+            False,
+            "SGLang-local MUSA MHC pre backend only supports "
+            f"hc_mult=4, got {residual.shape[-2]}",
+        )
+
+    try:
+        return True, mhc_pre_big_fuse(
+            residual=residual,
+            fn=fn,
+            mhc_scale=hc_scale,
+            mhc_base=hc_base,
+            rms_eps=rms_eps,
+            mhc_pre_eps=hc_pre_eps,
+            mhc_sinkhorn_eps=hc_sinkhorn_eps,
+            mhc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
+            n_splits=n_splits,
+        )
+    except Exception as exc:
+        return False, (
+            "SGLang-local MUSA MHC pre backend failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+def _is_nsa_prefill_cp_round_robin_split_safe() -> bool:
+    try:
+        return is_nsa_prefill_cp_round_robin_split()
+    except Exception:
+        return False
 
 
 @tilelang.jit(pass_configs=pass_configs)
@@ -673,11 +744,77 @@ def mhc_pre(
     assert hc_scale.shape == (3,)
     assert hc_base.shape == (hc_mult3,)
 
+    backend = _get_mhc_pre_backend()
+    if norm_weight is None and backend in (
+        MHC_PRE_BACKEND_SGLANG_TILELANG,
+        MHC_PRE_BACKEND_TILEKERNELS,
+        MHC_PRE_BACKEND_AUTO,
+    ):
+        local_ok, local_result = _try_sglang_tilelang_mhc_pre(
+            residual=residual,
+            fn=fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_pre_eps,
+            hc_sinkhorn_eps=hc_sinkhorn_eps,
+            hc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
+            n_splits=n_splits,
+        )
+        if local_ok:
+            return local_result
+        if backend in (MHC_PRE_BACKEND_SGLANG_TILELANG, MHC_PRE_BACKEND_TILEKERNELS):
+            raise RuntimeError(local_result)
+
     outer_shape = residual.shape[:-2]
 
     residual_flat = residual.view(-1, hc_mult, hidden_size)
     num_tokens = residual_flat.shape[0]
     fn_flat = fn
+
+    def torch_fallback():
+        residual_float = residual_flat.float()
+        x_flat = residual_float.view(num_tokens, hc_hidden_size)
+        sqrsum = x_flat.square().sum(dim=-1)
+        mixes = torch.mm(x_flat, fn_flat.float().t())
+        mixes = mixes * torch.rsqrt(sqrsum.unsqueeze(-1) / hc_hidden_size + rms_eps)
+
+        pre = (
+            torch.sigmoid(
+                mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
+            )
+            + hc_pre_eps
+        )
+        post = hc_post_mult_value * torch.sigmoid(
+            mixes[:, hc_mult : 2 * hc_mult] * hc_scale[1]
+            + hc_base[hc_mult : 2 * hc_mult]
+        )
+        comb = (
+            mixes[:, 2 * hc_mult :].view(num_tokens, hc_mult, hc_mult)
+            * hc_scale[2]
+            + hc_base[2 * hc_mult :].view(1, hc_mult, hc_mult)
+        )
+        comb = torch.exp(comb - comb.max(dim=2, keepdim=True).values)
+        comb = comb / comb.sum(dim=2, keepdim=True) + hc_sinkhorn_eps
+        comb = comb / (comb.sum(dim=1, keepdim=True) + hc_sinkhorn_eps)
+        for _ in range(sinkhorn_repeat - 1):
+            comb = comb / (comb.sum(dim=2, keepdim=True) + hc_sinkhorn_eps)
+            comb = comb / (comb.sum(dim=1, keepdim=True) + hc_sinkhorn_eps)
+
+        y = (pre.unsqueeze(-1) * residual_float).sum(dim=1)
+        if norm_weight is not None:
+            assert norm_eps is not None, "norm_eps required when norm_weight is provided"
+            y = (
+                y
+                * torch.rsqrt(y.square().mean(dim=-1, keepdim=True) + norm_eps)
+                * norm_weight.float()
+            )
+        return (
+            post.view(*outer_shape, hc_mult, 1),
+            comb.view(*outer_shape, hc_mult, hc_mult),
+            y.to(torch.bfloat16).view(*outer_shape, hidden_size),
+        )
 
     post_mix = torch.empty(
         num_tokens, hc_mult, dtype=torch.float32, device=residual.device
@@ -690,26 +827,27 @@ def mhc_pre(
     )
 
     if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
-        import deep_gemm
-
-        n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
-
-        gemm_out_mul = torch.empty(
-            n_splits, num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
-        )
-        gemm_out_sqrsum = torch.empty(
-            n_splits, num_tokens, dtype=torch.float32, device=residual.device
+        from sglang.srt.hardware_backend.layers.deepseek_v4_musa.ops.mhc_prenorm_ops import (
+            mhc_prenorm_gemm_sqrsum,
         )
 
-        deep_gemm.tf32_hc_prenorm_gemm(
+        split_k = envs.SGLANG_OPT_MHC_PRENORM_SPLIT_K.get()
+        if split_k == 0:
+            split_k = envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM_SPLIT_K.get()
+        if split_k == 0:
+            split_k = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
+        gemm_out_mul, gemm_out_sqrsum = mhc_prenorm_gemm_sqrsum(
             residual_flat.view(num_tokens, hc_hidden_size),
             fn_flat,
-            gemm_out_mul,
-            gemm_out_sqrsum,
-            num_splits=n_splits,
+            split_k=split_k,
+            return_partials=True,
         )
-        gemm_last_dim = hc_mult3
-        big_fuse_n_splits = n_splits
+        if gemm_out_mul.ndim == 2:
+            gemm_out_mul = gemm_out_mul.unsqueeze(0)
+        if gemm_out_sqrsum.ndim == 1:
+            gemm_out_sqrsum = gemm_out_sqrsum.unsqueeze(0)
+        gemm_last_dim = gemm_out_mul.shape[-1]
+        big_fuse_n_splits = gemm_out_mul.shape[0]
     else:
         if num_tokens <= 2048:
             assert n_splits == 1
@@ -739,12 +877,17 @@ def mhc_pre(
             partial_sqrsum = torch.empty(
                 n_splits_pre, num_tokens, dtype=torch.float32, device=residual.device
             )
-            kernel_0(
-                residual_flat.view(num_tokens, hc_hidden_size),
-                fn_flat,
-                partial_out,
-                partial_sqrsum,
-            )
+            try:
+                kernel_0(
+                    residual_flat.view(num_tokens, hc_hidden_size),
+                    fn_flat,
+                    partial_out,
+                    partial_sqrsum,
+                )
+            except Exception:
+                if backend == MHC_PRE_BACKEND_AUTO:
+                    return torch_fallback()
+                raise
             # Stage_1 reduction is folded into big_fuse below; skip launching it.
             gemm_out_mul = partial_out
             gemm_out_sqrsum = partial_sqrsum
@@ -764,14 +907,19 @@ def mhc_pre(
             assert (
                 n_splits == 1
             ), "The simple TileLang version gemm_sqrsum doesn't support split-k"
-            mhc_pre_gemm_sqrsum_tilelang(
-                residual_flat.view(num_tokens, hc_mult * hidden_size),
-                fn_flat,
-                gemm_out_mul.squeeze(0),
-                gemm_out_sqrsum.squeeze(0),
-                hc_mult3,
-                hc_mult * hidden_size,
-            )
+            try:
+                mhc_pre_gemm_sqrsum_tilelang(
+                    residual_flat.view(num_tokens, hc_mult * hidden_size),
+                    fn_flat,
+                    gemm_out_mul.squeeze(0),
+                    gemm_out_sqrsum.squeeze(0),
+                    hc_mult3,
+                    hc_mult * hidden_size,
+                )
+            except Exception:
+                if backend == MHC_PRE_BACKEND_AUTO:
+                    return torch_fallback()
+                raise
             gemm_last_dim = hc_mult3
             big_fuse_n_splits = n_splits
 
@@ -787,47 +935,57 @@ def mhc_pre(
         )
         if not norm_weight_bf.is_contiguous():
             norm_weight_bf = norm_weight_bf.contiguous()
-        mhc_pre_big_fuse_with_norm_tilelang(
-            gemm_out_mul,
-            gemm_out_sqrsum,
-            hc_scale,
-            hc_base,
-            residual_flat,
-            post_mix,
-            comb_mix,
-            layer_input,
-            norm_weight_bf,
-            hidden_size,
-            rms_eps,
-            hc_pre_eps,
-            hc_sinkhorn_eps,
-            hc_post_mult_value,
-            sinkhorn_repeat,
-            norm_eps,
-            big_fuse_n_splits,
-            hc_mult,
-            gemm_last_dim,
-        )
+        try:
+            mhc_pre_big_fuse_with_norm_tilelang(
+                gemm_out_mul,
+                gemm_out_sqrsum,
+                hc_scale,
+                hc_base,
+                residual_flat,
+                post_mix,
+                comb_mix,
+                layer_input,
+                norm_weight_bf,
+                hidden_size,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                norm_eps,
+                big_fuse_n_splits,
+                hc_mult,
+                gemm_last_dim,
+            )
+        except Exception:
+            if backend == MHC_PRE_BACKEND_AUTO:
+                return torch_fallback()
+            raise
     else:
-        mhc_pre_big_fuse_tilelang(
-            gemm_out_mul,
-            gemm_out_sqrsum,
-            hc_scale,
-            hc_base,
-            residual_flat,
-            post_mix,
-            comb_mix,
-            layer_input,
-            hidden_size,
-            rms_eps,
-            hc_pre_eps,
-            hc_sinkhorn_eps,
-            hc_post_mult_value,
-            sinkhorn_repeat,
-            big_fuse_n_splits,
-            hc_mult,
-            gemm_last_dim,
-        )
+        try:
+            mhc_pre_big_fuse_tilelang(
+                gemm_out_mul,
+                gemm_out_sqrsum,
+                hc_scale,
+                hc_base,
+                residual_flat,
+                post_mix,
+                comb_mix,
+                layer_input,
+                hidden_size,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                big_fuse_n_splits,
+                hc_mult,
+                gemm_last_dim,
+            )
+        except Exception:
+            if backend == MHC_PRE_BACKEND_AUTO:
+                return torch_fallback()
+            raise
 
     post_mix = post_mix.view(*outer_shape, hc_mult, 1)
     comb_mix = comb_mix.view(*outer_shape, hc_mult, hc_mult)
@@ -898,11 +1056,21 @@ def mhc_post(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
-    if is_nsa_prefill_cp_round_robin_split():
+    if _is_nsa_prefill_cp_round_robin_split_safe():
         x = strict_contiguous(x)
         residual = strict_contiguous(residual)
         post_layer_mix = strict_contiguous(post_layer_mix)
         comb_res_mix = strict_contiguous(comb_res_mix)
+    try:
+        from sglang.srt.hardware_backend.layers.deepseek_v4_musa.ops.mhc_ops import (
+            mhc_post as sglang_local_mhc_post,
+        )
+
+        return sglang_local_mhc_post(x, residual, post_layer_mix, comb_res_mix)
+    except Exception:
+        # Keep the upstream in-file TileLang path as a compatibility fallback.
+        pass
+
     out = torch.empty_like(residual)
     mhc_post_tilelang(
         comb_res_mix,

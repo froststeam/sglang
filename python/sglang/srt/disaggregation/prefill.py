@@ -56,6 +56,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 
 if TYPE_CHECKING:
@@ -149,6 +150,10 @@ class PrefillBootstrapQueue:
         kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
         kv_args.prefill_end_layer = getattr(self.token_to_kv_pool, "end_layer", None)
         kv_args.mla_compression_ratios = None
+        if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+            kv_args.mla_compression_ratios = list(
+                self.token_to_kv_pool.compression_ratios
+            )
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )

@@ -10,7 +10,7 @@
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 
 #include <cstdint>
-#include <cuda_fp8.h>
+#include <musa_fp8.h>
 
 namespace {
 
@@ -156,7 +156,7 @@ struct MegaMoEPreDispatchKernel {
         .with_device(device)
         .verify(topk_weights);
     TensorMatcher({P, H})  // buf.x
-        .with_dtype<int8_t>()
+        .with_dtype<fp8_e4m3_t>()
         .with_device(device)
         .verify(buf_x);
     // buf.x_sf is the contiguous row-major int32 view from DeepGEMM's mega

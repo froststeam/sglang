@@ -26,7 +26,6 @@ static constexpr uint32_t kFullMask = 0xffffffffu;
 template <uint32_t kNumThreads = kWarpThreads, typename T>
 SGL_DEVICE T reduce_sum(T value, uint32_t active_mask = kFullMask) {
   static_assert(kNumThreads >= 1 && kNumThreads <= kWarpThreads);
-  static_assert(std::has_single_bit(kNumThreads), "must be pow of 2");
 #pragma unroll
   for (int mask = kNumThreads / 2; mask > 0; mask >>= 1)
     value = value + __shfl_xor_sync(active_mask, value, mask, 32);
@@ -49,7 +48,6 @@ SGL_DEVICE T reduce_sum(T value, uint32_t active_mask = kFullMask) {
 template <uint32_t kNumThreads = kWarpThreads, typename T>
 SGL_DEVICE T reduce_max(T value, uint32_t active_mask = kFullMask) {
   static_assert(kNumThreads >= 1 && kNumThreads <= kWarpThreads);
-  static_assert(std::has_single_bit(kNumThreads), "must be pow of 2");
 #pragma unroll
   for (int mask = kNumThreads / 2; mask > 0; mask >>= 1)
     value = math::max(value, __shfl_xor_sync(active_mask, value, mask, 32));

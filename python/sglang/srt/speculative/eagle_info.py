@@ -41,7 +41,6 @@ from sglang.srt.speculative.spec_utils import (
     create_num_accept_tokens_filter,
     filter_finished_cache_loc_kernel,
     generate_simulated_accept_index,
-    get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
 from sglang.srt.utils import is_cuda, is_musa, next_power_of_2
@@ -54,6 +53,193 @@ if is_cuda() or is_musa():
     )
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_accept_index(
+    accept_index: torch.Tensor,
+    upper_bound: int,
+    *,
+    context: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    accept_index_cpu = accept_index.detach().cpu().to(torch.int64)
+    invalid_mask = (accept_index_cpu < -1) | (accept_index_cpu >= upper_bound)
+    if not bool(torch.any(invalid_mask).item()):
+        num_correct_cpu = (accept_index_cpu != -1).sum(dim=1) - 1
+        num_correct_cpu = torch.clamp(num_correct_cpu, min=0)
+        return accept_index, num_correct_cpu.to(
+            device=accept_index.device, dtype=torch.int32
+        )
+
+    bs = accept_index_cpu.shape[0]
+    fallback_stride = upper_bound // bs if bs > 0 else 0
+    bad_rows, bad_cols = torch.nonzero(invalid_mask, as_tuple=True)
+    bad_values = accept_index_cpu[bad_rows, bad_cols]
+    logger.error(
+        "Invalid EAGLE accept_index detected in %s: upper_bound=%s, "
+        "shape=%s, fallback_stride=%s, bad_count=%s, bad_sample=%s",
+        context,
+        upper_bound,
+        tuple(accept_index_cpu.shape),
+        fallback_stride,
+        bad_values.numel(),
+        list(
+            zip(
+                bad_rows[:8].tolist(),
+                bad_cols[:8].tolist(),
+                bad_values[:8].tolist(),
+            )
+        ),
+    )
+
+    for row in torch.unique(bad_rows, sorted=True).tolist():
+        row_invalid_cols = bad_cols[bad_rows == row]
+        first_bad_col = int(row_invalid_cols.min().item())
+        accept_index_cpu[row, first_bad_col:] = -1
+        if first_bad_col == 0:
+            fallback_index = row * fallback_stride
+            if fallback_stride > 0 and fallback_index < upper_bound:
+                accept_index_cpu[row, 0] = fallback_index
+                logger.error(
+                    "Fallback EAGLE accept_index row in %s: row=%s, "
+                    "fallback_index=%s, upper_bound=%s",
+                    context,
+                    row,
+                    fallback_index,
+                    upper_bound,
+                )
+            else:
+                logger.error(
+                    "Drop EAGLE accept_index row in %s: row=%s, "
+                    "fallback_stride=%s, upper_bound=%s",
+                    context,
+                    row,
+                    fallback_stride,
+                    upper_bound,
+                )
+
+    num_correct_cpu = (accept_index_cpu != -1).sum(dim=1) - 1
+    num_correct_cpu = torch.clamp(num_correct_cpu, min=0)
+    return (
+        accept_index_cpu.to(device=accept_index.device, dtype=accept_index.dtype),
+        num_correct_cpu.to(device=accept_index.device, dtype=torch.int32),
+    )
+
+
+def _flatten_accept_index(
+    accept_index: torch.Tensor,
+    upper_bound: int,
+    *,
+    context: str,
+) -> torch.Tensor:
+    accept_index_cpu = accept_index.detach().cpu().to(torch.int64).flatten()
+    accept_index_cpu = accept_index_cpu[accept_index_cpu != -1]
+    invalid_mask = (accept_index_cpu < 0) | (accept_index_cpu >= upper_bound)
+    if bool(torch.any(invalid_mask).item()):
+        bad_values = accept_index_cpu[invalid_mask]
+        logger.error(
+            "Drop invalid flat EAGLE accept_index in %s: upper_bound=%s, "
+            "bad_count=%s, bad_sample=%s, all_sample=%s",
+            context,
+            upper_bound,
+            bad_values.numel(),
+            bad_values[:8].tolist(),
+            accept_index_cpu[:16].tolist(),
+        )
+        accept_index_cpu = accept_index_cpu[~invalid_mask]
+    return accept_index_cpu.to(device=accept_index.device, dtype=torch.int64)
+
+
+def _safe_index_select_1d(
+    tensor: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    context: str,
+) -> torch.Tensor:
+    indices = indices.to(device=tensor.device, dtype=torch.int64)
+    if indices.numel() == 0:
+        return tensor[:0]
+
+    indices_cpu = indices.detach().cpu()
+    invalid_mask = (indices_cpu < 0) | (indices_cpu >= tensor.shape[0])
+    if bool(torch.any(invalid_mask).item()):
+        bad_values = indices_cpu[invalid_mask]
+        logger.error(
+            "Drop invalid index_select indices in %s: tensor_len=%s, "
+            "bad_count=%s, bad_sample=%s, all_sample=%s",
+            context,
+            tensor.shape[0],
+            bad_values.numel(),
+            bad_values[:8].tolist(),
+            indices_cpu[:16].tolist(),
+        )
+        indices = indices_cpu[~invalid_mask].to(device=tensor.device, dtype=torch.int64)
+        if indices.numel() == 0:
+            return tensor[:0]
+
+    return torch.index_select(tensor, 0, indices)
+
+
+def _evict_indices_from_accept_index(
+    num_tokens: int,
+    accept_index: torch.Tensor,
+    *,
+    device: torch.device,
+    context: str,
+) -> torch.Tensor:
+    keep = torch.zeros((num_tokens,), dtype=torch.bool)
+    accept_index_cpu = accept_index.detach().cpu().to(torch.int64)
+    valid_mask = (accept_index_cpu >= 0) & (accept_index_cpu < num_tokens)
+    if not bool(torch.all(valid_mask).item()):
+        bad_values = accept_index_cpu[~valid_mask]
+        logger.error(
+            "Drop invalid keep indices in %s: num_tokens=%s, bad_count=%s, "
+            "bad_sample=%s, all_sample=%s",
+            context,
+            num_tokens,
+            bad_values.numel(),
+            bad_values[:8].tolist(),
+            accept_index_cpu[:16].tolist(),
+        )
+    keep[accept_index_cpu[valid_mask]] = True
+    return torch.nonzero(~keep, as_tuple=False).flatten().to(
+        device=device, dtype=torch.int64
+    )
+
+
+def _sanitize_num_correct_drafts(
+    num_correct_drafts: torch.Tensor,
+    accept_index: torch.Tensor,
+    spec_steps: int,
+    *,
+    context: str,
+) -> Tuple[torch.Tensor, torch.Tensor, List[int], List[int]]:
+    num_correct_cpu_raw = num_correct_drafts.detach().cpu().to(torch.int64)
+    num_correct_cpu = (
+        accept_index.detach().cpu().to(torch.int64) != -1
+    ).sum(dim=1) - 1
+    num_correct_cpu = torch.clamp(num_correct_cpu, min=0, max=spec_steps)
+
+    if (
+        num_correct_cpu_raw.shape != num_correct_cpu.shape
+        or not bool(torch.equal(num_correct_cpu_raw, num_correct_cpu))
+    ):
+        logger.debug(
+            "Repair EAGLE num_correct_drafts in %s: raw=%s, repaired=%s, "
+            "accept_index=%s, spec_steps=%s",
+            context,
+            num_correct_cpu_raw.tolist(),
+            num_correct_cpu.tolist(),
+            accept_index.detach().cpu().to(torch.int64).tolist(),
+            spec_steps,
+        )
+
+    num_correct_drafts = num_correct_cpu.to(
+        device=num_correct_drafts.device, dtype=torch.int32
+    )
+    num_accept_tokens = num_correct_drafts + 1
+    num_correct_list = num_correct_cpu.tolist()
+    num_accept_list = (num_correct_cpu + 1).tolist()
+    return num_correct_drafts, num_accept_tokens, num_correct_list, num_accept_list
 
 
 def _draft_runner_of(worker):
@@ -419,6 +605,16 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 spec_steps=self.spec_steps,
             )
 
+        accept_index, num_correct_drafts = _sanitize_accept_index(
+            accept_index,
+            min(
+                int(predict.numel()),
+                int(batch.out_cache_loc.numel()),
+                int(logits_output.next_token_logits.shape[0]),
+            ),
+            context="EagleVerifyInput.verify",
+        )
+
         unfinished_index = []
         unfinished_accept_index = []
         accept_index_cpu = accept_index.tolist()
@@ -471,23 +667,56 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         if has_finished:
             num_correct_drafts = (accept_index != -1).sum(dim=1) - 1
+        (
+            num_correct_drafts,
+            num_accept_tokens,
+            num_correct_drafts_list,
+            num_accept_tokens_list,
+        ) = _sanitize_num_correct_drafts(
+            num_correct_drafts,
+            accept_index,
+            self.spec_steps,
+            context="EagleVerifyInput.verify post-finish",
+        )
 
         # Free the KV cache for unaccepted tokens
-        # TODO: fuse them
-        accept_index = accept_index[accept_index != -1]
-        accept_tokens = predict[accept_index]
+        # TODO: fuse them. Keep this index path conservative on MUSA: CPU builds
+        # the tiny index tensors, then device code uses index_select/index_fill
+        # instead of PyTorch advanced indexing kernels.
+        accept_index = _flatten_accept_index(
+            accept_index,
+            min(
+                int(predict.numel()),
+                int(batch.out_cache_loc.numel()),
+                int(self.draft_token.numel()),
+                int(logits_output.next_token_logits.shape[0]),
+            ),
+            context="EagleVerifyInput.verify flat",
+        )
+        accept_tokens = _safe_index_select_1d(
+            predict, accept_index, context="EagleVerifyInput.verify predict"
+        )
         evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
-        evict_mask[accept_index] = False
-        num_correct_drafts_cpu = num_correct_drafts.cpu()
-        num_accept_tokens_cpu = num_correct_drafts_cpu + 1
-        # FIXME: this `tolist()` fixes the numerical calculation consistency
-        # try to unify the tensor representation and list representation
-        num_correct_drafts_list = num_correct_drafts_cpu.tolist()
-        num_accept_tokens_list = num_accept_tokens_cpu.tolist()
+        if accept_index.numel() > 0:
+            evict_mask.index_fill_(0, accept_index, False)
+        num_accept_tokens_cpu = torch.tensor(
+            num_accept_tokens_list, dtype=torch.int64
+        )
 
         if page_size == 1:
-            # TODO: boolean array index leads to a device sync. Remove it.
-            token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+            evict_indices = _evict_indices_from_accept_index(
+                int(self.draft_token.numel()),
+                accept_index,
+                device=batch.out_cache_loc.device,
+                context="EagleVerifyInput.verify page_size_1",
+            )
+            token_to_kv_pool_allocator.free(
+                _safe_index_select_1d(
+                    batch.out_cache_loc,
+                    evict_indices,
+                    context="EagleVerifyInput.verify evict page_size_1",
+                )
+            )
         else:
             if self.topk == 1:
                 # Only evict full empty page. Do not evict partial empty page
@@ -498,18 +727,50 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     self.draft_token_num,
                     next_power_of_2(self.draft_token_num),
                 )
-                token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+                evict_indices = torch.nonzero(
+                    evict_mask.detach().cpu(), as_tuple=False
+                ).flatten()
+                token_to_kv_pool_allocator.free(
+                    _safe_index_select_1d(
+                        batch.out_cache_loc,
+                        evict_indices.to(
+                            device=batch.out_cache_loc.device, dtype=torch.int64
+                        ),
+                        context="EagleVerifyInput.verify evict topk_1",
+                    )
+                )
             else:
                 # Shift the accepted tokens to the beginning.
                 # Only evict the last part
-                src_cache_loc, tgt_cache_loc, to_free_num_slots = get_src_tgt_cache_loc(
-                    batch.seq_lens,
+                src_cache_loc = _safe_index_select_1d(
                     batch.out_cache_loc,
                     accept_index,
-                    num_correct_drafts,
-                    self.draft_token_num,
-                    page_size,
+                    context="EagleVerifyInput.verify src_cache_loc",
                 )
+                tgt_cache_loc = torch.empty_like(src_cache_loc)
+                extended_len = batch.seq_lens + self.draft_token_num
+                keep_len = torch.minimum(
+                    (
+                        batch.seq_lens
+                        + num_correct_drafts
+                        + 1
+                        + page_size
+                        - 1
+                    )
+                    // page_size
+                    * page_size,
+                    extended_len,
+                )
+                to_free_num_slots = extended_len - keep_len
+                if src_cache_loc.numel() != int((num_correct_drafts + 1).sum().item()):
+                    logger.error(
+                        "EAGLE src_cache_loc length mismatch: src_len=%s, "
+                        "expected=%s, accept_index_sample=%s, num_correct=%s",
+                        src_cache_loc.numel(),
+                        int((num_correct_drafts + 1).sum().item()),
+                        accept_index.detach().cpu()[:16].tolist(),
+                        num_correct_drafts.detach().cpu().tolist(),
+                    )
                 to_free_slots = torch.empty(
                     (to_free_num_slots.sum().item(),),
                     dtype=torch.int64,
@@ -547,28 +808,36 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # Construct EagleVerifyOutput
         if not has_finished:
             if page_size == 1 or self.topk == 1:
-                batch.out_cache_loc = batch.out_cache_loc[accept_index]
+                batch.out_cache_loc = _safe_index_select_1d(
+                    batch.out_cache_loc,
+                    accept_index,
+                    context="EagleVerifyInput.verify accepted out_cache_loc",
+                )
                 assign_req_to_token_pool_func(
                     batch.req_pool_indices,
                     batch.req_to_token_pool.req_to_token,
                     batch.seq_lens,
-                    batch.seq_lens + num_correct_drafts + 1,
+                    batch.seq_lens + num_accept_tokens,
                     batch.out_cache_loc,
                     bs,
                 )
             else:
                 batch.out_cache_loc = tgt_cache_loc
-            batch.seq_lens.add_(num_correct_drafts + 1)
+            batch.seq_lens.add_(num_accept_tokens)
             batch.seq_lens_cpu.add_(num_accept_tokens_cpu)
 
             draft_extend_input = EagleDraftExtendInput(
                 hidden_states=(
-                    batch.spec_info.hidden_states[accept_index]
+                    _safe_index_select_1d(
+                        batch.spec_info.hidden_states,
+                        accept_index,
+                        context="EagleVerifyInput.verify hidden_states",
+                    )
                     if batch.spec_info.hidden_states is not None
                     else None
                 ),
                 num_correct_drafts=num_correct_drafts,
-                num_accept_tokens=num_correct_drafts + 1,
+                num_accept_tokens=num_accept_tokens,
                 num_accept_tokens_cpu=num_accept_tokens_list,
                 input_ids=accept_tokens,
                 seq_lens=batch.seq_lens,
@@ -589,11 +858,15 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     batch.req_pool_indices,
                     batch.req_to_token_pool.req_to_token,
                     batch.seq_lens,
-                    batch.seq_lens + num_correct_drafts + 1,
-                    batch.out_cache_loc[accept_index],
+                    batch.seq_lens + num_accept_tokens,
+                    _safe_index_select_1d(
+                        batch.out_cache_loc,
+                        accept_index,
+                        context="EagleVerifyInput.verify finished out_cache_loc",
+                    ),
                     bs,
                 )
-                batch.seq_lens.add_(num_correct_drafts + 1)
+                batch.seq_lens.add_(num_accept_tokens)
                 batch.seq_lens_cpu.add_(num_accept_tokens_cpu)
 
             if len(unfinished_accept_index) > 0:
@@ -608,7 +881,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     num_accept_tokens_list[i] for i in unfinished_index
                 ]
                 if page_size == 1 or self.topk == 1:
-                    batch.out_cache_loc = batch.out_cache_loc[unfinished_accept_index]
+                    batch.out_cache_loc = _safe_index_select_1d(
+                        batch.out_cache_loc,
+                        unfinished_accept_index,
+                        context="EagleVerifyInput.verify unfinished out_cache_loc",
+                    )
                 else:
                     batch.out_cache_loc = torch.empty(
                         len(unfinished_index) + sum(draft_input_num_correct_drafts_cpu),
@@ -630,22 +907,34 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         next_power_of_2(self.draft_token_num),
                     )
 
-                unfinished_num_correct_drafts = num_correct_drafts[
-                    unfinished_index_device
-                ]
+                unfinished_num_correct_drafts = torch.index_select(
+                    num_correct_drafts, 0, unfinished_index_device
+                )
                 draft_extend_input = EagleDraftExtendInput(
                     hidden_states=(
-                        batch.spec_info.hidden_states[unfinished_accept_index]
+                        _safe_index_select_1d(
+                            batch.spec_info.hidden_states,
+                            unfinished_accept_index,
+                            context="EagleVerifyInput.verify unfinished hidden_states",
+                        )
                         if batch.spec_info.hidden_states is not None
                         else None
                     ),
                     num_accept_tokens_cpu=draft_input_num_accept_tokens_cpu,
                     num_correct_drafts=unfinished_num_correct_drafts,
                     num_accept_tokens=unfinished_num_correct_drafts + 1,
-                    input_ids=predict[unfinished_accept_index],
-                    seq_lens=batch.seq_lens[unfinished_index_device],
+                    input_ids=_safe_index_select_1d(
+                        predict,
+                        unfinished_accept_index,
+                        context="EagleVerifyInput.verify unfinished predict",
+                    ),
+                    seq_lens=torch.index_select(
+                        batch.seq_lens, 0, unfinished_index_device
+                    ),
                     seq_lens_cpu=batch.seq_lens_cpu[unfinished_index],
-                    req_pool_indices=batch.req_pool_indices[unfinished_index_device],
+                    req_pool_indices=torch.index_select(
+                        batch.req_pool_indices, 0, unfinished_index_device
+                    ),
                 )
             else:
                 # hidden_size=None: worker fixup rebuilds via
@@ -804,23 +1093,34 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         # Detect idle stub by `topk_index` length (idle inputs have
         # shape[0] == 0 across all fields). Don't use `hidden_states is None`:
         # for STANDALONE all non-idle inputs also have None hidden_states.
-        if len(self.topk_index) == 0:
+        if self.topk_index is None or len(self.topk_index) == 0:
             self.hidden_states = spec_info.hidden_states
             self.bonus_tokens = spec_info.bonus_tokens
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
             return
-        if len(spec_info.topk_index) == 0:
+        if spec_info.topk_index is None or len(spec_info.topk_index) == 0:
             return
-        if self.hidden_states is not None and spec_info.hidden_states is not None:
+        if self.hidden_states is None:
+            self.hidden_states = spec_info.hidden_states
+        elif spec_info.hidden_states is not None:
             self.hidden_states = torch.cat(
                 [self.hidden_states, spec_info.hidden_states], axis=0
             )
-        self.bonus_tokens = torch.cat(
-            [self.bonus_tokens, spec_info.bonus_tokens], axis=0
-        )
-        self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
-        self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        if self.bonus_tokens is None:
+            self.bonus_tokens = spec_info.bonus_tokens
+        elif spec_info.bonus_tokens is not None:
+            self.bonus_tokens = torch.cat(
+                [self.bonus_tokens, spec_info.bonus_tokens], axis=0
+            )
+        if self.topk_p is None:
+            self.topk_p = spec_info.topk_p
+        elif spec_info.topk_p is not None:
+            self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
+        if self.topk_index is None:
+            self.topk_index = spec_info.topk_index
+        elif spec_info.topk_index is not None:
+            self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
 
 
 @dataclass
@@ -939,6 +1239,72 @@ class EagleDraftExtendInput(SpecInput):
         assert batch.spec_info is self
         if batch.forward_mode.is_idle():
             return
+
+        max_accept_tokens = speculative_num_steps + 1
+        accept_tokens_cpu = list(self.num_accept_tokens_cpu)
+        input_len = int(self.input_ids.numel())
+        invalid_accept_lens = (
+            len(accept_tokens_cpu) != int(self.seq_lens.numel())
+            or any(x < 0 or x > max_accept_tokens for x in accept_tokens_cpu)
+            or sum(accept_tokens_cpu) != input_len
+        )
+        if invalid_accept_lens:
+            repaired_accept_tokens_cpu = (
+                self.num_accept_tokens.detach().cpu().to(torch.int64).tolist()
+            )
+            if (
+                len(repaired_accept_tokens_cpu) != int(self.seq_lens.numel())
+                or any(
+                    x < 0 or x > max_accept_tokens for x in repaired_accept_tokens_cpu
+                )
+                or sum(repaired_accept_tokens_cpu) != input_len
+            ):
+                remaining = input_len
+                repaired_accept_tokens_cpu = []
+                for _ in range(int(self.seq_lens.numel())):
+                    cur_len = min(max_accept_tokens, remaining)
+                    repaired_accept_tokens_cpu.append(cur_len)
+                    remaining -= cur_len
+
+            logger.error(
+                "Repair invalid EAGLE draft-extend accept lens: raw=%s, repaired=%s, "
+                "input_len=%s, bs=%s, max_accept_tokens=%s, seq_lens_cpu=%s",
+                accept_tokens_cpu,
+                repaired_accept_tokens_cpu,
+                input_len,
+                int(self.seq_lens.numel()),
+                max_accept_tokens,
+                self.seq_lens_cpu.detach().cpu().to(torch.int64).tolist(),
+            )
+            self.num_accept_tokens_cpu = repaired_accept_tokens_cpu
+            self.num_accept_tokens = torch.tensor(
+                repaired_accept_tokens_cpu,
+                dtype=self.num_accept_tokens.dtype,
+                device=self.num_accept_tokens.device,
+            )
+            self.num_correct_drafts = torch.clamp(self.num_accept_tokens - 1, min=0)
+
+        seq_lens_cpu = self.seq_lens_cpu.detach().cpu().to(torch.int64)
+        if bool(torch.any((seq_lens_cpu < 0) | (seq_lens_cpu > 2**31 - 1)).item()):
+            if len(batch.reqs) == int(self.seq_lens_cpu.numel()):
+                repaired_seq_lens_cpu = torch.tensor(
+                    [req.kv_committed_len for req in batch.reqs], dtype=torch.int64
+                )
+            else:
+                repaired_seq_lens_cpu = torch.clamp(
+                    self.seq_lens.detach().cpu().to(torch.int64),
+                    min=0,
+                    max=2**31 - 1,
+                )
+            logger.error(
+                "Repair invalid EAGLE draft-extend seq_lens_cpu: raw=%s, repaired=%s",
+                seq_lens_cpu.tolist(),
+                repaired_seq_lens_cpu.tolist(),
+            )
+            self.seq_lens_cpu = repaired_seq_lens_cpu
+            self.seq_lens = repaired_seq_lens_cpu.to(
+                device=self.seq_lens.device, dtype=self.seq_lens.dtype
+            )
 
         # The kernel below populates `self.positions` and `self.bonus_tokens`;
         # the worker reads `self.bonus_tokens` to construct next iter's

@@ -583,20 +583,52 @@ class Envs:
 
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
+    # EAGLE v2 draft extend (DRAFT_EXTEND_V2) cuda graph for DeepseekV4AttnBackend.
+    SGLANG_DSV4_EAGLE_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
+    # Shard hc_head_fn on hc_dim (hc_mult * hidden_size) by --tp at load time (row-TP).
+    SGLANG_DSV4_HC_HEAD_TP = EnvBool(False)
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
+    # High-level kill switch for experimental DSV4 MUSA MoE dispatch.
+    SGLANG_DSV4_MUSA_MOE_EXPERIMENTAL = EnvBool(False)
 
     # CUDA kernels
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
+    # 0 means use backend default/auto heuristic. Positive values are passed to
+    # DeepGEMM/TileLang MHC prenorm split-K paths when applicable.
+    SGLANG_OPT_DEEPGEMM_HC_PRENORM_SPLIT_K = EnvInt(0)
+    SGLANG_OPT_MHC_PRENORM_BACKEND = EnvStr("auto")
+    SGLANG_OPT_MHC_PRENORM_SPLIT_K = EnvInt(0)
+    SGLANG_OPT_MHC_PRENORM_TILELANG_IMPL = EnvStr("auto")
+    SGLANG_OPT_MHC_PRENORM_TILELANG_TOKEN_BLOCK = EnvInt(0)
+    SGLANG_OPT_MHC_PRENORM_TILELANG_STAGES = EnvInt(0)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
+    SGLANG_OPT_MHC_PRE_BACKEND = EnvStr("auto")
+    SGLANG_OPT_MHC_PRE_BIG_FUSE_THREADS = EnvInt(0)
+    SGLANG_OPT_MHC_PRE_BIG_FUSE_HIDDEN_BLOCK = EnvInt(0)
+    SGLANG_OPT_MHC_PRE_BIG_FUSE_PASS_CONFIG = EnvStr("auto")
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
+    SGLANG_OPT_MHC_POST_THREADS = EnvInt(0)
+    SGLANG_OPT_MHC_POST_HIDDEN_BLOCK = EnvInt(0)
+    SGLANG_OPT_MHC_POST_PASS_CONFIG = EnvStr("auto")
+    SGLANG_OPT_MHC_POST_LAYOUT = EnvStr("auto")
+    SGLANG_OPT_MHC_POST_DIRECT_STORE = EnvBool(False)
+    SGLANG_OPT_HC_HEAD_TILELANG = EnvBool(False)
+    SGLANG_OPT_HC_HEAD_TILELANG_STRICT = EnvBool(False)
+    SGLANG_OPT_USE_TILELANG_RMSNORM = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
+    SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(False)
+    SGLANG_OPT_FLASHMLA_SPARSE_PREFILL_C4_KVCACHE = EnvBool(False)
+    SGLANG_OPT_DSV4_FLASHMLA_LOCAL_DECODE_Q = EnvBool(True)
+    SGLANG_OPT_DSV4_FLASHMLA_LOCAL_PREFILL_Q = EnvBool(True)
+    SGLANG_DEEPSEEK_V4_MUSA_ENABLE_JIT_TOPK512 = EnvBool(False)
+    SGLANG_DEEPSEEK_V4_MUSA_ENABLE_JIT_TOPK1024 = EnvBool(False)
 
     # SWA radix cache
     SGLANG_OPT_CACHE_SWA_TRANSLATION = EnvBool(True)
@@ -620,14 +652,18 @@ class Envs:
     # this combination on the host side.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND = EnvBool(False)
     SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
+    SGLANG_OPT_USE_TILEKERNELS_FP8_QUANT = EnvBool(False)
+    SGLANG_OPT_USE_TILEKERNELS_SWIGLU_QUANT = EnvBool(False)
 
     # TopK
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
+    SGLANG_OPT_USE_TILELANG_MOE_FUSED_GATE = EnvBool(False)
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
 
     # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
+    SGLANG_OPT_DSV4_MUSA_TILELANG_WO_A = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)

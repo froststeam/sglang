@@ -81,6 +81,7 @@ sources = [
     "csrc/common_extension_musa.cc",
     "csrc/elementwise/activation.cu",
     "csrc/elementwise/concat_mla.cu",
+    "csrc/elementwise/hadamard.cpp",
     "csrc/elementwise/pos_enc.cu",
     "csrc/elementwise/fused_add_rms_norm_kernel.mu",
     "csrc/elementwise/topk.cu",
@@ -144,6 +145,20 @@ if mtgpu_target not in ["mp_22", "mp_31"]:
         f"Warning: Unsupported GPU architecture detected '{mtgpu_target}'. Expected 'mp_22' or 'mp_31'."
     )
     sys.exit(1)
+
+# XXX (MUSA): These flags should NOT be published outside
+mcc_private_use_flags = [
+    "-mllvm",
+    "-mtgpu-combine-instr-with-burst=0",
+    "-mllvm",
+    "-mtgpu-enchanced-minreg-schedule=1",
+    "-mllvm",
+    "-mtgpu-enable-preisel-sinking=0",
+    #"-mllvm",
+    #"-mtgpu-attr-alloc-first=1",
+    "-mllvm",
+    "-misched-recompute-slotindex",
+]
 
 mcc_flags = [
     "-DNDEBUG",

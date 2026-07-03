@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
@@ -68,6 +69,122 @@ else:
 
 _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
+# TileKernels fused SwiGLU+quant wins on prefill-sized M; decode small-M stays
+# on the existing split path until a subwarp-per-group TileKernels kernel exists.
+_TILEKERNELS_SWIGLU_QUANT_MIN_ROWS = 1024
+_DSV4_MUSA_COMPACT_MOE_MIN_TOKENS = 8192
+
+
+def _debug_tilekernels_swiglu_quant_miss_musa(reason: str) -> None:
+    if os.environ.get("SGLANG_DEBUG_TILEKERNELS_SWIGLU_QUANT") == "1":
+        print(f"[SGLang][MUSA] TileKernels SwiGLU+quant miss: {reason}", flush=True)
+
+
+def _try_tilekernels_swiglu_quant_musa(
+    gateup_output: torch.Tensor,
+    group_size: int,
+    swiglu_limit: Optional[float],
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    if not (_is_musa and envs.SGLANG_DSV4_MUSA_MOE_EXPERIMENTAL.get()):
+        _debug_tilekernels_swiglu_quant_miss_musa("disabled_or_non_musa")
+        return None
+    if gateup_output.dim() != 2:
+        _debug_tilekernels_swiglu_quant_miss_musa(
+            f"rank={gateup_output.dim()} expected=2"
+        )
+        return None
+    if gateup_output.shape[0] < _TILEKERNELS_SWIGLU_QUANT_MIN_ROWS:
+        _debug_tilekernels_swiglu_quant_miss_musa(
+            f"rows={gateup_output.shape[0]} below_prefill_threshold="
+            f"{_TILEKERNELS_SWIGLU_QUANT_MIN_ROWS}"
+        )
+        return None
+    if gateup_output.shape[-1] % 2 != 0:
+        _debug_tilekernels_swiglu_quant_miss_musa(
+            f"hidden2={gateup_output.shape[-1]} is_odd"
+        )
+        return None
+    if group_size != 128:
+        _debug_tilekernels_swiglu_quant_miss_musa(f"group_size={group_size}")
+        return None
+    if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        _debug_tilekernels_swiglu_quant_miss_musa("scale_ue8m0_enabled")
+        return None
+    if gateup_output.dtype not in (torch.bfloat16, torch.float16):
+        _debug_tilekernels_swiglu_quant_miss_musa(f"dtype={gateup_output.dtype}")
+        return None
+    if not gateup_output.is_contiguous():
+        _debug_tilekernels_swiglu_quant_miss_musa("input_not_contiguous")
+        return None
+
+    try:
+        import tile_kernels.quant as tile_quant
+
+        quantized, scale = tile_quant.swiglu_forward_and_per_token_cast(
+            x=gateup_output,
+            fmt="e4m3",
+            num_per_channels=group_size,
+            pos_to_expert=None,
+            pos_to_token_topk=None,
+            topk_weights=None,
+            swiglu_clamp_value=swiglu_limit,
+            use_tma_aligned_col_major_sf=False,
+            round_sf=False,
+            use_packed_ue8m0=False,
+            clamped_count=None,
+        )
+    except Exception as exc:
+        _debug_tilekernels_swiglu_quant_miss_musa(
+            f"tile_kernels_exception={type(exc).__name__}: {exc}"
+        )
+        return None
+
+    expected_output_shape = (
+        gateup_output.shape[0],
+        gateup_output.shape[1] // 2,
+    )
+    expected_scale_shape = (
+        expected_output_shape[0],
+        expected_output_shape[1] // group_size,
+    )
+    if quantized.shape != expected_output_shape or scale.shape != expected_scale_shape:
+        _debug_tilekernels_swiglu_quant_miss_musa(
+            f"bad_output_shape quantized={tuple(quantized.shape)} scale={tuple(scale.shape)} "
+            f"expected_quantized={expected_output_shape} expected_scale={expected_scale_shape}"
+        )
+        return None
+    return quantized, scale.to(torch.float32)
+
+
+def _should_use_dsv4_musa_compact_prefill_deepgemm(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> bool:
+    if not (
+        _is_musa
+        and quant_info.use_fp8
+        and envs.SGLANG_DSV4_MUSA_MOE_EXPERIMENTAL.get()
+        and hidden_states.dim() == 2
+        and hidden_states.shape[0] >= _DSV4_MUSA_COMPACT_MOE_MIN_TOKENS
+        and topk_ids.numel() > 0
+    ):
+        return False
+
+    from sglang.srt.layers.moe.ep_moe.kernels import (
+        select_moe_ep_deepgemm_compact_fixed_bucket_rows_musa,
+    )
+
+    return (
+        select_moe_ep_deepgemm_compact_fixed_bucket_rows_musa(
+            int(hidden_states.shape[0]),
+            int(runner_config.num_local_experts),
+            int(runner_config.top_k),
+            deep_gemm_wrapper.DEEPGEMM_BLOCK_M,
+        )
+        is not None
+    )
 
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
@@ -305,41 +422,50 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             # Hacky byte-equal fallback that reproduces the optimize-branch
             # code path exactly: bf16 silu_and_mul then a separate per-token
             # group fp8 quant. Kept behind the mega-moe-memory flag.
-            if self.swiglu_limit is not None:
-                gateup_output = _apply_swiglu_limit(
-                    gateup_output, swiglu_limit=self.swiglu_limit
-                )
-
-            if not _is_musa:
-                down_input = torch.empty(
-                    (all_tokens, N // 2),
-                    device=gateup_output.device,
-                    dtype=torch.bfloat16,
-                )
-                _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
-            else:
-                gateup_output = gateup_output.view(-1, N)
-                down_input = torch.empty(
-                    (all_tokens, N // 2),
-                    device=gateup_output.device,
-                    dtype=torch.bfloat16,
-                )
-                act_and_mul(
-                    gateup_output,
-                    down_input,
-                    topk_ids=m_indices,
-                    activation=self.config.activation,
-                )
-            del gateup_output
-
-            down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
-                down_input,
+            fused_quant = _try_tilekernels_swiglu_quant_musa(
+                gateup_output.view(-1, N),
                 scale_block_size,
-                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                self.swiglu_limit,
             )
-            del down_input
+            if fused_quant is not None:
+                down_input_fp8, down_input_scale = fused_quant
+                del gateup_output
+            else:
+                if self.swiglu_limit is not None:
+                    gateup_output = _apply_swiglu_limit(
+                        gateup_output, swiglu_limit=self.swiglu_limit
+                    )
+
+                if not _is_musa:
+                    down_input = torch.empty(
+                        (all_tokens, N // 2),
+                        device=gateup_output.device,
+                        dtype=torch.bfloat16,
+                    )
+                    _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
+                elif _is_musa:
+                    gateup_output = gateup_output.view(-1, N)
+                    down_input = torch.empty(
+                        (all_tokens, N // 2),
+                        device=gateup_output.device,
+                        dtype=torch.bfloat16,
+                    )
+                    act_and_mul(
+                        gateup_output,
+                        down_input,
+                        topk_ids=m_indices,
+                        activation=self.config.activation,
+                    )
+                del gateup_output
+
+                down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
+                    down_input,
+                    scale_block_size,
+                    column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                )
+                del down_input
 
         down_output = torch.empty(
             (all_tokens, K),
@@ -690,13 +816,23 @@ def pre_permute_standard_to_deep_gemm(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepGemmRunnerInput:
-    from sglang.srt.layers.moe.ep_moe.kernels import moe_ep_deepgemm_preprocess
-
     hidden_states, topk_output = (
         dispatch_output.hidden_states,
         dispatch_output.topk_output,
     )
     topk_weights, topk_ids, _ = topk_output
+
+    if _should_use_dsv4_musa_compact_prefill_deepgemm(
+        hidden_states, topk_ids, quant_info, runner_config
+    ):
+        return _pre_permute_standard_to_deep_gemm_compact_musa(
+            dispatch_output,
+            quant_info,
+            runner_config,
+            running_state,
+        )
+
+    from sglang.srt.layers.moe.ep_moe.kernels import moe_ep_deepgemm_preprocess
 
     hidden_states_shape = hidden_states.shape
     hidden_states_dtype = hidden_states.dtype
@@ -875,6 +1011,55 @@ def pre_permute_standard_to_deep_gemm(
     )
 
 
+def _pre_permute_standard_to_deep_gemm_compact_musa(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> DeepGemmRunnerInput:
+    from sglang.srt.layers.moe.ep_moe.kernels import (
+        moe_ep_deepgemm_compact_preprocess_musa,
+    )
+
+    hidden_states, topk_output = (
+        dispatch_output.hidden_states,
+        dispatch_output.topk_output,
+    )
+    topk_weights, topk_ids, _ = topk_output
+
+    hidden_states_shape = hidden_states.shape
+    hidden_states_dtype = hidden_states.dtype
+    hidden_states_device = hidden_states.device
+    hidden_states_ref = hidden_states
+
+    src2dst, input_tensor, input_tensor_scale, m_indices, all_tokens = (
+        moe_ep_deepgemm_compact_preprocess_musa(
+            topk_ids,
+            runner_config.num_local_experts,
+            hidden_states,
+            runner_config.top_k,
+            quant_info.block_shape,
+        )
+    )
+
+    dispose_tensor(hidden_states_ref)
+
+    running_state["topk_ids"] = topk_ids
+    running_state["topk_weights"] = topk_weights
+    running_state["hidden_states_shape"] = hidden_states_shape
+    running_state["hidden_states_dtype"] = hidden_states_dtype
+    running_state["hidden_states_device"] = hidden_states_device
+    running_state["src2dst"] = src2dst
+    running_state["all_tokens"] = all_tokens
+
+    return DeepGemmRunnerInput(
+        hidden_states=input_tensor,
+        hidden_states_scale=input_tensor_scale,
+        use_masked_gemm=False,
+        m_indices=m_indices,
+    )
+
+
 @register_post_permute("deep_gemm", "standard")
 def post_permute_deep_gemm_to_standard(
     runner_output: DeepGemmRunnerOutput,
@@ -895,19 +1080,22 @@ def post_permute_deep_gemm_to_standard(
     output = torch.empty(
         hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
     )
-    # XXX (MUSA): Larger hidden blocks improve the post-combine bandwidth on
-    # MUSA for Qwen3.6 GDN/MoE shapes; keep the existing 512 block elsewhere.
-    block_size = 512 if not _is_musa else 1024
-    post_reorder_triton_kernel[(hidden_states_shape[0],)](
-        runner_output.hidden_states,
-        output,
-        src2dst,
-        topk_ids,
-        topk_weights,
-        runner_config.top_k,
-        hidden_states_shape[1],
-        BLOCK_SIZE=block_size,
-    )
+    with torch.profiler.record_function("DSV4_MOE_POST_COMBINE"):
+        # TileLang post-combine is temporarily disabled in the production path:
+        # current E2E indicates a correctness/stability issue for real MoE shapes.
+        # XXX (MUSA): Larger hidden blocks improve the post-combine bandwidth on
+        # MUSA for Qwen3.6 GDN/MoE shapes; keep the existing 512 block elsewhere.
+        block_size = 512 if not _is_musa else 1024
+        post_reorder_triton_kernel[(hidden_states_shape[0],)](
+            runner_output.hidden_states,
+            output,
+            src2dst,
+            topk_ids,
+            topk_weights,
+            runner_config.top_k,
+            hidden_states_shape[1],
+            BLOCK_SIZE=block_size,
+        )
 
     dispose_tensor(runner_output.hidden_states)
 
@@ -1263,7 +1451,11 @@ def _varlen_deep_gemm_silu_mul_quant(
     )
 
     if _is_musa:
-        assert swiglu_limit is None
+        if swiglu_limit is not None:
+            gateup_output = _apply_swiglu_limit(
+                gateup_output.reshape(-1, D * 2), swiglu_limit=swiglu_limit
+            ).view(E, N, D * 2)
+            swiglu_limit = None
         assert not swizzle
         down_input_scale = torch.empty(
             (E, N, G),

@@ -192,6 +192,8 @@ class BenchArgs:
     prompt_filename: str = ""
     result_filename: str = "result.jsonl"
     correctness_test: bool = False
+    correctness_dump_filename: str = ""
+    correctness_dump_decode_logits_steps: int = 0
     # This is only used for correctness test
     cut_len: int = 4
     log_decode_step: int = 0
@@ -222,6 +224,18 @@ class BenchArgs:
             "--result-filename", type=str, default=BenchArgs.result_filename
         )
         parser.add_argument("--correctness-test", action="store_true")
+        parser.add_argument(
+            "--correctness-dump-filename",
+            type=str,
+            default=BenchArgs.correctness_dump_filename,
+            help="Optional torch.save output for correctness-test tokens/logits on rank 0.",
+        )
+        parser.add_argument(
+            "--correctness-dump-decode-logits-steps",
+            type=int,
+            default=BenchArgs.correctness_dump_decode_logits_steps,
+            help="Number of decode-step logits tensors to include in the correctness dump.",
+        )
         parser.add_argument("--cut-len", type=int, default=BenchArgs.cut_len)
         parser.add_argument(
             "--log-decode-step",
@@ -630,11 +644,30 @@ def correctness_test(
         bench_args, tokenizer, custom_prompts
     )
     rank_print(f"\n{input_ids=}\n")
+    correctness_dump = None
+    if tp_rank == 0 and bench_args.correctness_dump_filename:
+        correctness_dump = {
+            "input_ids": input_ids,
+            "cut_len": bench_args.cut_len,
+            "output_len": bench_args.output_len[0],
+            "model_path": server_args.model_path,
+            "tp_size": server_args.tp_size,
+            "prefill_first_half_logits": None,
+            "prefill_final_logits": None,
+            "decode_next_token_ids": [],
+            "decode_logits": [],
+            "output_ids": None,
+            "output_texts": None,
+        }
 
     if bench_args.cut_len > 0:
         # Prefill
         next_token_ids, next_token_logits, batch = model_runner.extend(reqs)
         rank_print(f"prefill logits (first half): {next_token_logits} \n")
+        if correctness_dump is not None:
+            correctness_dump["prefill_first_half_logits"] = (
+                next_token_logits.detach().cpu()
+            )
 
         # Prepare extend inputs
         torch_runner = getattr(model_runner, "torch_runner", None)
@@ -645,12 +678,28 @@ def correctness_test(
     # Extend (prefill w/ KV cache)
     next_token_ids, next_token_logits, batch = model_runner.extend(reqs)
     rank_print(f"prefill logits (final): {next_token_logits} \n")
+    if correctness_dump is not None:
+        correctness_dump["prefill_final_logits"] = next_token_logits.detach().cpu()
+        correctness_dump["prefill_next_token_ids"] = [
+            int(x) for x in next_token_ids.detach().cpu().tolist()
+        ]
 
     # Decode
-    output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
-    for _ in range(bench_args.output_len[0] - 1):
-        next_token_ids, _ = model_runner.decode(next_token_ids, batch)
-        next_token_ids_list = next_token_ids.tolist()
+    next_token_ids_list = next_token_ids.detach().cpu().tolist()
+    output_ids = [
+        input_ids[i] + [int(next_token_ids_list[i])] for i in range(len(input_ids))
+    ]
+    for step in range(bench_args.output_len[0] - 1):
+        next_token_ids, next_token_logits = model_runner.decode(next_token_ids, batch)
+        next_token_ids_list = next_token_ids.detach().cpu().tolist()
+        if correctness_dump is not None:
+            correctness_dump["decode_next_token_ids"].append(
+                [int(x) for x in next_token_ids.detach().cpu().tolist()]
+            )
+            if step < bench_args.correctness_dump_decode_logits_steps:
+                correctness_dump["decode_logits"].append(
+                    next_token_logits.detach().cpu()
+                )
         for i in range(len(reqs)):
             output_ids[i].append(next_token_ids_list[i])
 
@@ -658,9 +707,23 @@ def correctness_test(
     model_runner.cleanup(batch)
 
     # Print output texts
+    output_texts = []
     for i in range(len(reqs)):
+        output_text = tokenizer.decode(output_ids[i])
+        output_texts.append(output_text)
         rank_print(f"========== Prompt {i} ==========")
-        rank_print(tokenizer.decode(output_ids[i]), "\n")
+        rank_print(output_text, "\n")
+
+    if correctness_dump is not None:
+        correctness_dump["output_ids"] = [
+            [int(token_id) for token_id in output_id] for output_id in output_ids
+        ]
+        correctness_dump["output_texts"] = output_texts
+        dump_dir = os.path.dirname(bench_args.correctness_dump_filename)
+        if dump_dir:
+            os.makedirs(dump_dir, exist_ok=True)
+        torch.save(correctness_dump, bench_args.correctness_dump_filename)
+        rank_print(f"Correctness dump saved to {bench_args.correctness_dump_filename}")
 
 
 def synchronize(device):

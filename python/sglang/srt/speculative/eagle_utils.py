@@ -1,4 +1,5 @@
 import math
+import logging
 from enum import IntEnum
 from typing import List, Optional
 
@@ -10,6 +11,7 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
+logger = logging.getLogger(__name__)
 
 if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
@@ -64,6 +66,18 @@ def build_tree_kernel_efficient(
     # seq_lens_sum == sum(seq_lens); seq_lens: sequence length without draft tokens
     bs = seq_lens.numel()
     device = seq_lens.device
+    real_seq_lens_sum = int(seq_lens.detach().cpu().sum().item())
+    if seq_lens_sum != real_seq_lens_sum:
+        logger.warning(
+            "Correcting stale EAGLE seq_lens_sum: seq_lens_sum=%s, actual=%s, "
+            "bs=%s, num_verify_tokens=%s",
+            seq_lens_sum,
+            real_seq_lens_sum,
+            bs,
+            num_verify_tokens,
+        )
+        seq_lens_sum = real_seq_lens_sum
+
     # e.g. for bs=1, tree_mask: num_draft_token, seq_lens_sum + num_draft_token (flattened)
     # where each row indicates the attending pattern of each draft token
     # if use_partial_packed_tree_mask is True, tree_mask: num_draft_token (flattened, packed)

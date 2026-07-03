@@ -81,12 +81,12 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
 
 template <typename KeyT, typename IndicesT, uint32_t kPageSize, bool kUsePDL>
 struct FusedStoreCacheIndexerKernel {
-  static constexpr int32_t kLogSize = std::countr_zero(kPageSize);
+  static constexpr int32_t kLogSize = host::countr_zero(kPageSize);
   /// NOTE: 132 = 128 + 4 (128 represent K and 4 represent scale)
   static constexpr int64_t kPageBytes = 132 * kPageSize;
   static constexpr auto kernel = fused_store_indexer_cache<KeyT, IndicesT, kLogSize, kUsePDL>;
 
-  static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
+  static_assert(host::has_single_bit(kPageSize), "kPageSize must be a power of 2");
   static_assert(1 << kLogSize == kPageSize);
 
   static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView cache, tvm::ffi::TensorView indices) {

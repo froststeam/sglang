@@ -77,7 +77,7 @@ void setup_kernel_smem_once(host::DebugInfo where = {}) {
   [[maybe_unused]]
   static const auto result = [] {
     const auto fptr = std::bit_cast<const void*>(f);
-    return ::cudaFuncSetAttribute(fptr, ::cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
+    return ::musaFuncSetAttribute(fptr, ::musaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
   }();
   host::RuntimeDeviceCheck(result, where);
 }

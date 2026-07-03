@@ -171,9 +171,9 @@ struct CustomAllReducePull : public CustomAllReduceBase {
     launch.enable_pdl(kUsePDL);
     const auto check_capturing = [&] {
       if (!m_is_graph_capturing) return false;  // override to avoid cudaRT call overhead
-      cudaStreamCaptureStatus status;
-      RuntimeDeviceCheck(cudaStreamIsCapturing(stream, &status));
-      return status == cudaStreamCaptureStatusActive;
+      musaStreamCaptureStatus status;
+      RuntimeDeviceCheck(musaStreamIsCapturing(stream, &status));
+      return status == musaStreamCaptureStatusActive;
     };
     if (check_capturing()) {
       // no-op if not really capturing, we're in a dummy run
@@ -184,12 +184,12 @@ struct CustomAllReducePull : public CustomAllReduceBase {
       // 1.copy the input to the buffer
       const auto input_bytes = static_cast<int64_t>(sizeof(DType) * num_items);
       RuntimeCheck(input_bytes <= m_pull_buffer_bytes, "Input is too large, num items: ", num_items);
-      RuntimeDeviceCheck(cudaMemcpyAsync(buffer_ptr, input_ptr, input_bytes, cudaMemcpyDeviceToDevice, stream));
+      RuntimeDeviceCheck(musaMemcpyAsync(buffer_ptr, input_ptr, input_bytes, musaMemcpyDeviceToDevice, stream));
       // 2. launch the all reduce kernel
       const auto data_ptr = get_data_ptr();  // use default buffer
       launch(kernel, data_ptr, params, ctrl);
       if (use_2shot) {  // 3. copy the reduced result back to the output, because 2-shot doesn't write to output
-        RuntimeDeviceCheck(cudaMemcpyAsync(input_ptr, buffer_ptr, input_bytes, cudaMemcpyDeviceToDevice, stream));
+        RuntimeDeviceCheck(musaMemcpyAsync(input_ptr, buffer_ptr, input_bytes, musaMemcpyDeviceToDevice, stream));
       }
     }
     return output;
