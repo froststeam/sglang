@@ -752,6 +752,12 @@ def set_random_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
     if torch.xpu.is_available():
         torch.xpu.manual_seed_all(seed)
+    # MUSA: the device RNG that the sampling kernels (top_p_sampling_from_probs,
+    # generator=None) consume is otherwise NEVER seeded — torch.cuda.is_available()
+    # is False on MUSA — so it starts uninitialized and drifts into degenerate
+    # sampling over a long run (progressive early-EOS / empty completions).
+    if hasattr(torch, "musa") and torch.musa.is_available():
+        torch.musa.manual_seed_all(seed)
 
 
 def load_audio(
