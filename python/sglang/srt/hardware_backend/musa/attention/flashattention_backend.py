@@ -1503,12 +1503,11 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     _fa_cp_attn,
                 )
             elif (
-                # `metadata.extend_with_prefix` (HEAD) is precomputed as
-                # `any(forward_batch.extend_prefix_lens_cpu)`, i.e. equivalent to
-                # upstream's prefix-lens check; `is_cross_attention` is the new
-                # upstream addition, kept here via union.
                 layer.is_cross_attention
-                or getattr(metadata, "extend_with_prefix", False)
+                or (
+                    forward_batch.extend_prefix_lens_cpu is not None
+                    and any(forward_batch.extend_prefix_lens_cpu)
+                )
                 or forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend(include_v2=True)
             ):
