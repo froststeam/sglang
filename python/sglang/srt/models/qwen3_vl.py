@@ -30,6 +30,9 @@ from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.musa.layers.linear_auto_tune import (
+    maybe_apply_musa_linear_silu,
+)
 from sglang.srt.layers.attention.vision import (
     BATCH_BUCKETS,
     FLASHINFER_MAX_SEQLEN_BUCKETS,
@@ -134,10 +137,18 @@ class Qwen3_VisionMLP(nn.Module):
             use_dp_attention_reduce=is_dp_attention_enabled(),
         )
         self.act = ACT2FN[hidden_act]
+        self.hidden_act = hidden_act
 
     def forward(self, x: torch.Tensor):
-        x_fc1, _ = self.linear_fc1(x)
-        mlp_output, _ = self.linear_fc2(self.act(x_fc1))
+        x_fc1 = (
+            maybe_apply_musa_linear_silu(self.linear_fc1, x)
+            if _is_musa and self.hidden_act == "silu"
+            else None
+        )
+        if x_fc1 is None:
+            x_fc1, _ = self.linear_fc1(x)
+            x_fc1 = self.act(x_fc1)
+        mlp_output, _ = self.linear_fc2(x_fc1)
         return mlp_output
 
 

@@ -1,0 +1,377 @@
+/*
+ * Copyright (c) 2020-2026, Moore Threads Technology Co., Ltd("Moore Threads").
+ * All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <musa_runtime.h>
+#include <cassert>
+#include <musa_bf16.h>
+#include <musa_fp16.h>
+#include <tvm/ffi/container/tensor.h>
+#include <tvm/ffi/dtype.h>
+#include <tvm/ffi/error.h>
+#include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/extra/musa/device_guard.h>
+#include <tvm/ffi/function.h>
+
+#include "../common.h"
+#include "../device_utils.h"
+#include "../include/common.muh"
+#include "../include/dtype.muh"
+
+using namespace musa::dnn;
+
+#ifdef TORCH_CHECK
+#undef TORCH_CHECK
+#endif
+#define TORCH_CHECK(cond, ...) TVM_FFI_ICHECK(cond);
+
+static inline int tensor_element_size(DLDataType dtype) {
+    return dtype.bits / 8;
+}
+
+#if defined(__MUSA_ARCH__) && __MUSA_ARCH__ == 310
+#define ThreadNumPerWarp 32
+#else
+#define ThreadNumPerWarp 128
+#endif
+
+#define SYNC_IF_NEEDED() \
+    if constexpr (BLOCK_N * BLOCK_K > ThreadNumPerWarp) { \
+        __SYNCTHREADS_LM; \
+    }
+
+using GemvV16F32 = float __attribute__((vector_size(64)));
+
+template <typename AType, bool is_w4a16, bool fuse_castfp8>
+struct GemvAVecType {
+    using StorageType = std::conditional_t<std::is_same_v<AType, __mt_fp8_e4m3>, uint8_t, AType>;
+    using type = typename VecType<StorageType, 128>::Ttype;
+};
+
+template <typename AType, bool fuse_castfp8>
+struct GemvAVecType<AType, true, fuse_castfp8> {
+    using type = GemvV16F32;
+};
+
+template <typename AType, typename BType, typename CType, typename ScoreType, typename ScaleType,
+          int BLOCK_N, int BLOCK_K, int iobit, bool mul_routed_weight, bool is_swigelu, bool use_silu,
+          bool is_w4a16, bool is_per_group_scale, bool is_fp8, int scale_block, bool use_rms_norm,
+          bool check_bounds = false>
+__global__ void musa_gemv_kernel(
+    CType *c_ptr,
+    const AType *a_ptr,
+    const BType *b_ptr,
+    int *expert_idx_table,
+    ScoreType *score_ptr,
+    ScaleType *scale_a,
+    ScaleType *scale_b,
+    int topk,
+    int expert_offset_stride,
+    int n, int k,
+    int nr_expert,
+    int half_n_idx,
+    int scale_k_len,
+    bfloat16_t *gamma,
+    float* sum_out,
+    volatile int *count,
+    float eps) {
+
+    constexpr int bits_of_byte = 8;
+    constexpr int half_blockn = BLOCK_N / 2;
+    constexpr int b_vec_bits = 128;
+    constexpr int Vlen = is_w4a16 ? b_vec_bits / 4 : b_vec_bits / (sizeof(BType) * bits_of_byte);
+    constexpr int w4a16_shift = is_w4a16 ? 2 : 1;
+    constexpr int scale_k_load_cntdown_init = ceil_div(scale_block, (BLOCK_K * Vlen));
+    constexpr bool fuse_castfp8 = (is_fp8 && !std::is_same_v<AType, __mt_fp8_e4m3>);
+
+    using AVec = typename GemvAVecType<AType, is_w4a16, false>::type;
+    using BVec = typename VecType<std::conditional_t<is_fp8, uint8_t, BType>, b_vec_bits>::Ttype;
+    using fp8x4_vec = unsigned char __attribute__((vector_size(4)));
+
+    int token_idx = blockIdx.z;
+    int expert_idx = blockIdx.y;
+    int real_expert_idx = 0;
+    int t_n_idx = threadIdx.x / BLOCK_K;
+    int t_k_idx = threadIdx.x % BLOCK_K;
+    int n_idx = blockIdx.x * BLOCK_N + t_n_idx;
+
+    if (expert_idx_table != nullptr) {
+        real_expert_idx = expert_idx_table[token_idx * topk + expert_idx];
+        if (real_expert_idx < 0 || real_expert_idx >= nr_expert) {
+            if constexpr (is_swigelu) {
+                if (n_idx < half_n_idx) {
+                    int offsets = (token_idx * topk + expert_idx) * half_n_idx + n_idx;
+                    c_ptr[offsets] = 0;
+                }
+            } else {
+                if constexpr (check_bounds) {
+                    if (n_idx < n) {
+                        int offsets = (token_idx * topk + expert_idx) * n + n_idx;
+                        c_ptr[offsets] = 0;
+                    }
+                } else {
+                    int offsets = (token_idx * topk + expert_idx) * n + n_idx;
+                    c_ptr[offsets] = 0;
+                }
+            }
+            return;
+        }
+    }
+
+    constexpr int thread_sum_len = is_fp8 ? Vlen / 4 : Vlen;
+    float cur_thread_sum[thread_sum_len];
+    int scale_k_load_cntdown = scale_k_load_cntdown_init;
+    extern __shared__ float shared_array[];
+
+    #pragma unroll
+    for (int i = 0; i < thread_sum_len; i++) {
+        cur_thread_sum[i] = 0.0f;
+    }
+
+    float scale_a_val = 1.0f;
+    float scale_b_val = 1.0f;
+    int scale_a_offset = 0;
+    int scale_b_offset = 0;
+
+    if constexpr (is_swigelu) {
+        if (t_n_idx < half_blockn) {
+            n_idx = blockIdx.x * half_blockn + t_n_idx;
+        } else {
+            n_idx = blockIdx.x * half_blockn + t_n_idx - half_blockn + half_n_idx;
+        }
+    }
+
+    const int full_n = is_swigelu ? 2 * n : n;
+    const bool valid_input_n_idx = !check_bounds || n_idx < full_n;
+
+    if constexpr (is_w4a16) {
+        scale_b_offset = (real_expert_idx * n + n_idx) * scale_k_len + t_k_idx * Vlen / scale_block;
+        if constexpr (is_swigelu) {
+            scale_b_offset = (real_expert_idx * 2 * n + n_idx) * scale_k_len + t_k_idx * Vlen / scale_block;
+        }
+        if (valid_input_n_idx) {
+            scale_b_val = scale_b[scale_b_offset];
+            scale_k_load_cntdown -= 1;
+        }
+    } else if (is_fp8) {
+        if constexpr (is_per_group_scale) {
+            scale_a_offset = token_idx * scale_k_len + t_k_idx * Vlen / scale_block;
+            scale_b_offset = (real_expert_idx * n + n_idx) / scale_block * scale_k_len + t_k_idx * Vlen / scale_block;
+            if constexpr (is_swigelu) {
+                scale_b_offset = (real_expert_idx * 2 * n + n_idx) / scale_block * scale_k_len + t_k_idx * Vlen / scale_block;
+            }
+        } else {
+            scale_b_offset = real_expert_idx;
+            if constexpr (!fuse_castfp8) {
+                scale_a_offset = token_idx;
+            }
+        }
+        if constexpr (!fuse_castfp8) {
+            scale_a_val = scale_a[scale_a_offset];
+        }
+        if (valid_input_n_idx) {
+            scale_b_val = scale_b[scale_b_offset];
+            scale_k_load_cntdown -= 1;
+        }
+    }
+
+    const BType *b_base_ptr = nullptr;
+    if (valid_input_n_idx) {
+        b_base_ptr =
+            b_ptr
+            + ((size_t)real_expert_idx * expert_offset_stride + n_idx * k + t_k_idx * Vlen)
+                  / w4a16_shift;
+    }
+
+    for (int k_idx = 0; k_idx < k; k_idx += Vlen * BLOCK_K) {
+        if (!valid_input_n_idx) {
+            continue;
+        }
+
+        AType a_reg[Vlen];
+        BType b_reg[Vlen / w4a16_shift];
+        if constexpr (fuse_castfp8) {
+            using ALoadVec = typename VecType<AType, 128>::Ttype;
+            constexpr int a_load_elems = 128 / (sizeof(AType) * bits_of_byte);
+            static_assert(Vlen % a_load_elems == 0);
+            #pragma unroll
+            for (int i = 0; i < Vlen; i += a_load_elems) {
+                *(ALoadVec *)(a_reg + i) = *(const ALoadVec *)(a_ptr + token_idx * k + t_k_idx * Vlen + k_idx + i);
+            }
+        } else {
+            *(AVec *)(a_reg) = *(AVec *)(a_ptr + token_idx * k + t_k_idx * Vlen + k_idx);
+        }
+        *(BVec *)(b_reg) = *(BVec *)(b_base_ptr + k_idx / w4a16_shift);
+
+        if constexpr (is_w4a16 && !is_fp8) {
+            float b_reg_float[Vlen];
+            #pragma unroll
+            for (int i = 0; i < Vlen / 2; i++) {
+                if constexpr (is_per_group_scale) {
+                    uint8_t read_u8 = b_reg[i];
+                    b_reg_float[i * 2 + 0] = scale_b_val * ((float)(read_u8 & 0xF) - 8.f);
+                    b_reg_float[i * 2 + 1] = scale_b_val * ((float)(read_u8 >> 4) - 8.f);
+                } else {
+                    int8_t read_s8 = b_reg[i];
+                    b_reg_float[i * 2 + 0] = scale_b_val * (float)((int8_t)(read_s8 << 4));
+                    b_reg_float[i * 2 + 1] = scale_b_val * (float)((int8_t)(read_s8 & 0xF0));
+                }
+            }
+            if constexpr (is_per_group_scale) {
+                if (scale_k_load_cntdown == 0 && (k_idx + Vlen * BLOCK_K) < k) {
+                    scale_b_offset += ceil_div(BLOCK_K * Vlen, scale_block);
+                    scale_b_val = scale_b[scale_b_offset];
+                    scale_k_load_cntdown = scale_k_load_cntdown_init;
+                }
+                scale_k_load_cntdown -= 1;
+            }
+            #pragma unroll
+            for (int i = 0; i < thread_sum_len; i++) {
+                cur_thread_sum[i] += b_reg_float[i] * (float)a_reg[i];
+            }
+        } else if constexpr (is_fp8) {
+            float scale_val = scale_a_val * scale_b_val;
+            if constexpr (is_per_group_scale) {
+                if (scale_k_load_cntdown == 0 && (k_idx + Vlen * BLOCK_K) < k) {
+                    scale_a_offset += ceil_div(BLOCK_K * Vlen, scale_block);
+                    scale_b_offset += ceil_div(BLOCK_K * Vlen, scale_block);
+                    if constexpr (!fuse_castfp8) {
+                        scale_a_val = scale_a[scale_a_offset];
+                    }
+                    scale_b_val = scale_b[scale_b_offset];
+                    scale_k_load_cntdown = scale_k_load_cntdown_init;
+                }
+                scale_k_load_cntdown -= 1;
+            }
+            for (int i = 0; i < thread_sum_len; i++) {
+                typedef _Float16 half_v4 __attribute__((ext_vector_type(4)));
+                if constexpr (fuse_castfp8) {
+                    half_v4 b_halfv4;
+                    b_halfv4 = __musa_e4m32f16_rn_bst4(reinterpret_cast<const fp8x4_vec*>(b_reg)[i]);
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        cur_thread_sum[i] += scale_val * float(a_reg[i * 4 + j]) * b_halfv4[j];
+                    }
+                } else {
+                    half_v4 a_halfv4;
+                    half_v4 b_halfv4;
+                    a_halfv4 = __musa_e4m32f16_rn_bst4(reinterpret_cast<const fp8x4_vec*>(a_reg)[i]);
+                    b_halfv4 = __musa_e4m32f16_rn_bst4(reinterpret_cast<const fp8x4_vec*>(b_reg)[i]);
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        cur_thread_sum[i] += scale_val * a_halfv4[j] * b_halfv4[j];
+                    }
+                }
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < thread_sum_len; i++) {
+                cur_thread_sum[i] += (float)b_reg[i] * (float)a_reg[i];
+            }
+        }
+    }
+
+    float rst = 0;
+    #pragma unroll
+    for (int i = 0; i < thread_sum_len; i++) {
+        rst += cur_thread_sum[i];
+    }
+
+    if constexpr (is_w4a16 && !is_per_group_scale) {
+        rst = rst / 16.f;
+    }
+
+    if constexpr (BLOCK_K > 1) {
+        shared_array[threadIdx.x] = rst;
+        SYNC_IF_NEEDED()
+        if (threadIdx.x < BLOCK_N) {
+            rst = 0;
+            #pragma unroll
+            for (int i = 0; i < BLOCK_K; i++) {
+                rst += shared_array[threadIdx.x * BLOCK_K + i];
+            }
+        }
+        if constexpr (is_swigelu) {
+            SYNC_IF_NEEDED()
+        }
+    }
+
+    if constexpr (BLOCK_N > ThreadNumPerWarp) {
+        return;
+    }
+
+    if (threadIdx.x < BLOCK_N) {
+        int dst_n_idx = blockIdx.x * BLOCK_N + threadIdx.x;
+        if constexpr (is_swigelu) {
+            dst_n_idx = blockIdx.x * half_blockn + threadIdx.x;
+        }
+        const bool valid_output_n_idx = !check_bounds || dst_n_idx < n;
+
+        if constexpr (mul_routed_weight) {
+            float score = (float)score_ptr[token_idx * topk + expert_idx];
+            rst = rst * score;
+        }
+
+        if constexpr (is_swigelu) {
+            shared_array[threadIdx.x] = rst;
+            if (threadIdx.x < half_blockn && valid_output_n_idx) {
+                float b = shared_array[threadIdx.x + half_blockn];
+                rst = rst * sigmoid(rst) * b;
+                c_ptr[token_idx * topk * n + expert_idx * n + dst_n_idx] = rst;
+            }
+        } else if constexpr (use_silu) {
+            if (valid_output_n_idx) {
+                rst = rst * sigmoid(rst);
+                c_ptr[token_idx * topk * n + expert_idx * n + dst_n_idx] = rst;
+            }
+        } else if constexpr (use_rms_norm) {
+            float rms = rst * rst;
+            int count_val = 0;
+
+            for (int offset = 1; offset < BLOCK_N; offset *= 2) {
+                float peer = __shfl_xor_sync(BLOCK_N, rms, offset);
+                rms += peer;
+            }
+
+            if (threadIdx.x == 0) {
+                atomicAdd(sum_out, rms);
+                __threadfence_block();
+                atomicAdd((int*)(count), 1);
+            }
+
+            while (count_val < gridDim.x) {
+                count_val = count[0];
+            }
+
+            rms = sum_out[0];
+            if (valid_output_n_idx) {
+                rst = rst * rsqrtf(rms / n + eps) * float(gamma[dst_n_idx]);
+                c_ptr[token_idx * topk * n + expert_idx * n + dst_n_idx] = rst;
+            }
+        } else if (valid_output_n_idx) {
+            c_ptr[token_idx * topk * n + expert_idx * n + dst_n_idx] = rst;
+        }
+    }
+}
+
+struct GemvBlockConfig {
+    int block_n;
+    int block_k;
+    float score;
+    bool valid;
+};

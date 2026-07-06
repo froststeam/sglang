@@ -36,106 +36,6 @@ from sglang.srt.utils.hf_transformers_utils import get_processor
 logger = logging.getLogger(__name__)
 
 cached_get_processor = lru_cache(get_processor)
-_MUSA_MOE_GEMV_MAX_TOKENS = 7
-
-
-def _can_install_qwen3_vl_moe_musa_gemv(experts):
-    config = getattr(experts, "moe_runner_config", None)
-    w13 = getattr(experts, "w13_weight", None)
-    w2 = getattr(experts, "w2_weight", None)
-    return (
-        config is not None
-        and w13 is not None
-        and w2 is not None
-        and w13.device.type == "musa"
-        and w13.dtype in (torch.float16, torch.bfloat16)
-        and w13.is_contiguous()
-        and w2.is_contiguous()
-        and w2.dtype == w13.dtype
-        and w2.shape[2] == w13.shape[1] // 2
-        and w2.shape[1] == w13.shape[2]
-        and experts.moe_ep_size == 1
-        and not experts.reduce_results
-        and config.activation == "silu"
-        and config.is_gated
-        and not config.apply_router_weight_on_input
-        and not config.no_combine
-        and config.gemm1_alpha is None
-        and config.gemm1_clamp_limit is None
-        and not hasattr(experts, "w13_weight_bias")
-        and not hasattr(experts, "w2_weight_bias")
-        and not hasattr(experts, "w13_weight_scale")
-        and not hasattr(experts, "w2_weight_scale")
-        and not hasattr(experts, "w13_weight_zp")
-        and not hasattr(experts, "w2_weight_zp")
-    )
-
-
-def _run_qwen3_vl_moe_musa_gemv(experts, hidden_states, topk_output):
-    from sgl_kernel import musa_fused_moe_gemv
-
-    from sglang.srt.hardware_backend.musa.jit_kernel import moe_sum_reduce
-
-    topk_weights = topk_output.topk_weights.contiguous()
-    topk_ids = topk_output.topk_ids.contiguous()
-    num_tokens = hidden_states.shape[0]
-    topk = topk_ids.shape[1]
-    w13 = experts.w13_weight
-    w2 = experts.w2_weight
-    config = experts.moe_runner_config
-    inter_size = w13.shape[1] // 2
-
-    intermediate = torch.empty(
-        (num_tokens, topk, inter_size),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
-    musa_fused_moe_gemv(
-        hidden_states,
-        w13,
-        intermediate,
-        None,
-        None,
-        topk_weights,
-        topk_ids,
-        False,
-        topk,
-        False,
-        True,
-    )
-
-    routed_output = torch.empty(
-        (num_tokens, topk, w2.shape[1]),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
-    flat_tokens = num_tokens * topk
-    musa_fused_moe_gemv(
-        intermediate.view(flat_tokens, inter_size),
-        w2,
-        routed_output.view(flat_tokens, 1, w2.shape[1]),
-        None,
-        None,
-        topk_weights.view(flat_tokens, 1),
-        topk_ids.view(flat_tokens, 1),
-        True,
-        1,
-        False,
-        False,
-    )
-
-    routed_scaling_factor = config.routed_scaling_factor
-    routed_scaling_factor = (
-        1.0 if routed_scaling_factor is None else routed_scaling_factor
-    )
-    out_hidden_states = (
-        hidden_states if config.inplace else torch.empty_like(hidden_states)
-    )
-    if topk == 1 and routed_scaling_factor == 1.0:
-        out_hidden_states.copy_(routed_output[:, 0])
-    else:
-        moe_sum_reduce(routed_output, out_hidden_states, routed_scaling_factor)
-    return out_hidden_states
 
 
 class Qwen3MoeLLMModel(Qwen3MoeModel):
@@ -280,32 +180,6 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     ):
         super().__init__(config, quant_config, prefix, language_model_cls)
         self.visual.use_musa_vision_rope = True
-        self._enable_musa_moe_gemv_decode_fast_path()
-
-    def _enable_musa_moe_gemv_decode_fast_path(self):
-        if not hasattr(self, "model"):
-            return
-        for layer in self.model.layers[self.model.start_layer : self.model.end_layer]:
-            experts = getattr(getattr(layer, "mlp", None), "experts", None)
-            if (
-                experts is None
-                or hasattr(experts, "_qwen3_vl_moe_original_forward")
-                or not _can_install_qwen3_vl_moe_musa_gemv(experts)
-            ):
-                continue
-
-            experts._qwen3_vl_moe_original_forward = experts.forward
-
-            def forward_with_musa_gemv(hidden_states, topk_output, *, _experts=experts):
-                if hidden_states.shape[0] <= _MUSA_MOE_GEMV_MAX_TOKENS:
-                    return _run_qwen3_vl_moe_musa_gemv(
-                        _experts, hidden_states, topk_output
-                    )
-                return _experts._qwen3_vl_moe_original_forward(
-                    hidden_states, topk_output
-                )
-
-            experts.forward = forward_with_musa_gemv
 
     _lora_pattern_moe = re.compile(
         r"^(?:model\.layers\.(\d+)\.(?:self_attn\.(?:qkv_proj|o_proj)|mlp\.experts)|lm_head|model\.embed_tokens)$"

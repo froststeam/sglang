@@ -9,7 +9,6 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
@@ -159,6 +158,17 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
+
+        from sglang.srt.hardware_backend.musa.layers.linear_auto_tune import (
+            should_use_musa_linear_gemv,
+        )
+
+        if should_use_musa_linear_gemv(layer, x, quant_kind="bf16"):
+            from sglang.srt.hardware_backend.musa.jit_kernel.csrc.gemm import (
+                musa_linear_gemv,
+            )
+
+            return musa_linear_gemv(x, layer.weight, bias=bias)
 
         return F.linear(x, layer.weight, bias)
 
@@ -496,9 +506,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             w2_weight = layer.w2_weight
             from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 
-            # Only use_fp8=False when SGLANG_DEEPEP_BF16_DISPATCH is true,
-            # otherwise use_fp8=True for FP8 dispatch path
-            use_fp8 = not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+            # Unquantized MoE keeps 16-bit expert weights. The BF16/FP16
+            # DeepGEMM kernels require 16-bit activations as well; quantizing
+            # the dispatch input to FP8 would make the runner feed FP8 tensors
+            # into the 16-bit GEMM path.
+            use_fp8 = w13_weight.dtype not in (torch.bfloat16, torch.float16)
             quant_info = DeepGemmMoeQuantInfo(
                 w13_weight=w13_weight,
                 w2_weight=w2_weight,

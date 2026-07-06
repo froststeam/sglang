@@ -26,10 +26,9 @@ from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalSta
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import flatten_nested_list, is_musa, is_npu, print_warning_once
+from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
 from sglang.utils import logger
 
-_is_musa = is_musa()
 _is_npu = is_npu()
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
@@ -657,13 +656,7 @@ def _get_chunked_prefill_embedding(
 def _get_multimodal_mask(
     input_ids: torch.Tensor, placeholder_tensor: torch.Tensor
 ) -> torch.Tensor:
-    if not _is_musa:
-        return torch.isin(input_ids, placeholder_tensor).unsqueeze(-1)
-
-    mask = torch.zeros_like(input_ids, dtype=torch.bool)
-    for placeholder in placeholder_tensor:
-        mask |= input_ids == placeholder
-    return mask.unsqueeze(-1)
+    return torch.isin(input_ids, placeholder_tensor).unsqueeze(-1)
 
 
 def _adjust_embedding_length(

@@ -440,9 +440,19 @@ def deep_gemm_ep_preprocess(
     num_local_experts: int,
     use_fp8_quant: bool,
 ) -> None:
+    if not can_use_deep_gemm_ep_preprocess(
+        topk_ids,
+        hidden_states,
+        num_local_experts,
+        use_fp8_quant,
+    ):
+        dtype = "fp8" if use_fp8_quant else "bf16"
+        raise RuntimeError(
+            f"MUSA DeepGEMM {dtype} EP preprocess requires hidden_size to be a "
+            "supported shape, topk<=16, int32 topk_ids, and num_local_experts>0."
+        )
+
     from sglang.srt.hardware_backend.musa.jit_kernel.tilelang.deep_gemm_ep_preprocess import (
-        can_use_ep_bf16_tilelang,
-        can_use_ep_fp8_tilelang,
         deep_gemm_ep_preprocess_bf16_tilelang,
         deep_gemm_ep_preprocess_fp8_tilelang,
     )
@@ -450,12 +460,6 @@ def deep_gemm_ep_preprocess(
     if use_fp8_quant:
         if output_scale is None:
             raise ValueError("output_scale must be provided for fp8 EP preprocess")
-        if not can_use_ep_fp8_tilelang(hidden_states, topk_ids, num_local_experts):
-            raise RuntimeError(
-                "MUSA DeepGEMM fp8 EP preprocess requires hidden_size to be a "
-                "supported multiple of 128, topk<=16, int32 topk_ids, and "
-                "num_local_experts>0."
-            )
         deep_gemm_ep_preprocess_fp8_tilelang(
             topk_ids,
             hidden_states,
@@ -467,12 +471,6 @@ def deep_gemm_ep_preprocess(
         )
         return
 
-    if not can_use_ep_bf16_tilelang(hidden_states, topk_ids, num_local_experts):
-        raise RuntimeError(
-            "MUSA DeepGEMM bf16 EP preprocess requires hidden_size to be a "
-            "supported multiple of 128, topk<=16, int32 topk_ids, and "
-            "num_local_experts>0."
-        )
     deep_gemm_ep_preprocess_bf16_tilelang(
         topk_ids,
         hidden_states,
@@ -481,6 +479,35 @@ def deep_gemm_ep_preprocess(
         output,
         num_local_experts,
     )
+
+
+def can_use_deep_gemm_ep_preprocess(
+    topk_ids: torch.Tensor,
+    hidden_states: torch.Tensor,
+    num_local_experts: int,
+    use_fp8_quant: bool,
+    block_n: int = 128,
+    block_k: int = 128,
+    output_dtype: torch.dtype | None = None,
+) -> bool:
+    if block_n != 128:
+        return False
+    if output_dtype is not None and output_dtype not in (
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+    ):
+        return False
+    if use_fp8_quant and block_k != 128:
+        return False
+
+    from sglang.srt.hardware_backend.musa.jit_kernel.tilelang.deep_gemm_ep_preprocess import (
+        can_use_ep_bf16_tilelang,
+        can_use_ep_fp8_tilelang,
+    )
+
+    if use_fp8_quant:
+        return can_use_ep_fp8_tilelang(hidden_states, topk_ids, num_local_experts)
+    return can_use_ep_bf16_tilelang(hidden_states, topk_ids, num_local_experts)
 
 
 @cache_once

@@ -137,8 +137,6 @@ else:
         from sgl_kernel.musa import (
             min_p_sampling_from_probs,
             musa_batched_rotary_embedding_contiguous,
-            musa_fused_gemv,
-            musa_fused_moe_gemv,
             musa_fused_mul_add,
             musa_rotary_embedding_contiguous,
             top_k_top_p_sampling_from_probs,

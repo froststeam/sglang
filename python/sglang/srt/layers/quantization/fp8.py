@@ -798,6 +798,22 @@ class Fp8LinearMethod(LinearMethodBase):
                     bias=bias,
                 )
 
+            from sglang.srt.hardware_backend.musa.layers.linear_auto_tune import (
+                should_use_musa_linear_gemv,
+            )
+
+            if should_use_musa_linear_gemv(layer, x, quant_kind="fp8_block"):
+                from sglang.srt.hardware_backend.musa.jit_kernel.csrc.gemm import (
+                    musa_linear_gemv,
+                )
+
+                return musa_linear_gemv(
+                    x,
+                    layer.weight,
+                    B_scale=layer.weight_scale_inv,
+                    bias=bias,
+                )
+
             return self.w8a8_block_fp8_linear(
                 input=x,
                 weight=layer.weight,

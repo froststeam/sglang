@@ -1355,7 +1355,9 @@ def _deepgemm_compact_prefix_sum_musa(
             )
             * block_m
         )
-        offsets.copy_(torch.cumsum(padded_counts, dim=0, dtype=torch.int32) - padded_counts)
+        offsets.copy_(
+            torch.cumsum(padded_counts, dim=0, dtype=torch.int32) - padded_counts
+        )
     return padded_counts, offsets
 
 
@@ -1634,9 +1636,11 @@ def _get_deepgemm_static_cap_m_indices_musa(
     if cached is not None and cached.device == device:
         return cached
 
-    m_indices = torch.arange(
-        num_local_experts, device=device, dtype=torch.int32
-    ).repeat_interleave(int(cap_per_expert)).contiguous()
+    m_indices = (
+        torch.arange(num_local_experts, device=device, dtype=torch.int32)
+        .repeat_interleave(int(cap_per_expert))
+        .contiguous()
+    )
     _DEEPGEMM_STATIC_CAP_M_INDICES_CACHE[key] = m_indices
     return m_indices
 
@@ -1729,13 +1733,15 @@ def moe_ep_deepgemm_static_cap_preprocess_musa(
                     try_moe_deepgemm_static_cap_src2dst_quant_scatter_tilelang_musa,
                 )
 
-                used_tilelang = try_moe_deepgemm_static_cap_src2dst_quant_scatter_tilelang_musa(
-                    hidden_states,
-                    compact_input,
-                    compact_scale,
-                    src2dst,
-                    top_k,
-                    block_k,
+                used_tilelang = (
+                    try_moe_deepgemm_static_cap_src2dst_quant_scatter_tilelang_musa(
+                        hidden_states,
+                        compact_input,
+                        compact_scale,
+                        src2dst,
+                        top_k,
+                        block_k,
+                    )
                 )
             else:
                 from sglang.srt.hardware_backend.layers.deepseek_v4_musa.ops.moe_prefill_ops import (
@@ -1759,7 +1765,9 @@ def moe_ep_deepgemm_static_cap_preprocess_musa(
             used_tilelang = False
 
     if not used_tilelang:
-        raise RuntimeError("static-cap DeepGEMM preprocess requires TileLang quant scatter")
+        raise RuntimeError(
+            "static-cap DeepGEMM preprocess requires TileLang quant scatter"
+        )
 
     return src2dst, compact_input, compact_scale, m_indices, all_tokens, overflow_flag
 
@@ -1840,9 +1848,7 @@ def moe_ep_deepgemm_compact_preprocess_musa(
         # Padding rows are never gathered back.  Zero scales make unread FP8
         # padding contribute zero if a grouped GEMM tail block consumes it.
         # The same pass tags fixed-bucket tail rows as the last expert.
-        _deepgemm_compact_fixed_bucket_init_kernel[
-            (triton.cdiv(all_tokens, 16),)
-        ](
+        _deepgemm_compact_fixed_bucket_init_kernel[(triton.cdiv(all_tokens, 16),)](
             compact_scale,
             m_indices,
             all_tokens,
@@ -1884,9 +1890,7 @@ def moe_ep_deepgemm_compact_preprocess_musa(
             )
 
             if fixed_bucket is not None:
-                make_src2dst_grid = (
-                    triton.cdiv(num_routes, 256),
-                )
+                make_src2dst_grid = (triton.cdiv(num_routes, 256),)
                 _deepgemm_compact_make_src2dst_kernel[make_src2dst_grid](
                     topk_ids,
                     offsets,
@@ -1960,27 +1964,30 @@ def moe_ep_deepgemm_preprocess(
 
     expected_m = (topk_ids.numel() - 1) // num_local_experts + 1
 
-    can_use_musa_fused_preprocess = (
-        _is_musa
-        and hidden_states.dtype == torch.bfloat16
-        and topk_ids.dtype == torch.int32
-        and topk_ids.dim() == 2
-        and top_k == topk_ids.shape[-1]
-        and top_k <= 16
-        and hidden_states.size(1) % 128 == 0
-        and block_n == 128
-        and block_k == 128
-        and (is_fp8 or output_dtype == torch.bfloat16)
-    )
+    can_use_musa_fused_preprocess = False
+    if _is_musa and top_k == topk_ids.shape[-1]:
+        from sglang.srt.hardware_backend.musa.jit_kernel.csrc.moe import (
+            can_use_deep_gemm_ep_preprocess,
+        )
+
+        can_use_musa_fused_preprocess = can_use_deep_gemm_ep_preprocess(
+            topk_ids,
+            hidden_states,
+            num_local_experts,
+            is_fp8,
+            block_n,
+            block_k,
+            output_dtype,
+        )
     if can_use_musa_fused_preprocess:
         from sglang.srt.hardware_backend.musa.jit_kernel.csrc.moe import (
             deep_gemm_ep_preprocess,
         )
 
         # For masked grouped GEMM, shape M should be a multiple of the block M.
-        # Use expected_m as the per-expert buffer bound so EP+topk paths are not
-        # capped by the original token count.
-        m_max = ceil_div(expected_m, 256) * 256
+        # Use num_tokens as the per-expert buffer bound so skewed routing cannot
+        # write past the compacted per-expert buffer.
+        m_max = (hidden_states.size(0) // 256 + 1) * 256
         masked_m = torch.empty(
             num_local_experts, device=topk_ids.device, dtype=torch.int32
         )

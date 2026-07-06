@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import contextmanager
+from copy import copy
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Any, Optional
@@ -26,6 +27,7 @@ class MusaMoeBucket:
     max_tokens: int
     backend: str
     block_m: Optional[int] = None
+    use_contiguous_gemm: Optional[bool] = None
 
 
 _MUSA_MOE_BUCKET_POLICY: tuple[MusaMoeBucket, ...] | None = None
@@ -40,6 +42,22 @@ def set_musa_moe_bucket_policy(policy: tuple[MusaMoeBucket, ...] | None) -> None
     _MUSA_MOE_BUCKET_POLICY = policy
 
 
+def _apply_deep_gemm_bucket(deep_gemm_runner: Any, bucket: MusaMoeBucket) -> Any:
+    # Bucket policy only mutates wrapper-level attrs; keep them off the shared runner.
+    runner = copy(deep_gemm_runner)
+    use_contiguous_gemm = (
+        bucket.use_contiguous_gemm
+        if bucket.use_contiguous_gemm is not None
+        else bucket.block_m is not None
+    )
+    runner.use_contiguous_gemm = use_contiguous_gemm
+    if bucket.block_m is not None:
+        runner.contiguous_gemm_block_m = bucket.block_m
+    elif hasattr(runner, "contiguous_gemm_block_m"):
+        delattr(runner, "contiguous_gemm_block_m")
+    return runner
+
+
 def select_musa_moe_runner(
     num_tokens: int,
     triton_runner: Any,
@@ -48,17 +66,13 @@ def select_musa_moe_runner(
     if _MUSA_MOE_BUCKET_POLICY is not None:
         for bucket in _MUSA_MOE_BUCKET_POLICY:
             if num_tokens <= bucket.max_tokens:
-                if bucket.backend == "triton":
+                if bucket.backend in ("triton", "gemv"):
                     return triton_runner
-                if bucket.block_m is not None:
-                    deep_gemm_runner.contiguous_gemm_block_m = bucket.block_m
-                return deep_gemm_runner
+                return _apply_deep_gemm_bucket(deep_gemm_runner, bucket)
         last_bucket = _MUSA_MOE_BUCKET_POLICY[-1]
-        if last_bucket.backend == "triton":
+        if last_bucket.backend in ("triton", "gemv"):
             return triton_runner
-        if last_bucket.block_m is not None:
-            deep_gemm_runner.contiguous_gemm_block_m = last_bucket.block_m
-        return deep_gemm_runner
+        return _apply_deep_gemm_bucket(deep_gemm_runner, last_bucket)
 
     return triton_runner
 

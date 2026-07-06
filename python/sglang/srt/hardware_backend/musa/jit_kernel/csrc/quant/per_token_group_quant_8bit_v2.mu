@@ -72,15 +72,16 @@ struct DtypeInfo<__mt_fp8_e4m3> {
 };
 
 template <bool FUSE_SILU_AND_MUL>
-__device__ __forceinline__ int compute_input_group_start_offset(
+__device__ __forceinline__ int64_t compute_input_group_start_offset(
     int expert_idx,
     int token_idx,
     int hidden_dim_group_idx,
     int hidden_size,
     int num_tokens_per_expert,
     int group_size) {
-  return expert_idx * num_tokens_per_expert * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) +
-         token_idx * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) + hidden_dim_group_idx * group_size;
+  return static_cast<int64_t>(expert_idx) * num_tokens_per_expert * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) +
+         static_cast<int64_t>(token_idx) * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) +
+         static_cast<int64_t>(hidden_dim_group_idx) * group_size;
 }
 
 constexpr float LOCAL_ABSMAX_ABS = 1e-10;
@@ -139,7 +140,7 @@ struct RowScheduler {
       int threads_per_subwarp,
       int num_local_experts,
       int hidden_dim_num_groups,
-      int num_groups,
+      int num_tokens_per_expert,
       int& subwarps_per_block,
       dim3& grid,
       dim3& block) {
@@ -155,7 +156,6 @@ struct RowScheduler {
       }
       return 1;
     })();
-    const int num_tokens_per_expert = num_groups / hidden_dim_num_groups;
     grid = dim3(hidden_dim_num_groups / subwarps_per_block, num_tokens_per_expert);
     block = dim3(subwarps_per_block * threads_per_subwarp);
   }
@@ -183,14 +183,21 @@ struct RowScheduler {
 };
 
 struct MaskedLayoutScheduler {
-  // TODO can be dynamically determined (which may be good when num rank is small)
-  static constexpr int TOKEN_DIM_BLOCK_NUM_PER_EXPERT = 1024;
+  static int choose_token_dim_blocks_per_expert(
+      const int hidden_dim_num_groups,
+      const int num_tokens_per_expert) {
+    int token_dim_blocks_per_expert = hidden_dim_num_groups >= 32 ? 16 : 32;
+    if (num_tokens_per_expert <= 128) {
+      token_dim_blocks_per_expert = token_dim_blocks_per_expert > 16 ? 16 : token_dim_blocks_per_expert;
+    }
+    return token_dim_blocks_per_expert < num_tokens_per_expert ? token_dim_blocks_per_expert : num_tokens_per_expert;
+  }
 
   static void compute_exec_config(
       int threads_per_subwarp,
       int num_local_experts,
       int hidden_dim_num_groups,
-      int num_groups,
+      int num_tokens_per_expert,
       int& subwarps_per_block,
       dim3& grid,
       dim3& block) {
@@ -207,7 +214,9 @@ struct MaskedLayoutScheduler {
       return 1;
     })();
     TORCH_CHECK(hidden_dim_num_groups % subwarps_per_block == 0);
-    grid = dim3(hidden_dim_num_groups / subwarps_per_block, TOKEN_DIM_BLOCK_NUM_PER_EXPERT, num_local_experts);
+    const int token_dim_blocks_per_expert =
+        choose_token_dim_blocks_per_expert(hidden_dim_num_groups, num_tokens_per_expert);
+    grid = dim3(hidden_dim_num_groups / subwarps_per_block, token_dim_blocks_per_expert, num_local_experts);
     block = dim3(subwarps_per_block * threads_per_subwarp);
   }
 
@@ -227,9 +236,10 @@ struct MaskedLayoutScheduler {
     const int64_t hidden_dim_group_idx = blockIdx.x * subwarps_per_block + subwarp_id;
 
     const int curr_expert_token_num = masked_m[expert_idx];
+    const int token_dim_block_num_per_expert = gridDim.y;
 
     for (int token_idx = token_idx_start; token_idx < curr_expert_token_num;
-         token_idx += TOKEN_DIM_BLOCK_NUM_PER_EXPERT) {
+         token_idx += token_dim_block_num_per_expert) {
       const int hidden_size = hidden_dim_num_groups * GROUP_SIZE;
       const int64_t input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
           expert_idx, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert, GROUP_SIZE);
@@ -272,12 +282,12 @@ __global__ void per_token_group_quant_8bit_kernel(
           const int token_idx,
           const int hidden_dim_group_idx,
           const int lane_id,
-          const int input_group_start_offset) {
+          const int64_t input_group_start_offset) {
         constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
         constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(int4);
 
-        const int offset_num_groups = expert_idx * num_tokens_per_expert * hidden_dim_num_groups +
-                                      token_idx * hidden_dim_num_groups + hidden_dim_group_idx;
+        const int64_t offset_num_groups = static_cast<int64_t>(expert_idx) * num_tokens_per_expert * hidden_dim_num_groups +
+                                          static_cast<int64_t>(token_idx) * hidden_dim_num_groups + hidden_dim_group_idx;
 
         int4 input_primary_int4[INPUT_PRIMARY_INT4_SIZE];
         T* input_primary_vec = reinterpret_cast<T*>(input_primary_int4);
@@ -423,7 +433,7 @@ __global__ void per_token_group_quant_8bit_fast_kernel(
   const int token_idx = blockIdx.y;
   const int hidden_dim_group_idx = blockIdx.x * subwarps_per_block + subwarp_id;
   const int hidden_size = hidden_dim_num_groups * GROUP_SIZE;
-  const int input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
+  const int64_t input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
       0, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert, GROUP_SIZE);
   const int elem_offset = lane_id * FP8_FAST_VEC_ELEMS;
 
@@ -462,11 +472,12 @@ __global__ void per_token_group_quant_8bit_fast_kernel(
     if constexpr (IS_COLUMN_MAJOR) {
       output_s[token_idx + hidden_dim_group_idx * scale_hidden_stride] = y_scale_inv;
     } else {
-      output_s[token_idx * hidden_dim_num_groups + hidden_dim_group_idx] = y_scale_inv;
+      output_s[static_cast<int64_t>(token_idx) * hidden_dim_num_groups + hidden_dim_group_idx] = y_scale_inv;
     }
   }
 
-  const int output_offset = (token_idx * hidden_dim_num_groups + hidden_dim_group_idx) * GROUP_SIZE + elem_offset;
+  const int64_t output_offset =
+      (static_cast<int64_t>(token_idx) * hidden_dim_num_groups + hidden_dim_group_idx) * GROUP_SIZE + elem_offset;
   const uint32_t output_buf = pack_quant4<DST_DTYPE>(values, y_scale);
   *reinterpret_cast<uint32_t*>(output_q + output_offset) = output_buf;
 }
@@ -490,7 +501,8 @@ __global__ void per_token_group_quant_8bit_i8_fused_tiled_kernel(
   }
 
   const int hidden_size = hidden_dim_num_groups * GROUP_SIZE;
-  const int input_group_start_offset = token_idx * hidden_size * 2 + hidden_dim_group_idx * GROUP_SIZE;
+  const int64_t input_group_start_offset =
+      static_cast<int64_t>(token_idx) * hidden_size * 2 + static_cast<int64_t>(hidden_dim_group_idx) * GROUP_SIZE;
   const int elem_offset = lane_id * FP8_FAST_VEC_ELEMS;
 
   uint64_t input_primary_u64 = *reinterpret_cast<const uint64_t*>(input + input_group_start_offset + elem_offset);
@@ -516,10 +528,11 @@ __global__ void per_token_group_quant_8bit_i8_fused_tiled_kernel(
   const float y_scale = DtypeInfo<int8_t>::MAX / local_absmax;
 
   if (lane_id == 0) {
-    output_s[token_idx * hidden_dim_num_groups + hidden_dim_group_idx] = y_scale_inv;
+    output_s[static_cast<int64_t>(token_idx) * hidden_dim_num_groups + hidden_dim_group_idx] = y_scale_inv;
   }
 
-  const int output_offset = (token_idx * hidden_dim_num_groups + hidden_dim_group_idx) * GROUP_SIZE + elem_offset;
+  const int64_t output_offset =
+      (static_cast<int64_t>(token_idx) * hidden_dim_num_groups + hidden_dim_group_idx) * GROUP_SIZE + elem_offset;
   const uint32_t output_buf = pack_quant4<int8_t>(values, y_scale);
   *reinterpret_cast<uint32_t*>(output_q + output_offset) = output_buf;
 }
@@ -544,8 +557,9 @@ __global__ void per_token_group_quant_8bit_fp8_col_tiled_kernel(
   }
 
   const int hidden_size = hidden_dim_num_groups * GROUP_SIZE;
-  const int input_group_start_offset =
-      token_idx * hidden_size + hidden_dim_group_idx * GROUP_SIZE + lane_id * FP8_FAST_VEC_ELEMS;
+  const int64_t input_group_start_offset =
+      static_cast<int64_t>(token_idx) * hidden_size + static_cast<int64_t>(hidden_dim_group_idx) * GROUP_SIZE +
+      lane_id * FP8_FAST_VEC_ELEMS;
 
   uint64_t input_primary_u64 = *reinterpret_cast<const uint64_t*>(input + input_group_start_offset);
   half* input_primary_vec = reinterpret_cast<half*>(&input_primary_u64);
@@ -568,8 +582,9 @@ __global__ void per_token_group_quant_8bit_fp8_col_tiled_kernel(
     output_s[token_idx + hidden_dim_group_idx * scale_hidden_stride] = y_scale_inv;
   }
 
-  const int output_offset =
-      (token_idx * hidden_dim_num_groups + hidden_dim_group_idx) * GROUP_SIZE + lane_id * FP8_FAST_VEC_ELEMS;
+  const int64_t output_offset =
+      (static_cast<int64_t>(token_idx) * hidden_dim_num_groups + hidden_dim_group_idx) * GROUP_SIZE +
+      lane_id * FP8_FAST_VEC_ELEMS;
   uint32_t output_buf;
   auto output_buf_ptr = reinterpret_cast<__mt_fp8x4_storage_t*>(&output_buf);
   float4 outputx4 = {values[0] * y_scale, values[1] * y_scale, values[2] * y_scale, values[3] * y_scale};
@@ -592,8 +607,9 @@ __device__ __forceinline__ void quantize_bf16_fp8_g128_group(
   const int hidden_size = hidden_dim_num_groups * GROUP_SIZE;
   const int lane_id = threadIdx.x % THREADS_PER_GROUP;
   const int elem_offset = lane_id * ELEMS_PER_THREAD;
-  const int input_offset =
-      token_idx * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) + hidden_dim_group_idx * GROUP_SIZE + elem_offset;
+  const int64_t input_offset =
+      static_cast<int64_t>(token_idx) * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) +
+      static_cast<int64_t>(hidden_dim_group_idx) * GROUP_SIZE + elem_offset;
 
   float values[ELEMS_PER_THREAD];
   if constexpr (ELEMS_PER_THREAD >= 8) {
@@ -654,10 +670,11 @@ __device__ __forceinline__ void quantize_bf16_fp8_g128_group(
   const float y_scale = 1.0f / y_scale_inv;
 
   if (lane_id == 0) {
-    output_s[token_idx * hidden_dim_num_groups + hidden_dim_group_idx] = y_scale_inv;
+    output_s[static_cast<int64_t>(token_idx) * hidden_dim_num_groups + hidden_dim_group_idx] = y_scale_inv;
   }
 
-  const int output_offset = (token_idx * hidden_dim_num_groups + hidden_dim_group_idx) * GROUP_SIZE + elem_offset;
+  const int64_t output_offset =
+      (static_cast<int64_t>(token_idx) * hidden_dim_num_groups + hidden_dim_group_idx) * GROUP_SIZE + elem_offset;
   if constexpr (ELEMS_PER_THREAD == 16) {
     float4 outputx4_0 = {values[0] * y_scale, values[1] * y_scale, values[2] * y_scale, values[3] * y_scale};
     float4 outputx4_1 = {values[4] * y_scale, values[5] * y_scale, values[6] * y_scale, values[7] * y_scale};
@@ -1157,7 +1174,6 @@ void sgl_per_token_group_quant_8bit_v2(
   TORCH_CHECK(std::abs(LOCAL_ABSMAX_ABS - eps) < 1e-13);
 
   CHECK_EQ(tensor_numel(input) % group_size, 0);
-  const int num_groups = static_cast<int>(tensor_numel(input)) / group_size / (fuse_silu_and_mul ? 2 : 1);
 
   const bool masked_layout = has_masked_m;
   TORCH_CHECK(output_s.ndim() == (masked_layout ? 3 : 2));
@@ -1189,7 +1205,8 @@ void sgl_per_token_group_quant_8bit_v2(
     int subwarps_per_block;                                                                                          \
     dim3 grid, block;                                                                                                \
     SCHEDULER::compute_exec_config(                                                                                  \
-        THREADS_PER_SUBWARP, num_local_experts, hidden_dim_num_groups, num_groups, subwarps_per_block, grid, block); \
+        THREADS_PER_SUBWARP, num_local_experts, hidden_dim_num_groups, num_tokens_per_expert, subwarps_per_block,    \
+        grid, block);                                                                                                \
                                                                                                                      \
     per_token_group_quant_8bit_kernel<SCHEDULER, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, __VA_ARGS__>         \
         <<<grid, block, 0, stream>>>(                                                                                \

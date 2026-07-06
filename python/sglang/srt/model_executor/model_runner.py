@@ -1651,6 +1651,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         new_expert_location_metadata: ExpertLocationMetadata,
         update_layer_ids: List[int],
     ):
+        # Preserve the pre-chunking behavior unless a separate expert-chunk knob
+        # is introduced: process all logical experts in one updater chunk.
+        rebalance_experts_per_chunk = new_expert_location_metadata.num_logical_experts
         p2p_missing_logical_experts = yield from self.expert_location_updater.update(
             self.model.routed_experts_weights_of_layer,
             new_expert_location_metadata,
@@ -2478,10 +2481,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         Covers framework-level warmups and optional model-specific warmups.
         """
         if self.device == "musa":
-            from sglang.srt.layers.moe.auto_tune import (
+            from sglang.srt.hardware_backend.musa.layers.linear_auto_tune import (
+                maybe_autotune_musa_linear_gemv,
+            )
+            from sglang.srt.hardware_backend.musa.layers.moe_auto_tune import (
                 maybe_autotune_musa_moe_deepgemm_threshold,
             )
 
+            maybe_autotune_musa_linear_gemv(
+                self.model,
+                rank=self.tp_rank,
+            )
             maybe_autotune_musa_moe_deepgemm_threshold(
                 self.model,
                 rank=self.tp_rank,

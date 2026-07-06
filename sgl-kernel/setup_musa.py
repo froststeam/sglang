@@ -115,7 +115,6 @@ sources = [
     str(_FLASHINFER_REPO.source_dir / "csrc/sampling.cu"),
     # XXX (MUSA): The following files contain MUSA-specific implementations.
     "csrc/musa/pos_encoding_contiguous.mu",
-    "csrc/musa/moe_gemv_swiglu.mu",
     "csrc/musa/ternary.mu",
     "csrc/musa/top_k_top_p_sampling.mu",
 ]
@@ -154,8 +153,8 @@ mcc_private_use_flags = [
     "-mtgpu-enchanced-minreg-schedule=1",
     "-mllvm",
     "-mtgpu-enable-preisel-sinking=0",
-    #"-mllvm",
-    #"-mtgpu-attr-alloc-first=1",
+    # "-mllvm",
+    # "-mtgpu-attr-alloc-first=1",
     "-mllvm",
     "-misched-recompute-slotindex",
 ]

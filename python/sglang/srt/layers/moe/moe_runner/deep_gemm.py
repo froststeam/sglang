@@ -270,8 +270,12 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hooks: Optional[Any] = None,
     ) -> DeepGemmRunnerOutput:
         weight_dtype = quant_info.w13_weight.dtype
+        use_16bit_gemm = not quant_info.use_fp8 and weight_dtype in (
+            torch.bfloat16,
+            torch.float16,
+        )
         if not runner_input.use_masked_gemm:
-            if weight_dtype == torch.bfloat16:
+            if use_16bit_gemm:
                 hidden_states = self._run_bf16_contiguous_gemm(
                     runner_input, quant_info, running_state
                 )
@@ -280,7 +284,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     runner_input, quant_info, running_state
                 )
         else:
-            if weight_dtype == torch.bfloat16:
+            if use_16bit_gemm:
                 hidden_states = self._run_masked_bf16_gemm(
                     runner_input, quant_info, running_state
                 )
@@ -858,17 +862,34 @@ def pre_permute_standard_to_deep_gemm(
         all_tokens = src2dst_numel
         block_shape = quant_info.block_shape or [128, 128]
         use_fp8_quant = quant_info.use_fp8
-        can_use_musa_fused_preprocess = (
+        can_use_musa_fused_preprocess = False
+        if (
             _is_musa
             and hidden_states.dtype == torch.bfloat16
             and topk_ids.dtype == torch.int32
-            and (
-                not use_fp8_quant
-                or (
-                    block_shape[1] == 128 and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-                )
+            and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        ):
+            from sglang.srt.hardware_backend.musa.jit_kernel.tilelang.deep_gemm_contig_preprocess import (
+                can_use_bf16_tilelang,
+                can_use_fp8_tilelang,
             )
-        )
+
+            if use_fp8_quant:
+                can_use_musa_fused_preprocess = block_shape[
+                    1
+                ] == 128 and can_use_fp8_tilelang(
+                    hidden_states,
+                    topk_ids,
+                    runner_config.num_local_experts,
+                    use_fp8_quant,
+                )
+            else:
+                can_use_musa_fused_preprocess = can_use_bf16_tilelang(
+                    hidden_states,
+                    topk_ids,
+                    runner_config.num_local_experts,
+                    use_fp8_quant,
+                )
         use_musa_padded_contig = (
             can_use_musa_fused_preprocess and hidden_states.dtype == torch.bfloat16
         )
@@ -1403,22 +1424,41 @@ def _varlen_deep_gemm_silu_mul_quant(
         sglang_per_token_group_quant_8bit,
     )
 
-    if _is_musa and activation == "silu":
-        assert swiglu_limit is None
-        assert not swizzle
-        return sglang_per_token_group_quant_8bit(
-            x=gateup_output,
-            dst_dtype=torch.float8_e4m3fn,
-            group_size=group_size,
-            masked_m=masked_m,
-            column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-            scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-            fuse_silu_and_mul=True,
-            enable_v2=True,
-        )
+    assert masked_m is not None
+    hidden_states_device = gateup_output.device
+    E, N, D_2 = gateup_output.shape
+    D = D_2 // 2
+    del D_2
+    G = D // group_size
+    down_input = torch.empty(
+        (E, N, D),
+        device=hidden_states_device,
+        dtype=torch.float8_e4m3fn,
+    )
 
-    if _MASKED_GEMM_FAST_ACT:
+    if _is_musa:
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            raise ValueError(
+                "MUSA masked DeepGEMM act-quant uses row-major float scales; "
+                "UE8M0 scale is not supported."
+            )
+        down_input_scale = torch.empty(
+            (E, N, G),
+            device=hidden_states_device,
+            dtype=torch.float32,
+        )
+        act_and_mul_masked_post_quant_fwd(
+            gateup_output,
+            down_input,
+            down_input_scale,
+            group_size,
+            masked_m,
+            scale_ue8m0=False,
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+            swizzle=swizzle,
+        )
+    elif _MASKED_GEMM_FAST_ACT:
         assert not swizzle, (
             "SGLANG_OPT_FIX_MEGA_MOE_MEMORY is incompatible with "
             "SGLANG_MASKED_GEMM_FAST_ACT (swizzled layout only supported by JIT act)"
@@ -1436,40 +1476,6 @@ def _varlen_deep_gemm_silu_mul_quant(
             scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             fuse_silu_and_mul=True,
             enable_v2=True,
-        )
-
-    assert masked_m is not None
-    hidden_states_device = gateup_output.device
-    E, N, D_2 = gateup_output.shape
-    D = D_2 // 2
-    del D_2
-    G = D // group_size
-    down_input = torch.empty(
-        (E, N, D),
-        device=hidden_states_device,
-        dtype=torch.float8_e4m3fn,
-    )
-
-    if _is_musa:
-        if swiglu_limit is not None:
-            gateup_output = _apply_swiglu_limit(
-                gateup_output.reshape(-1, D * 2), swiglu_limit=swiglu_limit
-            ).view(E, N, D * 2)
-            swiglu_limit = None
-        assert not swizzle
-        down_input_scale = torch.empty(
-            (E, N, G),
-            device=hidden_states_device,
-            dtype=torch.float32,
-        )
-        act_and_mul_masked_post_quant_fwd(
-            gateup_output,
-            down_input,
-            down_input_scale,
-            group_size,
-            masked_m,
-            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-            activation=activation,
         )
     elif envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get():
         assert N % 4 == 0 and G % 4 == 0
