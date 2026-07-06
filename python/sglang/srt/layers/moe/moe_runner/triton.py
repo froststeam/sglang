@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional
 
@@ -16,6 +17,13 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.utils import is_musa
+
+_is_musa = is_musa()
+_MUSA_MOE_GEMV_SWIGLU_MAX_TOKENS = int(
+    os.getenv("SGLANG_MUSA_MOE_GEMV_SWIGLU_MAX_TOKENS", "16")
+)
+_MUSA_MOE_GEMV_BLOCK_KS: tuple[int, ...] = (4, 8, 16, 32)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.standard import (
@@ -69,6 +77,175 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     block_shape: Optional[List[int]] = None
 
 
+def _run_musa_moe_gemv_swiglu(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> torch.Tensor:
+    if not _can_run_musa_moe_gemv_swiglu(hidden_states, quant_info, runner_config):
+        raise RuntimeError(
+            "MUSA MoE GEMV SwiGLU only supports local BF16 MoE or FP8 block-"
+            "quantized MoE with BF16 activations and FP8 weight scales."
+        )
+
+    from sglang.srt.hardware_backend.musa.jit_kernel import moe_sum_reduce
+    from sglang.srt.hardware_backend.musa.jit_kernel.csrc.gemm import (
+        musa_fused_moe_gemv,
+    )
+
+    topk = topk_ids.shape[1]
+    if topk_ids.dtype != torch.int32:
+        topk_ids = topk_ids.to(torch.int32)
+    topk_ids = topk_ids.contiguous()
+    if topk_weights.dtype != torch.float32:
+        topk_weights = topk_weights.to(torch.float32)
+    topk_weights = topk_weights.contiguous()
+
+    num_tokens = hidden_states.shape[0]
+    w13 = quant_info.w13_weight
+    w2 = quant_info.w2_weight
+    inter_size = w13.shape[1] // 2
+    use_fp8 = quant_info.use_fp8_w8a8
+
+    intermediate = torch.empty(
+        (num_tokens, topk, inter_size),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    musa_fused_moe_gemv(
+        hidden_states,
+        w13,
+        intermediate,
+        None,
+        quant_info.w13_scale if use_fp8 else None,
+        topk_weights,
+        topk_ids,
+        False,
+        topk,
+        False,
+        True,
+    )
+
+    routed_output = torch.empty(
+        (num_tokens, topk, w2.shape[1]),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    flat_tokens = num_tokens * topk
+    musa_fused_moe_gemv(
+        intermediate.view(flat_tokens, inter_size),
+        w2,
+        routed_output.view(flat_tokens, 1, w2.shape[1]),
+        None,
+        quant_info.w2_scale if use_fp8 else None,
+        topk_weights.view(flat_tokens, 1),
+        topk_ids.view(flat_tokens, 1),
+        True,
+        1,
+        False,
+        False,
+    )
+
+    routed_scaling_factor = runner_config.routed_scaling_factor
+    routed_scaling_factor = (
+        1.0 if routed_scaling_factor is None else routed_scaling_factor
+    )
+    out_hidden_states = (
+        hidden_states if runner_config.inplace else torch.empty_like(hidden_states)
+    )
+    if topk == 1 and routed_scaling_factor == 1.0:
+        out_hidden_states.copy_(routed_output[:, 0])
+    else:
+        moe_sum_reduce(routed_output, out_hidden_states, routed_scaling_factor)
+    return out_hidden_states
+
+
+def _can_run_musa_moe_gemv_swiglu_quant_info(
+    hidden_states: torch.Tensor,
+    quant_info: TritonMoeQuantInfo,
+) -> bool:
+    if hidden_states.dtype != torch.bfloat16:
+        return False
+
+    if (
+        quant_info.w13_weight.dtype == torch.bfloat16
+        and quant_info.w2_weight.dtype == torch.bfloat16
+    ):
+        return (
+            quant_info.w13_scale is None
+            and quant_info.w2_scale is None
+            and not quant_info.use_fp8_w8a8
+            and not quant_info.use_int8_w8a8
+            and not quant_info.use_int8_w8a16
+            and not quant_info.use_int4_w4a16
+        )
+
+    if not (
+        quant_info.use_fp8_w8a8
+        and quant_info.w13_weight.dtype == torch.float8_e4m3fn
+        and quant_info.w2_weight.dtype == torch.float8_e4m3fn
+        and quant_info.w13_scale is not None
+        and quant_info.w2_scale is not None
+        and quant_info.w13_scale.is_contiguous()
+        and quant_info.w2_scale.is_contiguous()
+        and quant_info.block_shape is not None
+        and len(quant_info.block_shape) == 2
+        and quant_info.block_shape[0] in (64, 128)
+        and quant_info.block_shape[1] in (64, 128)
+    ):
+        return False
+
+    return (
+        not quant_info.use_int8_w8a8
+        and not quant_info.use_int8_w8a16
+        and not quant_info.use_int4_w4a16
+    )
+
+
+def _can_run_musa_moe_gemv_swiglu(
+    hidden_states: torch.Tensor,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> bool:
+    hidden_size = hidden_states.shape[1]
+    element_size = quant_info.w13_weight.element_size()
+    if element_size <= 0:
+        return False
+    vlen = 128 // (element_size * 8)
+    if vlen <= 0:
+        return False
+    if not any(
+        hidden_size % (block_k * vlen) == 0 for block_k in _MUSA_MOE_GEMV_BLOCK_KS
+    ):
+        return False
+
+    return (
+        _is_musa
+        and _MUSA_MOE_GEMV_SWIGLU_MAX_TOKENS > 0
+        and 0 < hidden_states.shape[0] <= _MUSA_MOE_GEMV_SWIGLU_MAX_TOKENS
+        and hidden_states.is_contiguous()
+        and runner_config.num_local_experts == quant_info.w13_weight.shape[0]
+        and runner_config.num_local_experts == quant_info.w2_weight.shape[0]
+        and runner_config.activation == "silu"
+        and runner_config.swiglu_limit is None
+        and runner_config.gemm1_alpha is None
+        and runner_config.gemm1_clamp_limit is None
+        and not runner_config.no_combine
+        and not runner_config.apply_router_weight_on_input
+        and runner_config.is_gated
+        and quant_info.b13 is None
+        and quant_info.b2 is None
+        and quant_info.w13_weight.is_contiguous()
+        and quant_info.w2_weight.is_contiguous()
+        and quant_info.w13_zp is None
+        and quant_info.w2_zp is None
+        and not quant_info.per_channel_quant
+        and _can_run_musa_moe_gemv_swiglu_quant_info(hidden_states, quant_info)
+    )
+
+
 class TritonRunnerCore(MoeRunnerCore):
 
     def __init__(self, config: MoeRunnerConfig):
@@ -89,6 +266,21 @@ class TritonRunnerCore(MoeRunnerCore):
             self.config.num_experts is None
             or self.config.num_experts != self.config.num_local_experts
         )
+
+        if hooks is None and _can_run_musa_moe_gemv_swiglu(
+            runner_input.hidden_states,
+            quant_info,
+            self.config,
+        ):
+            return TritonRunnerOutput(
+                hidden_states=_run_musa_moe_gemv_swiglu(
+                    runner_input.hidden_states,
+                    runner_input.topk_weights,
+                    runner_input.topk_ids,
+                    quant_info,
+                    self.config,
+                )
+            )
 
         out = _fused_moe_kernel_sequence(
             runner_input.hidden_states,
@@ -144,6 +336,18 @@ def fused_experts_none_to_triton(
 ) -> StandardCombineInput:
     from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+
+    if _can_run_musa_moe_gemv_swiglu(
+        dispatch_output.hidden_states, quant_info, runner_config
+    ):
+        output = _run_musa_moe_gemv_swiglu(
+            dispatch_output.hidden_states,
+            dispatch_output.topk_output.topk_weights,
+            dispatch_output.topk_output.topk_ids,
+            quant_info,
+            runner_config,
+        )
+        return StandardCombineInput(hidden_states=output)
 
     output = fused_experts(
         hidden_states=dispatch_output.hidden_states,

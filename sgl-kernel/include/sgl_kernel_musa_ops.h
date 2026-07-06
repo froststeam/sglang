@@ -41,31 +41,6 @@ void rotary_embedding_contiguous(
     torch::Tensor& cos_sin_cache,
     bool is_neox);
 
-void fused_moe_gemv(
-    torch::Tensor& A,
-    torch::Tensor& B,
-    torch::Tensor& C,
-    const c10::optional<torch::Tensor>& A_scale,
-    const c10::optional<torch::Tensor>& B_scale,
-    torch::Tensor& topk_weights,
-    torch::Tensor& topk_ids,
-    bool mul_routed_weight,
-    int64_t topk,
-    bool use_int4_w4a16,
-    bool use_swigelu);
-
-void musa_fused_gemv(
-    torch::Tensor& A,
-    torch::Tensor& B,
-    torch::Tensor& C,
-    const c10::optional<torch::Tensor>& A_scale,
-    const c10::optional<torch::Tensor>& B_scale,
-    bool use_int4_w4a16,
-    bool use_swigelu,
-    bool use_rms_norm,
-    const c10::optional<torch::Tensor>& gamma,
-    double eps);
-
 void fused_mul_add(torch::Tensor& output, torch::Tensor& self, torch::Tensor& bias, double scale);
 
 void musa_top_k_top_p_sampling_from_probs(

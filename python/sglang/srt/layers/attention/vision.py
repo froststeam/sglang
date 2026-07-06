@@ -437,10 +437,7 @@ class VisionFlash3Attention(nn.Module):
             cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
             cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
             seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            if _is_musa:
-                max_seqlen = int(seq_lens.detach().cpu().max().item())
-            else:
-                max_seqlen = seq_lens.max().item()
+            max_seqlen = seq_lens.max().item()
 
             fa_kwargs = dict(
                 cu_seqlens_q=cu_seqlens,

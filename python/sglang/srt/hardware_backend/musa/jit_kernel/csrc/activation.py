@@ -183,6 +183,8 @@ def _act_and_mul_masked_post_quant_impl(
     output_scale: torch.Tensor,
     masked_m: torch.Tensor,
     activation_type: int,
+    swiglu_limit: float,
+    swizzle: bool,
 ) -> None:
     _act_and_mul_post_quant_module().sgl_musa_act_and_mul_masked_post_quant(
         input,
@@ -190,6 +192,8 @@ def _act_and_mul_masked_post_quant_impl(
         output_scale,
         masked_m,
         int(activation_type),
+        float(swiglu_limit),
+        bool(swizzle),
     )
 
 
@@ -203,6 +207,8 @@ def _act_and_mul_masked_post_quant_custom(
     output_scale: torch.Tensor,
     masked_m: torch.Tensor,
     activation_type: int,
+    swiglu_limit: float,
+    swizzle: bool,
 ) -> None:
     _act_and_mul_masked_post_quant_impl(
         input,
@@ -210,6 +216,8 @@ def _act_and_mul_masked_post_quant_custom(
         output_scale,
         masked_m,
         activation_type,
+        swiglu_limit,
+        swizzle,
     )
 
 
@@ -219,6 +227,8 @@ def act_and_mul_masked_post_quant(
     output_scale: torch.Tensor,
     masked_m: torch.Tensor,
     activation: str = "silu",
+    swiglu_limit: Optional[float] = None,
+    swizzle: bool = False,
 ) -> None:
     _act_and_mul_masked_post_quant_custom(
         input,
@@ -226,6 +236,8 @@ def act_and_mul_masked_post_quant(
         output_scale,
         masked_m,
         _activation_type_id(activation),
+        0.0 if swiglu_limit is None else float(swiglu_limit),
+        swizzle,
     )
 
 
@@ -237,6 +249,8 @@ def act_and_mul_masked_post_quant_fwd(
     masked_m: torch.Tensor,
     scale_ue8m0: bool = False,
     activation: str = "silu",
+    swiglu_limit: Optional[float] = None,
+    swizzle: bool = False,
 ) -> None:
     assert input.is_contiguous()
     assert output.dtype == torch.float8_e4m3fn
@@ -245,6 +259,8 @@ def act_and_mul_masked_post_quant_fwd(
     assert input.shape[0] == masked_m.shape[0]
     assert input.shape[-1] % 2 == 0
     assert activation in ("silu", "gelu", "gelu_tanh")
+    if swiglu_limit is not None and activation != "silu":
+        raise ValueError("swiglu_limit is only supported with silu activation.")
 
     size_n = input.shape[-1] // 2
     assert size_n % quant_group_size == 0
@@ -261,4 +277,6 @@ def act_and_mul_masked_post_quant_fwd(
         output_scale,
         masked_m,
         activation=activation,
+        swiglu_limit=swiglu_limit,
+        swizzle=swizzle,
     )

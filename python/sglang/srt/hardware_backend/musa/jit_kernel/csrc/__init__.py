@@ -5,6 +5,7 @@ from sglang.srt.hardware_backend.musa.jit_kernel.csrc.activation import (
     act_and_mul_masked,
     act_and_mul_masked_post_quant_fwd,
 )
+from sglang.srt.hardware_backend.musa.jit_kernel.csrc.gemm import musa_fused_moe_gemv
 from sglang.srt.hardware_backend.musa.jit_kernel.csrc.moe import (
     deep_gemm_contig_preprocess,
     deep_gemm_ep_preprocess,
@@ -32,6 +33,7 @@ __all__ = [
     "deep_gemm_contig_preprocess",
     "deep_gemm_ep_preprocess",
     "fused_share_gate_sigmoid_mul",
+    "musa_fused_moe_gemv",
     "moe_align_block_size",
     "act_and_mul",
     "act_and_mul_masked",

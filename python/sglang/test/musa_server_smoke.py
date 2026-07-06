@@ -1,6 +1,7 @@
 import json
 import os
 import shlex
+import time
 import unittest
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -135,6 +136,79 @@ def _close_server_log_files(log_files):
             pass
 
 
+def _get_visible_musa_device_count() -> int:
+    visible = os.getenv("MUSA_VISIBLE_DEVICES") or os.getenv("CUDA_VISIBLE_DEVICES")
+    if not visible:
+        return 0
+    return len([part for part in visible.split(",") if part.strip() != ""])
+
+
+def _wait_for_musa_free_memory(case: MusaSmokeCase) -> None:
+    if not os.getenv("SGLANG_IS_IN_CI"):
+        return
+
+    try:
+        import torch
+    except Exception:
+        return
+
+    if not (hasattr(torch, "musa") and torch.musa.is_available()):
+        return
+
+    device_count = torch.musa.device_count()
+    if device_count <= 0:
+        return
+
+    visible_count = _get_visible_musa_device_count()
+    num_devices = min(
+        case.tp_size,
+        visible_count if visible_count > 0 else device_count,
+        device_count,
+    )
+    if num_devices <= 0:
+        return
+
+    min_free_gb = float(os.getenv("MUSA_SMOKE_MIN_FREE_MEMORY_GB", "70"))
+    timeout_s = float(os.getenv("MUSA_SMOKE_FREE_MEMORY_TIMEOUT", "300"))
+    poll_s = float(os.getenv("MUSA_SMOKE_FREE_MEMORY_POLL_INTERVAL", "5"))
+    deadline = time.time() + timeout_s
+    last_snapshot = None
+
+    while True:
+        free_gb = []
+        for device_id in range(num_devices):
+            with torch.musa.device(device_id):
+                free_bytes, _total_bytes = torch.musa.mem_get_info()
+            free_gb.append(free_bytes / (1024**3))
+
+        last_snapshot = ", ".join(
+            f"gpu{device_id}={free:.2f}GB" for device_id, free in enumerate(free_gb)
+        )
+        if all(free >= min_free_gb for free in free_gb):
+            print(
+                "MUSA smoke: enough free GPU memory before launch: "
+                f"{last_snapshot} (threshold={min_free_gb:.2f}GB)",
+                flush=True,
+            )
+            return
+
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise unittest.SkipTest(
+                "MUSA smoke skipped due to insufficient free GPU memory before "
+                f"launch: {last_snapshot} (threshold={min_free_gb:.2f}GB, "
+                f"timeout={timeout_s:.0f}s)"
+            )
+
+        print(
+            "MUSA smoke: waiting for GPU memory to clear before launch: "
+            f"{last_snapshot} (threshold={min_free_gb:.2f}GB, "
+            f"remaining={remaining:.0f}s)",
+            flush=True,
+        )
+        time.sleep(poll_s)
+
+
 def _assert_server_process_alive(process):
     if process is None:
         return
@@ -237,6 +311,7 @@ class MusaServerSmokeTest(CustomTestCase):
         cls.model = model
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.server_log_files = _open_server_log_files(cls.smoke_case.name)
+        _wait_for_musa_free_memory(cls.smoke_case)
         try:
             cls.process = popen_launch_server(
                 cls.model,

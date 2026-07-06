@@ -318,18 +318,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.impl("musa_rotary_embedding_contiguous", torch::kMUSA, &rotary_embedding_contiguous);
 
   m.def(
-      "musa_fused_moe_gemv(Tensor! A, Tensor! B, Tensor! C, Tensor? A_scale, Tensor? B_scale,"
-      "Tensor! topk_weights, Tensor! topk_ids, bool mul_routed_weight, int topk, bool use_int4_w4a16,"
-      "bool use_swigelu) -> ()");
-  m.impl("musa_fused_moe_gemv", torch::kMUSA, &fused_moe_gemv);
-
-  m.def(
-      "musa_fused_gemv(Tensor! A, Tensor! B, Tensor! C, Tensor? A_scale, Tensor? B_scale,"
-      "bool use_int4_w4a16, bool use_swigelu, bool use_rms_norm, Tensor? gamma,"
-      "float eps) -> ()");
-  m.impl("musa_fused_gemv", torch::kMUSA, &musa_fused_gemv);
-
-  m.def(
       "musa_fused_mul_add(Tensor! output, Tensor! self, Tensor! bias,"
       "float scale) -> ()");
   m.impl("musa_fused_mul_add", torch::kMUSA, &fused_mul_add);

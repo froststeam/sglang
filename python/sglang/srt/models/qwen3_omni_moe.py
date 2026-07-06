@@ -31,6 +31,9 @@ from sglang.srt.configs.qwen3_omni import (
     Qwen3OmniMoeVisionEncoderConfig,
 )
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig
+from sglang.srt.hardware_backend.musa.layers.linear_auto_tune import (
+    maybe_apply_musa_linear_activation,
+)
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -43,7 +46,9 @@ from sglang.srt.models.qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration,
     load_fused_expert_weights,
 )
-from sglang.srt.utils import add_prefix, is_npu, logger
+from sglang.srt.utils import add_prefix, is_musa, is_npu, logger
+
+_is_musa = is_musa()
 
 
 class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
@@ -69,6 +74,7 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.dropout = config.dropout
         self.activation_fn = ACT2FN[config.activation_function]
+        self.activation_name = config.activation_function
         self.activation_dropout = config.activation_dropout
         self.fc1 = ColumnParallelLinear(
             self.embed_dim,
@@ -108,8 +114,20 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states, _ = self.fc1(hidden_states)
-        hidden_states = self.activation_fn(hidden_states)
+        activated_hidden_states = (
+            maybe_apply_musa_linear_activation(
+                self.fc1,
+                hidden_states,
+                activation=self.activation_name,
+            )
+            if _is_musa
+            else None
+        )
+        if activated_hidden_states is None:
+            hidden_states, _ = self.fc1(hidden_states)
+            hidden_states = self.activation_fn(hidden_states)
+        else:
+            hidden_states = activated_hidden_states
         hidden_states, _ = self.fc2(hidden_states)
         hidden_states = residual + hidden_states
 

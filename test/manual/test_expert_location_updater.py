@@ -215,6 +215,7 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
             ),
             old_physical_to_logical_map=physical_to_logical_map.tolist(),
             new_physical_to_logical_map=new_physical_to_logical_map.tolist(),
+            rebalance_experts_per_chunk=info.num_logical_experts,
             num_local_physical_experts=num_local_physical_experts,
             num_gpu_per_node=num_gpu_per_node,
             rank=rank,
