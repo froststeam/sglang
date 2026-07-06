@@ -219,6 +219,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     get_int_env_var,
+    is_musa,
     is_mps,
     kill_itself_when_parent_died,
     point_to_point_pyobj,
@@ -256,6 +257,7 @@ TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
+_is_musa = is_musa()
 _is_npu = is_npu()
 
 
@@ -990,7 +992,11 @@ class Scheduler(
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             return None, None
 
-        if self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
+        # XXX (MUSA): MUSA uses the spec-v2 draft worker layout even when the
+        # scheduler itself is not running overlap.
+        if self.spec_algorithm.supports_spec_v2() and (
+            self.enable_overlap or _is_musa
+        ):
             if self.server_args.enable_multi_layer_eagle:
                 draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
             else:
@@ -3014,7 +3020,11 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-            if self.spec_algorithm.is_none() or self.enable_overlap:
+            if (
+                self.spec_algorithm.is_none()
+                or self.enable_overlap
+                or (_is_musa and self.spec_algorithm.supports_spec_v2())
+            ):
                 # In most cases, we use the model worker batch to run the forward.
                 worker_batch_or_batch = batch.get_model_worker_batch()
             else:
@@ -3078,6 +3088,23 @@ class Scheduler(
                 )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
+
+                # XXX (MUSA): Reuse the spec-v2/overlap worker-batch path
+                # without enabling the overlap event loop. Mirror the overlap
+                # state handoff and CPU copy that output processing expects.
+                if (
+                    _is_musa
+                    and batch.is_spec_v2
+                    and not self.enable_overlap
+                    and batch_result.next_draft_input is not None
+                ):
+                    batch.spec_info = batch_result.next_draft_input
+                    batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+                    batch_result.copy_done = self.device_module.Event()
+                    batch_result.copy_to_cpu(
+                        return_logprob=batch.return_logprob,
+                        return_hidden_states=batch.return_hidden_states,
+                    )
 
             # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
             #       which can probably be replaced by future_indices later [TODO(lsyin)].
