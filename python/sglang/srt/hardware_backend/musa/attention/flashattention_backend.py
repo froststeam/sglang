@@ -140,12 +140,6 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         self.num_hidden_layers = model_runner.model_config.num_hidden_layers
         self.first_k_dense_replace = model_runner.model_config.first_k_dense_replace
         self.full_attention_interval = model_runner.model_config.full_attention_interval
-        architectures = getattr(model_runner.model_config.hf_config, "architectures", [])
-        self._use_minimax_m2_decode_split16 = (
-            "MiniMaxM2ForCausalLM" in (architectures or [])
-            and self.fa_impl_ver == 3
-        )
-
         if not self.use_mla:
             (
                 self._full_attention_layout,
@@ -1173,19 +1167,6 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         self._init_scheduler_metadata(forward_batch_for_init)
         self._copy_fresh_metadata_to_cuda_graph_tensors(bs, forward_mode, spec_info)
 
-    def _get_decode_num_splits(self, batch_size: int, max_seqlen_k: int) -> int:
-        # split16 removed: the explicit num_splits=16 was a workaround for an OLD
-        # mate flash-attn kernel that did a "single KV tile" for num_splits=0 under
-        # cuda-graph (~4x slower long-ctx). The current kernel auto-splits for
-        # num_splits=0 (in-kernel get_num_splits heuristic), so forcing 16 gives NO
-        # speedup (measured: 128K split16-on == off) and, worse, the scheduler
-        # metadata is precomputed with self.num_splits(=0) while the kernel used 16
-        # for the verify/decode path -> a num_splits build-vs-call MISMATCH that
-        # corrupted the split-K LSE combine -> eagle3 accept collapsed (2.2->1.06).
-        # Always return self.num_splits so scheduler metadata and kernel calls stay
-        # consistent everywhere.
-        return self.num_splits
-
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
         self._init_scheduler_metadata_for_batch(
@@ -1531,22 +1512,6 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                 or forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend(include_v2=True)
             ):
-                # split-KV fix: EAGLE3 target_verify/draft_extend are small-q + large-KV (decode-like).
-                # With num_splits=0 the kernel can't split under CUDA-graph capture -> single KV tile,
-                # ~4x slower at long context. Force decode's explicit split count (16 for MiniMaxM2,
-                # bs<=4); numerically equivalent. extend_with_prefix (prefill-like) keeps the default.
-                verify_num_splits = self.num_splits
-                if (
-                    forward_batch.forward_mode.is_target_verify()
-                    or forward_batch.forward_mode.is_draft_extend()
-                ):
-                    verify_num_splits = self._get_decode_num_splits(
-                        # base-port: v0.5.10 MUSA forward_extend references max_seqlen_k
-                        # here (EAGLE/MTP split-KV heuristic) before its later assignment;
-                        # use metadata.max_seq_len_k (the value the m25 base hoisted).
-                        forward_batch.batch_size,
-                        getattr(metadata, "max_seq_len_k", 0),
-                    )
                 scheduler_metadata = self._scheduler_metadata_for_kvcache(
                     scheduler_metadata_owner,
                     is_swa_layer=is_swa_layer,
@@ -1570,7 +1535,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
                     scheduler_metadata=scheduler_metadata,
-                    num_splits=verify_num_splits,
+                    num_splits=self.num_splits,
                     **kwargs,
                 )
             else:
@@ -1828,9 +1793,6 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         kwargs = {}
         if sinks is not None:
             kwargs["sinks"] = sinks
-        decode_num_splits = self._get_decode_num_splits(
-            forward_batch.batch_size, metadata.max_seq_len_k
-        )
 
         flash_attn_with_kvcache = self.flash_attn_with_kvcache
 
@@ -1875,7 +1837,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                         metadata,
                         is_cross_attention=True,
                     ),
-                    num_splits=decode_num_splits,
+                    num_splits=self.num_splits,
                     **kwargs,
                 )
             elif use_local_attn:
@@ -1898,7 +1860,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                         metadata,
                         local_metadata=local_attn_metadata,
                     ),
-                    num_splits=decode_num_splits,
+                    num_splits=self.num_splits,
                     **kwargs,
                 )
             else:
@@ -1937,7 +1899,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                         metadata,
                         is_swa_layer=is_swa_layer,
                     ),
-                    num_splits=decode_num_splits,
+                    num_splits=self.num_splits,
                     **kwargs,
                 )
                 if use_cascade_attn:
@@ -1962,7 +1924,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                             scheduler_metadata=self._spec_decode_expand_scheduler_metadata(
                                 is_swa_layer=is_swa_layer,
                             ),
-                            num_splits=decode_num_splits,
+                            num_splits=self.num_splits,
                             **kwargs,
                         )
                     )
@@ -2021,7 +1983,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     layer,
                     forward_batch,
                 ),
-                num_splits=decode_num_splits,
+                num_splits=self.num_splits,
             )
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
@@ -2046,7 +2008,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                         layer,
                         forward_batch,
                     ),
-                    num_splits=decode_num_splits,
+                    num_splits=self.num_splits,
                 )
                 o, _ = merge_state_v2_wrapper(
                     o,
