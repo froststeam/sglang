@@ -1179,15 +1179,12 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         # cuda-graph (~4x slower long-ctx). The current kernel auto-splits for
         # num_splits=0 (in-kernel get_num_splits heuristic), so forcing 16 gives NO
         # speedup (measured: 128K split16-on == off) and, worse, the scheduler
-        # metadata is precomputed with self.num_splits(=0) while this returned 16
-        # for the verify/decode kernel -> a num_splits build-vs-call MISMATCH that
+        # metadata is precomputed with self.num_splits(=0) while the kernel used 16
+        # for the verify/decode path -> a num_splits build-vs-call MISMATCH that
         # corrupted the split-K LSE combine -> eagle3 accept collapsed (2.2->1.06).
-        # Returning self.num_splits keeps metadata and kernel consistent everywhere.
-        # The env override (SGLANG_MUSA_FA3_DECODE_NUM_SPLITS) is still honored.
-        override = envs.SGLANG_MUSA_FA3_DECODE_NUM_SPLITS.get()
-        if override is None or override < 0:
-            return self.num_splits
-        return override
+        # Always return self.num_splits so scheduler metadata and kernel calls stay
+        # consistent everywhere.
+        return self.num_splits
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
