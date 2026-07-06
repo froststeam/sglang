@@ -16,6 +16,7 @@
 """Inference-only MiniMax M2 model compatible with HuggingFace weights."""
 
 import logging
+import os
 from contextlib import nullcontext
 from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
@@ -105,6 +106,107 @@ _is_npu = is_npu()
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_tp_rmsnorm_rope import split_qkv_tp_rmsnorm_rope
+
+_PROFILE_MINIMAX_M2_LAYERS = os.getenv("SGLANG_MINIMAX_M2_PROFILE_LAYERS") == "1"
+_MINIMAX_M2_LINEAR_ATTENTION_TYPE = int(
+    os.getenv("SGLANG_MINIMAX_M2_LINEAR_ATTENTION_TYPE", "0")
+)
+_MINIMAX_M2_LIGHTNING_MAX_LAYERS = int(
+    os.getenv("SGLANG_MINIMAX_M2_LIGHTNING_MAX_LAYERS", "-1")
+)
+_MINIMAX_M2_ENABLE_LIGHTNING_ATTENTION = (
+    os.getenv("SGLANG_MINIMAX_M2_ENABLE_LIGHTNING_ATTENTION") == "1"
+)
+_MINIMAX_M2_USE_TRITON_QK_SUMSQ = (
+    os.getenv("SGLANG_MINIMAX_M2_USE_TRITON_QK_SUMSQ", "0") == "1"
+)
+_MINIMAX_M2_SKIP_QK_TP_ALLREDUCE = (
+    os.getenv("SGLANG_MINIMAX_M2_SKIP_QK_TP_ALLREDUCE", "0") == "1"
+)
+_MINIMAX_M2_USE_BF16_ROUTER_GATE = (
+    os.getenv("SGLANG_MINIMAX_M2_USE_BF16_ROUTER_GATE", "0") == "1"
+)
+_MINIMAX_M2_KEEP_BF16_ROUTER_LOGITS = (
+    os.getenv("SGLANG_MINIMAX_M2_KEEP_BF16_ROUTER_LOGITS", "0") == "1"
+)
+_MINIMAX_M2_TRITON_ROUTER_GATE_MIN_TOKENS = int(
+    os.getenv("SGLANG_MINIMAX_M2_TRITON_ROUTER_GATE_MIN_TOKENS", "0")
+)
+_MINIMAX_M2_TRITON_ROUTER_GATE_MAX_TOKENS = int(
+    os.getenv(
+        "SGLANG_MINIMAX_M2_TRITON_ROUTER_GATE_MAX_TOKENS",
+        str(_MINIMAX_M2_TRITON_ROUTER_GATE_MIN_TOKENS),
+    )
+)
+_MINIMAX_M2_FUSE_QK_RMSNORM_APPLY_ROPE = (
+    os.getenv("SGLANG_MINIMAX_M2_FUSE_QK_RMSNORM_APPLY_ROPE", "0") == "1"
+)
+
+
+def _minimax_m2_profile_ctx(name: str):
+    if _PROFILE_MINIMAX_M2_LAYERS:
+        return torch.autograd.profiler.record_function(name)
+    return nullcontext()
+
+
+@triton.jit
+def _minimax_m2_router_gate_fp32_kernel(
+    hidden,
+    weight,
+    out,
+    hidden_size: tl.constexpr,
+    num_experts: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    token = tl.program_id(0)
+    expert_block = tl.program_id(1)
+
+    offs_n = expert_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for k0 in range(0, hidden_size, BLOCK_K):
+        k = k0 + offs_k
+        h = tl.load(
+            hidden + token * hidden_size + k,
+            mask=k < hidden_size,
+            other=0.0,
+        ).to(tl.float32)
+        w = tl.load(
+            weight + offs_n[:, None] * hidden_size + k[None, :],
+            mask=(offs_n[:, None] < num_experts) & (k[None, :] < hidden_size),
+            other=0.0,
+        ).to(tl.float32)
+        acc += tl.sum(w * h[None, :], axis=1)
+
+    tl.store(out + token * num_experts + offs_n, acc, mask=offs_n < num_experts)
+
+
+def _minimax_m2_router_gate_triton(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    num_tokens, hidden_size = hidden_states.shape
+    num_experts = weight.shape[0]
+    out = torch.empty(
+        (num_tokens, num_experts),
+        device=hidden_states.device,
+        dtype=torch.float32,
+    )
+    _minimax_m2_router_gate_fp32_kernel[
+        (num_tokens, triton.cdiv(num_experts, 4))
+    ](
+        hidden_states,
+        weight,
+        out,
+        hidden_size,
+        num_experts,
+        BLOCK_N=4,
+        BLOCK_K=256,
+        num_warps=4,
+    )
+    return out
 
 
 @triton.jit
@@ -270,6 +372,166 @@ def rms_apply_serial(
         eps,
         BLOCK_SIZE1,
         BLOCK_SIZE2,
+    )
+    return out1, out2
+
+
+@triton.jit
+def rmsnorm_apply_rope_kernel_serial(
+    x1_ptr,  # T* [B, D1]
+    x2_ptr,  # T* [B, D2]
+    w1_ptr,  # T* [D1]
+    w2_ptr,  # T* [D2]
+    sum_sq_ptr,  # float* [2 * B padded]
+    positions_ptr,  # int* [B]
+    cos_sin_ptr,  # T* [max_position, rotary_dim]
+    out1_ptr,  # T* [B, D1]
+    out2_ptr,  # T* [B, D2]
+    B,
+    stride_x1,
+    stride_x2,
+    tp_world,
+    eps,
+    D1: tl.constexpr,
+    D2: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    ROTARY_DIM: tl.constexpr,
+    ROTARY_HALF: tl.constexpr,
+    BLOCK_SIZE1: tl.constexpr,
+    BLOCK_SIZE2: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    pos = tl.load(positions_ptr + row_id)
+
+    x1_row = x1_ptr + row_id * stride_x1
+    x2_row = x2_ptr + row_id * stride_x2
+    out1_row = out1_ptr + row_id * stride_x1
+    out2_row = out2_ptr + row_id * stride_x2
+
+    sum_sq1 = tl.load(sum_sq_ptr + row_id)
+    sum_sq2 = tl.load(sum_sq_ptr + row_id + B)
+    inv_rms1 = tl.rsqrt(sum_sq1 / D1 / tp_world + eps)
+    inv_rms2 = tl.rsqrt(sum_sq2 / D2 / tp_world + eps)
+
+    offsets1 = tl.arange(0, BLOCK_SIZE1)
+    mask1 = offsets1 < D1
+    x1 = tl.load(x1_row + offsets1, mask=mask1, other=0.0).to(tl.float32)
+    w1 = tl.load(w1_ptr + offsets1, mask=mask1, other=1.0).to(tl.float32)
+    norm1 = x1 * inv_rms1 * w1
+
+    head_dim1 = offsets1 % HEAD_SIZE
+    rot_mask1 = mask1 & (head_dim1 < ROTARY_DIM)
+    pair_dim1 = tl.where(head_dim1 < ROTARY_HALF, head_dim1, head_dim1 - ROTARY_HALF)
+    pair_offsets1 = tl.where(
+        head_dim1 < ROTARY_HALF, offsets1 + ROTARY_HALF, offsets1 - ROTARY_HALF
+    )
+    pair_x1 = tl.load(x1_row + pair_offsets1, mask=rot_mask1, other=0.0).to(
+        tl.float32
+    )
+    pair_w1 = tl.load(w1_ptr + pair_offsets1, mask=rot_mask1, other=1.0).to(
+        tl.float32
+    )
+    pair_norm1 = pair_x1 * inv_rms1 * pair_w1
+    cos1 = tl.load(
+        cos_sin_ptr + pos * ROTARY_DIM + pair_dim1, mask=rot_mask1, other=1.0
+    ).to(tl.float32)
+    sin1 = tl.load(
+        cos_sin_ptr + pos * ROTARY_DIM + ROTARY_HALF + pair_dim1,
+        mask=rot_mask1,
+        other=0.0,
+    ).to(tl.float32)
+    rot_first1 = norm1 * cos1 - pair_norm1 * sin1
+    rot_second1 = norm1 * cos1 + pair_norm1 * sin1
+    rot1 = tl.where(head_dim1 < ROTARY_HALF, rot_first1, rot_second1)
+    out1 = tl.where(head_dim1 < ROTARY_DIM, rot1, norm1)
+    tl.store(out1_row + offsets1, out1, mask=mask1)
+
+    offsets2 = tl.arange(0, BLOCK_SIZE2)
+    mask2 = offsets2 < D2
+    x2 = tl.load(x2_row + offsets2, mask=mask2, other=0.0).to(tl.float32)
+    w2 = tl.load(w2_ptr + offsets2, mask=mask2, other=1.0).to(tl.float32)
+    norm2 = x2 * inv_rms2 * w2
+
+    head_dim2 = offsets2 % HEAD_SIZE
+    rot_mask2 = mask2 & (head_dim2 < ROTARY_DIM)
+    pair_dim2 = tl.where(head_dim2 < ROTARY_HALF, head_dim2, head_dim2 - ROTARY_HALF)
+    pair_offsets2 = tl.where(
+        head_dim2 < ROTARY_HALF, offsets2 + ROTARY_HALF, offsets2 - ROTARY_HALF
+    )
+    pair_x2 = tl.load(x2_row + pair_offsets2, mask=rot_mask2, other=0.0).to(
+        tl.float32
+    )
+    pair_w2 = tl.load(w2_ptr + pair_offsets2, mask=rot_mask2, other=1.0).to(
+        tl.float32
+    )
+    pair_norm2 = pair_x2 * inv_rms2 * pair_w2
+    cos2 = tl.load(
+        cos_sin_ptr + pos * ROTARY_DIM + pair_dim2, mask=rot_mask2, other=1.0
+    ).to(tl.float32)
+    sin2 = tl.load(
+        cos_sin_ptr + pos * ROTARY_DIM + ROTARY_HALF + pair_dim2,
+        mask=rot_mask2,
+        other=0.0,
+    ).to(tl.float32)
+    rot_first2 = norm2 * cos2 - pair_norm2 * sin2
+    rot_second2 = norm2 * cos2 + pair_norm2 * sin2
+    rot2 = tl.where(head_dim2 < ROTARY_HALF, rot_first2, rot_second2)
+    out2 = tl.where(head_dim2 < ROTARY_DIM, rot2, norm2)
+    tl.store(out2_row + offsets2, out2, mask=mask2)
+
+
+@debug_kernel_api
+def rms_apply_rope_serial(
+    x1: torch.Tensor,
+    x2: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    sum_sq: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    tp_world: int = 1,
+    eps: float = 1e-5,
+    head_size: int = 128,
+    rotary_dim: int = 64,
+) -> torch.Tensor:
+    assert x1.is_cuda and x2.is_cuda and w1.is_cuda and w2.is_cuda and sum_sq.is_cuda
+    assert positions.is_cuda and cos_sin_cache.is_cuda
+    B, D1 = x1.shape
+    B2, D2 = x2.shape
+    assert B == B2
+    assert rotary_dim % 2 == 0
+
+    stride_x1 = x1.stride(0)
+    stride_x2 = x2.stride(0)
+    out1 = torch.empty(B, D1, device=x1.device, dtype=x1.dtype)
+    out2 = torch.empty(B, D2, device=x2.device, dtype=x2.dtype)
+
+    BLOCK_SIZE1 = triton.next_power_of_2(D1)
+    BLOCK_SIZE2 = triton.next_power_of_2(D2)
+
+    rmsnorm_apply_rope_kernel_serial[(B,)](
+        x1,
+        x2,
+        w1,
+        w2,
+        sum_sq,
+        positions,
+        cos_sin_cache,
+        out1,
+        out2,
+        B,
+        stride_x1,
+        stride_x2,
+        tp_world,
+        eps,
+        D1,
+        D2,
+        head_size,
+        rotary_dim,
+        rotary_dim // 2,
+        BLOCK_SIZE1,
+        BLOCK_SIZE2,
+        num_warps=8,
     )
     return out1, out2
 
@@ -455,6 +717,74 @@ class MiniMaxM2QKRMSNorm:
         )
         return q, k
 
+    @staticmethod
+    def forward_qk_rope(
+        q_norm: "MiniMaxM2RMSNormTP",
+        k_norm: "MiniMaxM2RMSNormTP",
+        q: torch.Tensor,
+        k: torch.Tensor,
+        positions: torch.Tensor,
+        rotary_emb,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        use_triton_qk_sumsq = (
+            _MINIMAX_M2_USE_TRITON_QK_SUMSQ and q.dim() == 2 and k.dim() == 2
+        )
+        sum_sq = rms_sumsq_serial(q, k)
+        if q_norm.attn_tp_size > 1 and not _MINIMAX_M2_SKIP_QK_TP_ALLREDUCE:
+            sum_sq = attn_tp_all_reduce(sum_sq)
+
+        can_fuse_apply_rope = (
+            _MINIMAX_M2_FUSE_QK_RMSNORM_APPLY_ROPE
+            and q.dim() == 2
+            and k.dim() == 2
+            and positions.dim() == 1
+            and positions.numel() == q.shape[0]
+            and q.shape[0] == k.shape[0]
+            and q.is_cuda
+            and k.is_cuda
+            and positions.is_cuda
+            and q.dtype == k.dtype
+            and q_norm.weight.dtype == k_norm.weight.dtype
+            and getattr(rotary_emb, "is_neox_style", False)
+            and rotary_emb.__class__.__name__ == "RotaryEmbedding"
+            and q.shape[1] % rotary_emb.head_size == 0
+            and k.shape[1] % rotary_emb.head_size == 0
+            and rotary_emb.rotary_dim <= rotary_emb.head_size
+            and rotary_emb.rotary_dim % 2 == 0
+        )
+        if can_fuse_apply_rope and q.shape[0] > 0:
+            if (
+                rotary_emb.cos_sin_cache.device != q.device
+                or rotary_emb.cos_sin_cache.dtype != q.dtype
+            ):
+                rotary_emb.cos_sin_cache = rotary_emb.cos_sin_cache.to(
+                    q.device, dtype=q.dtype
+                )
+            return rms_apply_rope_serial(
+                q,
+                k,
+                q_norm.weight,
+                k_norm.weight,
+                sum_sq,
+                positions,
+                rotary_emb.cos_sin_cache,
+                q_norm.attn_tp_size,
+                q_norm.variance_epsilon,
+                rotary_emb.head_size,
+                rotary_emb.rotary_dim,
+            )
+
+        q, k = rms_apply_serial(
+            q,
+            k,
+            q_norm.weight,
+            k_norm.weight,
+            sum_sq,
+            q_norm.attn_tp_size,
+            q_norm.variance_epsilon,
+        )
+        return rotary_emb(positions, q, k)
+
 
 class MiniMaxM2MoE(nn.Module):
     """MiniMax MoE implementation using DeepEP for Expert Parallel support."""
@@ -496,17 +826,22 @@ class MiniMaxM2MoE(nn.Module):
         )
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
+            layer_id=layer_id,
             renormalize=True,
             scoring_func=config.scoring_func,
             correction_bias=self.e_score_correction_bias,
             routed_scaling_factor=1.0,
         )
 
+        self.gate_logits_dtype = (
+            torch.bfloat16 if _MINIMAX_M2_USE_BF16_ROUTER_GATE else torch.float32
+        )
+
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_local_experts,
             bias=False,
-            params_dtype=torch.float32,
+            params_dtype=self.gate_logits_dtype,
             quant_config=None,
             prefix=add_prefix("gate", prefix),
         )
@@ -516,6 +851,28 @@ class MiniMaxM2MoE(nn.Module):
         if get_moe_a2a_backend().is_deepep():
             self.ep_size = get_moe_expert_parallel_world_size()
             self.top_k = config.num_experts_per_tok
+
+    def _compute_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if (
+            _MINIMAX_M2_TRITON_ROUTER_GATE_MIN_TOKENS > 0
+            and self.gate_logits_dtype == torch.float32
+            and hidden_states.dim() == 2
+            and _MINIMAX_M2_TRITON_ROUTER_GATE_MIN_TOKENS
+            <= hidden_states.shape[0]
+            <= _MINIMAX_M2_TRITON_ROUTER_GATE_MAX_TOKENS
+            and hidden_states.shape[1] == self.gate.weight.shape[1]
+            and self.gate.weight.dtype == torch.float32
+            and self.gate.weight.is_contiguous()
+        ):
+            return _minimax_m2_router_gate_triton(hidden_states, self.gate.weight)
+
+        router_logits, _ = self.gate(hidden_states.to(self.gate_logits_dtype))
+        if (
+            self.gate_logits_dtype != torch.float32
+            and not _MINIMAX_M2_KEEP_BF16_ROUTER_LOGITS
+        ):
+            router_logits = router_logits.to(torch.float32)
+        return router_logits
 
     @staticmethod
     def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
@@ -548,20 +905,38 @@ class MiniMaxM2MoE(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        if hidden_states.shape[0] > 0:
-            # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states.to(torch.float32))
-            topk_output = self.topk(hidden_states, router_logits)
-        else:
+        # Fix (ported from upstream PR #20067): in DP attention mode, idle
+        # DP ranks see hidden_states of shape [0, hidden_size]. Running the
+        # router / topk / experts on an empty tensor produces garbage that
+        # pollutes the subsequent TP all_reduce on every rank. Use the empty
+        # topk output and skip the (empty) experts call instead.
+        if hidden_states.shape[0] == 0:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
+        else:
+            with _minimax_m2_profile_ctx(f"minimax_m2.layer_{self.layer_id}.moe.gate"):
+                router_logits = self._compute_router_logits(hidden_states)
+            with _minimax_m2_profile_ctx(
+                f"minimax_m2.layer_{self.layer_id}.moe.topk"
+            ):
+                topk_output = self.topk(hidden_states, router_logits)
 
-        final_hidden_states = self.experts(hidden_states, topk_output)
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
+        with _minimax_m2_profile_ctx(
+            f"minimax_m2.layer_{self.layer_id}.moe.experts"
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            final_hidden_states = self.experts(hidden_states, topk_output)
+        # When LayerCommunicator postprocess is allowed to use reduce_scatter
+        # (allow_reduce_scatter=True and dp_padding_mode is MAX_LEN), the
+        # all_reduce that should sum expert outputs across the TP group is
+        # fused into the reduce_scatter. Doing both produces an 8x amplification
+        # and deterministic garbled output. Skip the all_reduce in that case
+        # (mirrors the pattern in qwen2_moe.py, deepseek_v2.py, etc.).
+        if self.tp_size > 1 and not use_reduce_scatter:
+            with _minimax_m2_profile_ctx(
+                f"minimax_m2.layer_{self.layer_id}.moe.tp_all_reduce"
+            ):
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -570,7 +945,7 @@ class MiniMaxM2MoE(nn.Module):
     ) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states.to(torch.float32))
+            router_logits = self._compute_router_logits(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -594,7 +969,9 @@ class MiniMaxM2MoE(nn.Module):
         if is_non_idle_and_non_empty(
             state.forward_batch.forward_mode, state.hidden_states_mlp_input
         ):  # router_logits: (num_tokens, num_experts)
-            state.router_logits, _ = self.gate(state.hidden_states_mlp_input)
+            state.router_logits = self._compute_router_logits(
+                state.hidden_states_mlp_input
+            )
         else:
             state.router_logits = None
 
@@ -700,10 +1077,24 @@ class MiniMaxM2Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-
-        # Use attention TP rank/size for dp-attention support
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        self.layer_id = layer_id
+        self.attn_tp_rank = get_attention_tp_rank()
+        self.attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = self.attn_tp_rank
+        attn_tp_size = self.attn_tp_size
+        attn_type_list = getattr(config, "attn_type_list", None)
+        self.use_lightning_attention = (
+            _MINIMAX_M2_ENABLE_LIGHTNING_ATTENTION
+            and attn_type_list is not None
+            and layer_id < len(attn_type_list)
+            and int(attn_type_list[layer_id]) == _MINIMAX_M2_LINEAR_ATTENTION_TYPE
+            and (
+                _MINIMAX_M2_LIGHTNING_MAX_LAYERS < 0
+                or layer_id < _MINIMAX_M2_LIGHTNING_MAX_LAYERS
+            )
+        )
+        if self.use_lightning_attention and not getattr(config, "linear_backend", None):
+            config.linear_backend = "minimax"
 
         # Get dimensions from config
         self.total_num_heads = config.num_attention_heads
@@ -796,7 +1187,9 @@ class MiniMaxM2Attention(nn.Module):
             self.num_heads,
             self.head_dim,
             self.scaling,
-            num_kv_heads=self.num_kv_heads,
+            num_kv_heads=(
+                self.num_heads if self.use_lightning_attention else self.num_kv_heads
+            ),
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
@@ -808,6 +1201,13 @@ class MiniMaxM2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        # Fix (ported from upstream PR #20067): in DP attention mode, idle
+        # DP ranks see hidden_states of shape [0, hidden_size]. Running QKV
+        # projection / qk_norm / rope on an empty tensor produces garbage
+        # that pollutes the TP all_reduce in o_proj on every rank. Short-
+        # circuit empty input by returning hidden_states unchanged. The
+        # subsequent forward_core will detect inner_state=None and pass
+        # hidden_states through unchanged.
         if hidden_states.shape[0] == 0:
             assert (
                 not self.o_proj.reduce_results
@@ -860,10 +1260,17 @@ class MiniMaxM2Attention(nn.Module):
 
     def forward_core(self, intermediate_state):
         hidden_states, forward_batch, inner_state = intermediate_state
+        # forward_prepare returns inner_state=None when it short-circuited
+        # an empty (idle-DP-rank) input; pass hidden_states through.
         if inner_state is None:
             return hidden_states
-        attn_output = self.attn(*inner_state)
-        output, _ = self.o_proj(attn_output)
+        attn_marker = "lightning" if self.use_lightning_attention else "fa3"
+        with _minimax_m2_profile_ctx(
+            f"minimax_m2.layer_{self.layer_id}.attn.{attn_marker}"
+        ):
+            attn_output = self.attn(*inner_state)
+        with _minimax_m2_profile_ctx(f"minimax_m2.layer_{self.layer_id}.attn.o_proj"):
+            output, _ = self.o_proj(attn_output)
         return output
 
     def forward(
@@ -979,11 +1386,20 @@ class MiniMaxM2DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        # Fully Connected (MLP or MoE)
+            # Fully Connected (MLP or MoE)
+            with _minimax_m2_profile_ctx(
+                f"minimax_m2.layer_{self.layer_id}.prepare_mlp"
+            ):
+                hidden_states, residual = self.layer_communicator.prepare_mlp(
+                    hidden_states, residual, forward_batch
+                )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+            # Tell MoE to skip its TP all_reduce when the postprocess will
+            # reduce_scatter — avoids double reduction (~8x amplification)
+            # that produces deterministic garbled output under --enable-dp-attention.
+            use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+                forward_batch
+            )
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -1044,8 +1460,13 @@ class MiniMaxM2DecoderLayer(nn.Module):
 
     def op_mlp(self, state):
         hidden_states = state.pop("hidden_states_mlp_input")
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            state.forward_batch
+        )
         state.hidden_states_mlp_output = self.block_sparse_moe(
-            hidden_states, state.forward_batch
+            hidden_states,
+            state.forward_batch,
+            use_reduce_scatter=use_reduce_scatter,
         )
 
     def op_comm_postprocess_layer(self, state):
@@ -1217,6 +1638,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
                 config.hidden_size,
                 quant_config=None,
                 prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
             )
         else:
             self.lm_head = PPMissingLayer()
@@ -1226,6 +1648,20 @@ class MiniMaxM2ForCausalLM(nn.Module):
 
         # For EAGLE3
         self.capture_aux_hidden_states = False
+
+    @property
+    def start_layer(self) -> int:
+        # Proxy to inner MiniMaxM2Model so disagg KV manager (model_runner.py
+        # line ~623: `getattr(self.model, "start_layer", 0)`) gets the
+        # per-PP-rank value instead of defaulting to 0. Without this proxy,
+        # PP rank 1 writes KV with start_layer=0 → garbled decode output
+        # under PD-disagg + PP=2. See coord/debug_methodology_numeric_garbage.md
+        # §10.2 (F18).
+        return self.model.start_layer
+
+    @property
+    def end_layer(self) -> int:
+        return self.model.end_layer
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
@@ -1238,10 +1674,10 @@ class MiniMaxM2ForCausalLM(nn.Module):
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
             self.model.layers_to_capture = [
-                2,
-                num_layers // 2,
-                num_layers - 3,
-            ]  # Specific layers for EAGLE3 support
+                1,
+                num_layers // 2 - 1,
+                num_layers - 4,
+            ]  # Eagle3 standard: early, middle, near-final layers
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
