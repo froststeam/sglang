@@ -187,13 +187,16 @@ mr:musa-server-smoke:qwen3-vl-32b-4gpu:
     - .musa-registered-suite-job
   variables:
     MUSA_RUN_SUITE: "stage-a-test-4-gpu-musa-qwen3-vl-32b-smoke"
-    MUSA_RUN_SUITE_TIMEOUT_PER_FILE: "1200"
+    MUSA_RUN_SUITE_TIMEOUT_PER_FILE: "1800"
+    MUSA_RUN_SUITE_EXTRA_PIP_PACKAGES: "lmms-eval"
     MUSA_SMOKE_COMMON_EXTRA_ARGS: "--disable-piecewise-cuda-graph --attention-backend fa3 --disable-overlap-schedule --chunked-prefill-size 2048"
     MUSA_SMOKE_QWEN3_VL_32B_MODEL: "/data/models/Qwen3-VL-32B-Instruct"
-    MUSA_SMOKE_GSM8K_DATA_PATH: "/data/eval/gsm8k/test.jsonl"
-    MUSA_SMOKE_GSM8K_NUM_EXAMPLES: "1319"
-    MUSA_SMOKE_GSM8K_NUM_THREADS: "128"
-    MUSA_SMOKE_GSM8K_MAX_TOKENS: "512"
+    MUSA_SMOKE_EVAL_NAME: "vlm"
+    MUSA_SMOKE_VLM_DATASET: "mmmu_val"
+    MUSA_SMOKE_VLM_METRIC: "mmmu_acc,none"
+    MUSA_SMOKE_VLM_LIMIT: "all"
+    MUSA_SMOKE_VLM_BATCH_SIZE: "64"
+    MUSA_SMOKE_VLM_MIN_SCORE: "0.55"
 
 mr:musa-server-smoke-summary:
   stage: mr-summary

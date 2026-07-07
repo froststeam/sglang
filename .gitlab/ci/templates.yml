@@ -134,6 +134,16 @@
     - source scripts/ci/musa/ci_setup_jit_cache.sh
     - bash scripts/ci/musa/ci_install_dependency.sh --system-deps-only
     - export PATH="${PYTHONUSERBASE}/bin:${PATH}"
+    - |
+      if [ -n "${MUSA_RUN_SUITE_EXTRA_PIP_PACKAGES:-}" ]; then
+        python3 -m pip install \
+          --user \
+          --index-url "${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" \
+          --timeout "${PIP_TIMEOUT:-30}" \
+          --retries "${PIP_RETRIES:-2}" \
+          --cache-dir "${PIP_CACHE_DIR:-/data/gitlab-ci/pip-cache}" \
+          ${MUSA_RUN_SUITE_EXTRA_PIP_PACKAGES}
+      fi
     - export MUSA_SMOKE_ARTIFACT_DIR="${CI_PROJECT_DIR:-$(pwd)}/ci_artifacts/musa-smoke/${CI_JOB_NAME_SLUG:-musa-smoke}"
     - export SGLANG_EVAL_REPORT_DIR="${MUSA_SMOKE_ARTIFACT_DIR}"
     - mkdir -p "${MUSA_SMOKE_ARTIFACT_DIR}"
