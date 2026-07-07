@@ -133,7 +133,7 @@ mr:musa-server-smoke:joyai-llm-flash-4gpu:
     MUSA_RUN_SUITE_TIMEOUT_PER_FILE: "1800"
     MUSA_SMOKE_COMMON_EXTRA_ARGS: "--disable-piecewise-cuda-graph --attention-backend fa3 --disable-overlap-schedule --chunked-prefill-size 2048"
     MUSA_SMOKE_JOYAI_LLM_FLASH_MODEL: "/data/models/JoyAI-LLM-Flash"
-    MUSA_SMOKE_JOYAI_LLM_FLASH_EXTRA_ARGS: "--ep 4 --moe-runner-backend auto --max-running-requests 64 --cuda-graph-bs 1 2 4 8 16 32 48 64 --watchdog-timeout 900"
+    MUSA_SMOKE_JOYAI_LLM_FLASH_EXTRA_ARGS: "--dp-size 2 --mem-fraction-static 0.85 --tokenizer-backend fastokens --moe-runner-backend auto --max-running-requests 64 --cuda-graph-bs 1 2 4 8 16 32 48 64 --watchdog-timeout 900"
     MUSA_SMOKE_GSM8K_DATA_PATH: "/data/eval/gsm8k/test.jsonl"
     MUSA_SMOKE_GSM8K_NUM_EXAMPLES: "1319"
     MUSA_SMOKE_GSM8K_NUM_THREADS: "64"
