@@ -1,15 +1,21 @@
+import glob
 import json
 import os
+import shutil
 import shlex
+import tempfile
 import time
 import unittest
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Optional
+from typing import Any, Optional
 
 import requests
 
+from sglang.srt.environ import temp_set_env
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.test.kits.mmmu_vlm_kit import _run_lmms_eval_with_retry
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -24,6 +30,10 @@ class MusaSmokeCase:
     name: str
     model_env: str
     tp_size: int = 1
+    default_eval_name: str = "gsm8k"
+    default_vlm_dataset: str = "mmmu_val"
+    default_vlm_metric: str = "mmmu_acc,none"
+    default_vlm_min_score: float = 0.35
     default_extra_args: str = ""
     default_gsm8k_min_score: float = 0.85
     default_gsm8k_chat_template_kwargs: Optional[str] = None
@@ -92,6 +102,13 @@ def _env_float(name: str, default: float) -> float:
 def _env_optional_int(name: str) -> Optional[int]:
     value = os.getenv(name)
     return int(value) if value is not None else None
+
+
+def _env_optional_limit(name: str) -> Optional[str]:
+    value = os.getenv(name)
+    if value is None or value.lower() in ("all", "full", "none"):
+        return None
+    return value
 
 
 def _env_optional_float(name: str) -> Optional[float]:
@@ -295,6 +312,244 @@ def _run_gsm8k_eval(
     )
 
 
+def _find_lmms_eval_result_file(output_path: str, dataset: str) -> str:
+    result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
+    if not result_files:
+        result_files = glob.glob(f"{output_path}/*.json")
+    if not result_files:
+        raise FileNotFoundError(f"No JSON result files found in {output_path}")
+
+    for result_file in result_files:
+        try:
+            with open(result_file, "r") as f:
+                result = json.load(f)
+        except Exception:
+            continue
+        if isinstance(result, dict) and dataset in result.get("results", {}):
+            return result_file
+
+    return result_files[0]
+
+
+def _safe_model_stem(model: str) -> str:
+    return model.replace("/", "_").replace(":", "_")
+
+
+def _write_vlm_metrics_artifact(model: str, metrics: dict) -> None:
+    report_dir = os.environ.get("SGLANG_EVAL_REPORT_DIR") or os.environ.get(
+        "MUSA_SMOKE_ARTIFACT_DIR", "/tmp"
+    )
+    os.makedirs(report_dir, exist_ok=True)
+    result_filename = os.path.join(report_dir, f"vlm__{_safe_model_stem(model)}.json")
+    with open(result_filename, "w") as f:
+        f.write(json.dumps(metrics, indent=2, sort_keys=True) + "\n")
+    print(f"Writing VLM results to {result_filename}")
+
+
+def _lmms_num_samples(result: dict, dataset: str) -> Optional[int]:
+    samples = result.get("n-samples", {}).get(dataset)
+    if isinstance(samples, dict):
+        value = samples.get("effective") or samples.get("original")
+        return int(value) if value is not None else None
+    return None
+
+
+def _iter_response_texts(value: Any):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, list):
+        for item in value:
+            yield from _iter_response_texts(item)
+    elif isinstance(value, dict):
+        for key in ("content", "text", "response"):
+            if key in value:
+                yield from _iter_response_texts(value[key])
+
+
+def _lmms_sample_response_texts(sample: dict) -> list[str]:
+    for key in ("filtered_resps", "resps"):
+        texts = [text for text in _iter_response_texts(sample.get(key)) if text]
+        if texts:
+            return texts
+    return []
+
+
+def _count_lmms_sample_output_tokens(output_path: str, model: str) -> Optional[int]:
+    sample_files = glob.glob(f"{output_path}/**/*_samples_*.jsonl", recursive=True)
+    if not sample_files:
+        return None
+
+    tokenizer = get_tokenizer(model, trust_remote_code=True)
+    total_tokens = 0
+    for sample_file in sample_files:
+        with open(sample_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                sample = json.loads(line)
+                for text in _lmms_sample_response_texts(sample):
+                    total_tokens += len(
+                        tokenizer.encode(text, add_special_tokens=False)
+                    )
+    return total_tokens
+
+
+def _archive_lmms_eval_outputs(
+    output_path: str,
+    model: str,
+    dataset: str,
+    result_file_path: str,
+) -> None:
+    artifact_dir = os.getenv("MUSA_SMOKE_ARTIFACT_DIR")
+    if not artifact_dir:
+        return
+
+    archive_dir = os.path.join(artifact_dir, "lmms_eval")
+    os.makedirs(archive_dir, exist_ok=True)
+
+    archive_prefix = f"{_safe_model_stem(model)}__{dataset}"
+    result_dst = os.path.join(archive_dir, f"{archive_prefix}__result.json")
+    shutil.copy2(result_file_path, result_dst)
+    print(f"Archived lmms-eval result to {result_dst}")
+
+    sample_files = glob.glob(f"{output_path}/**/*_samples_{dataset}.jsonl", recursive=True)
+    if not sample_files:
+        sample_files = glob.glob(f"{output_path}/**/*_samples_*.jsonl", recursive=True)
+
+    for sample_file in sample_files:
+        sample_dst = os.path.join(
+            archive_dir,
+            f"{archive_prefix}__{os.path.basename(sample_file)}",
+        )
+        shutil.copy2(sample_file, sample_dst)
+        print(f"Archived lmms-eval samples to {sample_dst}")
+
+
+def _run_vlm_eval(
+    base_url: str,
+    model: str,
+    case: MusaSmokeCase,
+    server_process=None,
+):
+    dataset = os.getenv("MUSA_SMOKE_VLM_DATASET", case.default_vlm_dataset)
+    metric = os.getenv("MUSA_SMOKE_VLM_METRIC", case.default_vlm_metric)
+    raw_limit = os.getenv("MUSA_SMOKE_VLM_LIMIT", "all")
+    limit = _env_optional_limit("MUSA_SMOKE_VLM_LIMIT")
+    batch_size = _env_int("MUSA_SMOKE_VLM_BATCH_SIZE", 64)
+    timeout = _env_int("MUSA_SMOKE_VLM_TIMEOUT", 3600)
+
+    model_args = (
+        f'model_version="{model}",'
+        f'tp={_env_int("MUSA_SMOKE_VLM_EVAL_TP", 1)}'
+    )
+
+    with tempfile.TemporaryDirectory(prefix="musa_smoke_vlm_") as output_path:
+        cmd = [
+            "python3",
+            "-m",
+            "lmms_eval",
+            "--model",
+            "openai_compatible",
+            "--model_args",
+            model_args,
+            "--tasks",
+            dataset,
+            "--batch_size",
+            str(batch_size),
+            "--log_samples",
+            "--log_samples_suffix",
+            "openai_compatible",
+            "--output_path",
+            output_path,
+        ]
+        if limit is not None:
+            cmd.extend(["--limit", limit])
+
+        print(
+            "MUSA smoke VLM eval config: "
+            + json.dumps(
+                {
+                    "batch_size": batch_size,
+                    "dataset": dataset,
+                    "limit": raw_limit,
+                    "metric": metric,
+                    "model": model,
+                    "model_args": model_args,
+                    "timeout": timeout,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+        _assert_server_process_alive(server_process)
+        tic = time.perf_counter()
+        try:
+            with temp_set_env(
+                OPENAI_API_KEY=os.getenv("OPENAI_API_KEY", "sk-123456"),
+                OPENAI_API_BASE=f"{base_url}/v1",
+            ):
+                _run_lmms_eval_with_retry(cmd, timeout=timeout)
+        except Exception:
+            _assert_server_process_alive(server_process)
+            raise
+        latency = time.perf_counter() - tic
+        _assert_server_process_alive(server_process)
+
+        result_file_path = _find_lmms_eval_result_file(output_path, dataset)
+        with open(result_file_path, "r") as f:
+            result = json.load(f)
+            print(f"VLM eval result: {result}")
+
+        try:
+            num_output_tokens = _count_lmms_sample_output_tokens(output_path, model)
+        except Exception as exc:
+            print(f"Failed to count VLM output tokens from lmms-eval samples: {exc}")
+            num_output_tokens = None
+        _archive_lmms_eval_outputs(output_path, model, dataset, result_file_path)
+
+    score = result["results"][dataset][metric]
+    metrics = {
+        "eval_name": "vlm",
+        "dataset": dataset,
+        "metric": metric,
+        "model": model,
+        "score": score,
+        "batch_size": batch_size,
+        "limit": raw_limit,
+        "latency": latency,
+        "num_examples_actual": _lmms_num_samples(result, dataset),
+    }
+    if num_output_tokens is not None:
+        metrics["num_output_tokens"] = num_output_tokens
+        metrics["output_throughput_source"] = "lmms_eval_sample_tokenized_response"
+        if num_output_tokens > 0 and latency > 0:
+            metrics["output_throughput"] = num_output_tokens / latency
+            print(f"VLM output throughput: {metrics['output_throughput']:.3f} token/s")
+    _write_vlm_metrics_artifact(model, metrics)
+
+    min_score = _env_float("MUSA_SMOKE_VLM_MIN_SCORE", case.default_vlm_min_score)
+    assert score >= min_score, (
+        f"{dataset} {metric} {score:.4f} is below threshold {min_score:.4f}; "
+        f"result={result}"
+    )
+
+
+def _run_model_eval(
+    base_url: str,
+    model: str,
+    case: MusaSmokeCase,
+    server_process=None,
+):
+    eval_name = os.getenv("MUSA_SMOKE_EVAL_NAME", case.default_eval_name).lower()
+    if eval_name == "gsm8k":
+        _run_gsm8k_eval(base_url, model, case, server_process=server_process)
+    elif eval_name in ("vlm", "mmmu"):
+        _run_vlm_eval(base_url, model, case, server_process=server_process)
+    else:
+        raise ValueError(f"Unsupported MUSA smoke eval: {eval_name}")
+
+
 class MusaServerSmokeTest(CustomTestCase):
     smoke_case: MusaSmokeCase
     process = None
@@ -348,8 +603,8 @@ class MusaServerSmokeTest(CustomTestCase):
         _run_generate(self.base_url)
         _assert_server_process_alive(self.process)
 
-    def test_gsm8k_eval(self):
-        _run_gsm8k_eval(
+    def test_model_eval(self):
+        _run_model_eval(
             self.base_url,
             self.model,
             self.smoke_case,

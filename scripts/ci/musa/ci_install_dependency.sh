@@ -52,6 +52,9 @@ SGLANG_CI_INSTALL_DEPS="${SGLANG_CI_INSTALL_DEPS:-1}"
 SGLANG_CI_INSTALL_SYSTEM_DEPS="${SGLANG_CI_INSTALL_SYSTEM_DEPS:-1}"
 SGLANG_CI_UPGRADE_TORCHADA="${SGLANG_CI_UPGRADE_TORCHADA:-1}"
 SGLANG_CI_TEST_PACKAGES="${SGLANG_CI_TEST_PACKAGES:-pytest tabulate}"
+SGLANG_CI_INSTALL_LMMS_EVAL="${SGLANG_CI_INSTALL_LMMS_EVAL:-1}"
+LMMS_EVAL_PACKAGE_SPEC="${LMMS_EVAL_PACKAGE_SPEC:-lmms-eval==0.5.0}"
+LMMS_EVAL_RUNTIME_DEPS="${LMMS_EVAL_RUNTIME_DEPS:-evaluate>=0.4.0 pytablewriter sacrebleu>=1.5.0 sqlitedict==2.1.0 tenacity==8.3.0 python-dotenv}"
 SGLANG_CI_EDITABLE_INSTALL="${SGLANG_CI_EDITABLE_INSTALL:-0}"
 MUSA_CI_CLEAN_PYTHONUSERBASE="${MUSA_CI_CLEAN_PYTHONUSERBASE:-1}"
 MUSA_CI_PYTHONUSERBASE_ROOT="${MUSA_CI_PYTHONUSERBASE_ROOT:-/data/gitlab-ci/python-user-base}"
@@ -184,6 +187,32 @@ install_checkout_sglang_extra() {
   (cd "${REPO_ROOT}" && "${PIP_INSTALL[@]}" "${EXTRA_INSTALL_ARGS[@]}")
 }
 
+install_lmms_eval() {
+  if [ "${SGLANG_CI_INSTALL_LMMS_EVAL}" != "1" ]; then
+    echo "Skip lmms-eval installation because SGLANG_CI_INSTALL_LMMS_EVAL is disabled."
+    return
+  fi
+
+  if python3 -c "import lmms_eval.__main__" >/dev/null 2>&1; then
+    echo "lmms-eval is already importable; skip installation."
+    return
+  fi
+
+  if [ -n "${LMMS_EVAL_RUNTIME_DEPS}" ]; then
+    echo "Install lmms-eval runtime dependencies for VLM MMMU evaluation..."
+    # Install only the runtime packages needed by the openai_compatible MMMU path.
+    # lmms-eval's package metadata also pulls development, logging, video, audio,
+    # and task-specific dependencies such as wandb, black, pre-commit, and decord;
+    # those are unnecessary in this CI case and make the dependency job sensitive
+    # to large downloads.
+    "${PIP_INSTALL[@]}" ${LMMS_EVAL_RUNTIME_DEPS} --user
+  fi
+
+  echo "Install ${LMMS_EVAL_PACKAGE_SPEC} without optional dependency fan-out..."
+  "${PIP_INSTALL[@]}" --no-deps "${LMMS_EVAL_PACKAGE_SPEC}" --user
+  python3 -c "import lmms_eval.__main__"
+}
+
 if [ ! -d "${REPO_ROOT}/python" ] || [ ! -d "${REPO_ROOT}/sgl-kernel" ]; then
   echo "Invalid SGLang checkout: ${REPO_ROOT}" >&2
   exit 2
@@ -209,6 +238,9 @@ echo "  install sglang dependencies: ${SGLANG_CI_INSTALL_DEPS}"
 echo "  install system build dependencies: ${SGLANG_CI_INSTALL_SYSTEM_DEPS}"
 echo "  upgrade torchada: ${SGLANG_CI_UPGRADE_TORCHADA}"
 echo "  ci test packages: ${SGLANG_CI_TEST_PACKAGES}"
+echo "  install lmms-eval: ${SGLANG_CI_INSTALL_LMMS_EVAL}"
+echo "  lmms-eval package spec: ${LMMS_EVAL_PACKAGE_SPEC}"
+echo "  lmms-eval runtime deps: ${LMMS_EVAL_RUNTIME_DEPS}"
 echo "  editable sglang install: ${SGLANG_CI_EDITABLE_INSTALL}"
 echo "  clean python user base: ${MUSA_CI_CLEAN_PYTHONUSERBASE}"
 echo "  python user base root: ${MUSA_CI_PYTHONUSERBASE_ROOT}"
@@ -341,6 +373,7 @@ if [ "${SGLANG_CI_INSTALL_DEPS}" != "1" ]; then
 fi
 (cd "${REPO_ROOT}" && "${PIP_INSTALL[@]}" "${SGLANG_INSTALL_ARGS[@]}")
 install_checkout_sglang_extra fastokens "fastokens>=0.1.1,<0.2.0"
+install_lmms_eval
 
 if [ -n "${SGLANG_CI_TEST_PACKAGES}" ]; then
   "${PIP_INSTALL[@]}" ${SGLANG_CI_TEST_PACKAGES} --user

@@ -11,6 +11,10 @@ class TestMusaServerSmokeQwen3VL32B4GPU(musa_server_smoke.MusaServerSmokeTest):
         name="qwen3-vl-32b-tp4",
         model_env="MUSA_SMOKE_QWEN3_VL_32B_MODEL",
         tp_size=4,
+        default_eval_name="vlm",
+        default_vlm_dataset="mmmu_val",
+        default_vlm_metric="mmmu_acc,none",
+        default_vlm_min_score=0.55,
         default_gsm8k_min_score=0.94,
         default_extra_args=(
             "--ep 4 --attention-backend fa3 --mm-attention-backend fa3 "

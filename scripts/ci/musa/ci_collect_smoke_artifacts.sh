@@ -103,7 +103,7 @@ if [[ -f "${marker_file}" ]]; then
     cp -f "${file}" "${artifact_dir}/"
   done < <(
     find /tmp -maxdepth 1 -type f \
-      \( -name 'gsm8k__*.html' -o -name 'gsm8k__*.json' \) \
+      \( -name 'gsm8k__*.html' -o -name 'gsm8k__*.json' -o -name 'vlm__*.html' -o -name 'vlm__*.json' \) \
       -newer "${marker_file}" -print0 2>/dev/null
   )
 
@@ -128,7 +128,12 @@ if [[ -f "${marker_file}" ]]; then
   )
 fi
 
-report_files=("${artifact_dir}"/gsm8k__*.html "${artifact_dir}"/gsm8k__*.json)
+report_files=(
+  "${artifact_dir}"/gsm8k__*.html
+  "${artifact_dir}"/gsm8k__*.json
+  "${artifact_dir}"/vlm__*.html
+  "${artifact_dir}"/vlm__*.json
+)
 mudmp_files=()
 if [[ -d "${artifact_dir}/mudmp" ]]; then
   while IFS= read -r -d "" file; do
@@ -143,6 +148,10 @@ fi
   echo "job_id=${CI_JOB_ID:-}"
   echo "commit_sha=${CI_COMMIT_SHA:-}"
   echo "musa_run_suite=${MUSA_RUN_SUITE:-}"
+  echo "smoke_eval=${MUSA_SMOKE_EVAL_NAME:-gsm8k}"
+  echo "smoke_vlm_dataset=${MUSA_SMOKE_VLM_DATASET:-}"
+  echo "smoke_vlm_metric=${MUSA_SMOKE_VLM_METRIC:-}"
+  echo "smoke_vlm_limit=${MUSA_SMOKE_VLM_LIMIT:-}"
   echo "smoke_model=${smoke_model}"
   echo "smoke_tp=${smoke_tp}"
   echo "smoke_ep=${smoke_ep}"
@@ -173,22 +182,26 @@ import sys
 from pathlib import Path
 
 artifact_dir = Path(sys.argv[1])
-json_files = sorted(artifact_dir.glob("gsm8k__*.json"))
+json_files = sorted(artifact_dir.glob("gsm8k__*.json")) + sorted(
+    artifact_dir.glob("vlm__*.json")
+)
 summary = artifact_dir / "summary.md"
 
 lines = ["# MUSA Smoke Artifacts", ""]
 if not json_files:
-    lines.append("No GSM8K JSON metrics were found.")
+    lines.append("No model-eval JSON metrics were found.")
 else:
     lines.append(
-        "| File | Examples | Requested | Score | Latency(s) | Throughput(tok/s) | Empty | Invalid |"
+        "| File | Eval | Dataset | Metric | Examples | Requested/Limit | Score | Latency(s) | Throughput(tok/s) | Empty | Invalid |"
     )
-    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+    lines.append(
+        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+    )
     for path in json_files:
         try:
             metrics = json.loads(path.read_text())
         except Exception as exc:
-            lines.append(f"| `{path.name}` | | | | | | | parse error: {exc} |")
+            lines.append(f"| `{path.name}` | | | | | | | | | | parse error: {exc} |")
             continue
 
         def fmt(key):
@@ -199,11 +212,20 @@ else:
             value = metrics.get(key)
             return "" if value is None else str(int(value))
 
+        eval_name = metrics.get("eval_name") or path.name.split("__", 1)[0]
+        dataset = metrics.get("dataset") or eval_name
+        metric = metrics.get("metric") or "score"
+        requested = metrics.get("num_examples_requested", metrics.get("limit", ""))
+        requested = "" if requested is None else str(requested)
+
         lines.append(
-            "| `{}` | {} | {} | {} | {} | {} | {} | {} |".format(
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
                 path.name,
+                eval_name,
+                dataset,
+                metric,
                 fmt_int("num_examples_actual"),
-                fmt_int("num_examples_requested"),
+                requested,
                 fmt("score"),
                 fmt("latency"),
                 fmt("output_throughput"),
