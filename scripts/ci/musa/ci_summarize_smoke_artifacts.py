@@ -83,6 +83,24 @@ def model_name(metrics: dict, manifest: dict, json_file: Path | None) -> str:
     return display_model_name(model)
 
 
+def parallel_name(manifest: dict) -> str:
+    value = manifest.get("smoke_parallel", "")
+    if value:
+        return value
+
+    parts = []
+    for label, key in (
+        ("TP", "smoke_tp"),
+        ("EP", "smoke_ep"),
+        ("PP", "smoke_pp"),
+        ("DP", "smoke_dp"),
+    ):
+        value = manifest.get(key, "")
+        if value and value != "-":
+            parts.append(f"{label}{value}")
+    return "/".join(parts)
+
+
 def load_manifest(job_dir: Path) -> dict:
     manifest = job_dir / "manifest.txt"
     data = {}
@@ -111,8 +129,7 @@ def main() -> None:
                 rows.append(
                     {
                         "model": display_model_name(manifest.get("smoke_model", "")),
-                        "tp": manifest.get("smoke_tp", ""),
-                        "ep": manifest.get("smoke_ep", ""),
+                        "parallel": parallel_name(manifest),
                         "suite": manifest.get("musa_run_suite", ""),
                         "file": "",
                         "metrics": manifest_metrics(manifest),
@@ -132,8 +149,7 @@ def main() -> None:
                 rows.append(
                     {
                         "model": model_name(metrics, manifest, json_file),
-                        "tp": manifest.get("smoke_tp", ""),
-                        "ep": manifest.get("smoke_ep", ""),
+                        "parallel": parallel_name(manifest),
                         "suite": manifest.get("musa_run_suite", ""),
                         "file": str(json_file),
                         "metrics": metrics,
@@ -150,19 +166,18 @@ def main() -> None:
         lines.append("No MUSA smoke artifacts were found.")
     else:
         lines.append(
-            "| Model | TP | EP | Dataset | Examples | Score | Throughput(tok/s) |"
+            "| Model | Parallel | Dataset | Examples | Score | Throughput(tok/s) |"
         )
         lines.append(
-            "| --- | ---: | ---: | --- | ---: | ---: | ---: |"
+            "| --- | --- | --- | ---: | ---: | ---: |"
         )
         for row in rows:
             metrics = row["metrics"]
             json_file = Path(row["file"]) if row.get("file") else None
             lines.append(
-                "| `{}` | {} | {} | {} | {} | {} | {} |".format(
+                "| `{}` | {} | {} | {} | {} | {} |".format(
                     row["model"],
-                    row.get("tp", ""),
-                    row.get("ep", ""),
+                    row.get("parallel", ""),
                     dataset_name(metrics, json_file),
                     fmt_int(metrics.get("num_examples_actual")),
                     fmt(metrics.get("score")),

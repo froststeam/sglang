@@ -72,6 +72,26 @@ def _build_server_args(case: MusaSmokeCase) -> list[str]:
     return args
 
 
+def _write_server_args_artifact(case: MusaSmokeCase, model: str, args: list[str]) -> None:
+    artifact_dir = os.getenv("MUSA_SMOKE_ARTIFACT_DIR")
+    if not artifact_dir:
+        return
+
+    os.makedirs(artifact_dir, exist_ok=True)
+    path = os.path.join(artifact_dir, "server_args.json")
+    with open(path, "w") as fout:
+        json.dump(
+            {
+                "case": case.name,
+                "model": model,
+                "args": args,
+            },
+            fout,
+            indent=2,
+        )
+        fout.write("\n")
+
+
 def _run_generate(base_url: str):
     response = requests.post(
         base_url + "/generate",
@@ -567,6 +587,8 @@ class MusaServerSmokeTest(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.server_log_files = _open_server_log_files(cls.smoke_case.name)
         _wait_for_musa_free_memory(cls.smoke_case)
+        server_args = _build_server_args(cls.smoke_case)
+        _write_server_args_artifact(cls.smoke_case, cls.model, server_args)
         try:
             cls.process = popen_launch_server(
                 cls.model,
@@ -576,7 +598,7 @@ class MusaServerSmokeTest(CustomTestCase):
                         "MUSA_SMOKE_SERVER_TIMEOUT", DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
                     )
                 ),
-                other_args=_build_server_args(cls.smoke_case),
+                other_args=server_args,
                 return_stdout_stderr=cls.server_log_files,
                 device="musa",
             )

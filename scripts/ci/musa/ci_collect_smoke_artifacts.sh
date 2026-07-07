@@ -29,9 +29,31 @@ for model_var in \
 done
 
 parallel_info="$(
-  python3 - <<'PY'
+  python3 - "${artifact_dir}" <<'PY'
 import os
+import json
 import shlex
+import sys
+from pathlib import Path
+
+artifact_dir = Path(sys.argv[1])
+
+
+PARALLEL_OPTIONS = [
+    ("TP", ("--tp", "--tp-size", "--tensor-parallel-size")),
+    (
+        "EP",
+        (
+            "--ep",
+            "--ep-size",
+            "--expert-parallel-size",
+            "--expert-model-parallel-size",
+            "--moe-ep-size",
+        ),
+    ),
+    ("PP", ("--pp", "--pp-size", "--pipeline-parallel-size")),
+    ("DP", ("--dp", "--dp-size", "--data-parallel-size")),
+]
 
 
 def collect_extra_args():
@@ -48,6 +70,18 @@ def collect_extra_args():
     return args
 
 
+def collect_server_args():
+    path = artifact_dir / "server_args.json"
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return []
+    args = data.get("args", [])
+    return args if isinstance(args, list) else []
+
+
 def option_value(args, names):
     for index, arg in enumerate(args):
         if arg in names and index + 1 < len(args):
@@ -59,41 +93,28 @@ def option_value(args, names):
     return ""
 
 
-def infer_tp():
-    suite = os.environ.get("MUSA_RUN_SUITE", "")
-    job = os.environ.get("CI_JOB_NAME_SLUG") or os.environ.get("CI_JOB_NAME", "")
-    text = f"{suite} {job}".lower()
-    for size in ("8", "4", "2", "1"):
-        if f"{size}gpu" in text:
-            return size
-    return ""
+def parallel_parts(args):
+    parts = []
+    for label, names in PARALLEL_OPTIONS:
+        value = option_value(args, set(names))
+        if value:
+            parts.append(f"{label}{value}")
+    return parts
 
 
-def infer_ep():
-    suite = os.environ.get("MUSA_RUN_SUITE", "").lower()
-    job = (os.environ.get("CI_JOB_NAME_SLUG") or os.environ.get("CI_JOB_NAME", "")).lower()
-    text = f"{suite} {job}"
-    if "gemma4-26b-a4b" in text or "qwen3-vl-32b" in text:
-        return "4"
-    return ""
-
-
-args = collect_extra_args()
-tp = option_value(args, {"--tp", "--tp-size", "--tensor-parallel-size"}) or infer_tp()
-ep = option_value(
-    args,
-    {
-        "--ep",
-        "--ep-size",
-        "--expert-parallel-size",
-        "--expert-model-parallel-size",
-        "--moe-ep-size",
-    },
-) or infer_ep()
-print(tp or "-", ep or "-")
+args = collect_server_args() or collect_extra_args()
+parts = parallel_parts(args)
+values = {part[:2]: part[2:] for part in parts}
+print(
+    values.get("TP", "-"),
+    values.get("EP", "-"),
+    values.get("PP", "-"),
+    values.get("DP", "-"),
+    "/".join(parts),
+)
 PY
 )"
-read -r smoke_tp smoke_ep <<<"${parallel_info}"
+read -r smoke_tp smoke_ep smoke_pp smoke_dp smoke_parallel <<<"${parallel_info}"
 
 shopt -s nullglob
 marker_file="${artifact_dir}/.start"
@@ -155,6 +176,9 @@ fi
   echo "smoke_model=${smoke_model}"
   echo "smoke_tp=${smoke_tp}"
   echo "smoke_ep=${smoke_ep}"
+  echo "smoke_pp=${smoke_pp}"
+  echo "smoke_dp=${smoke_dp}"
+  echo "smoke_parallel=${smoke_parallel}"
   echo "artifact_dir=${artifact_dir}"
   echo
   echo "files:"
