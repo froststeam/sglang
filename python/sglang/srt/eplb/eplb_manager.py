@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, List
 
 import torch.cuda
 
+from sglang.srt.distributed import get_moe_ep_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 
@@ -37,8 +38,11 @@ class EPLBManager:
         )
 
         self._main_generator = self._entrypoint()
+        self._defer_rebalance = False
+        self._disagg_transfer_busy = False
 
-    def on_forward_pass_end(self):
+    def on_forward_pass_end(self, *, disagg_transfer_pending: bool = False):
+        self._disagg_transfer_busy = disagg_transfer_pending
         next(self._main_generator)
 
     def reset_generator(self):
@@ -50,7 +54,28 @@ class EPLBManager:
             for _ in range(self._rebalance_num_iterations):
                 yield
 
+            while self._should_defer_rebalance():
+                if not self._defer_rebalance:
+                    logger.info(
+                        "[EPLBManager] defer rebalance until disaggregation transfer queues drain"
+                    )
+                    self._defer_rebalance = True
+                yield
+            self._defer_rebalance = False
             yield from self.rebalance()
+
+    def _should_defer_rebalance(self) -> bool:
+        need_defer = torch.tensor(
+            [int(self._disagg_transfer_busy)],
+            dtype=torch.int32,
+            device=self._server_args.device,
+        )
+        torch.distributed.all_reduce(
+            need_defer,
+            op=torch.distributed.ReduceOp.MAX,
+            group=get_moe_ep_group().device_group,
+        )
+        return bool(need_defer.item())
 
     def rebalance(self):
         logger.info("[EPLBManager] rebalance start")

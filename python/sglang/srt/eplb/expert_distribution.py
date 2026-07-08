@@ -28,6 +28,7 @@ import einops
 import torch
 import torch.distributed
 
+from sglang.srt.distributed import get_moe_ep_group
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.observability.metrics_collector import ExpertDispatchCollector
@@ -722,6 +723,9 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         super().__init__(*args, **kwargs)
 
         self._enable = self._server_args.enable_expert_distribution_metrics
+        self._metrics_reduce_group = get_moe_ep_group()
+        self._metrics_reduce_root = self._metrics_reduce_group.ranks[0]
+        self._is_metrics_reduce_root = self._metrics_reduce_group.rank_in_group == 0
 
         if self._enable:
             self.window_sizes = [10, 100, 1000]
@@ -947,7 +951,9 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             torch.get_device_module().empty_cache()
 
         torch.distributed.all_reduce(
-            logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
+            logical_count_of_buffered_step,
+            op=torch.distributed.ReduceOp.SUM,
+            group=self._metrics_reduce_group.device_group,
         )
 
         output = dict(
@@ -970,7 +976,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         ):
             return None
 
-        if self._rank == 0:
+        if self._is_metrics_reduce_root:
             utilization_mean_rates = self._history.mean()
             window_index = self.window_sizes[-1]
             average_utilization_rate_over_window = (
@@ -982,11 +988,17 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             avg_rate_tensor = torch.tensor(
                 [average_utilization_rate_over_window],
                 dtype=torch.float32,
-                device="cuda",
+                device=self._server_args.device,
             )
         else:
-            avg_rate_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
-        torch.distributed.broadcast(avg_rate_tensor, src=0)
+            avg_rate_tensor = torch.empty(
+                1, dtype=torch.float32, device=self._server_args.device
+            )
+        torch.distributed.broadcast(
+            avg_rate_tensor,
+            src=self._metrics_reduce_root,
+            group=self._metrics_reduce_group.device_group,
+        )
         return avg_rate_tensor.item()
 
 
