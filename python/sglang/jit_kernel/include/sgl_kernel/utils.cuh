@@ -22,25 +22,43 @@
 
 #include <cstddef>
 #include <type_traits>
-#ifndef USE_ROCM
+#if defined(USE_ROCM)
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
+#elif defined(USE_MUSA) || defined(__MUSACC__)
 #include <musa_bf16.h>
 #include <musa_fp16.h>
 #include <musa_fp8.h>
 #include <musa_runtime.h>
+#else
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#include <cuda_runtime.h>
+#endif
+
 #ifndef __grid_constant__
 #define __grid_constant__
 #endif
+
+#if defined(USE_MUSA) || defined(__MUSACC__)
 using cudaStream_t = musaStream_t;
+using cudaLaunchConfig_t = musaLaunchConfig_t;
+using cudaLaunchAttribute = musaLaunchAttribute;
 #define cudaMemcpy musaMemcpy
 #define cudaMemcpyAsync musaMemcpyAsync
 #define cudaMemcpyHostToDevice musaMemcpyHostToDevice
-#else
-#include <hip/hip_bf16.h>
-#include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
-#ifndef __grid_constant__
-#define __grid_constant__
-#endif
+#define cudaMemcpyDeviceToHost musaMemcpyDeviceToHost
+#define cudaMalloc musaMalloc
+#define cudaFree musaFree
+#define cudaMemset musaMemset
+#define cudaIpcMemHandle_t musaIpcMemHandle_t
+#define cudaIpcGetMemHandle musaIpcGetMemHandle
+#define cudaIpcOpenMemHandle musaIpcOpenMemHandle
+#define cudaIpcCloseMemHandle musaIpcCloseMemHandle
+#define cudaIpcMemLazyEnablePeerAccess musaIpcMemLazyEnablePeerAccess
+#elif defined(USE_ROCM)
 using cudaError_t = hipError_t;
 using cudaStream_t = hipStream_t;
 using cudaLaunchConfig_t = hipLaunchConfig_t;
@@ -50,9 +68,33 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #define cudaGetErrorString hipGetErrorString
 #define cudaGetLastError hipGetLastError
 #define cudaLaunchKernel hipLaunchKernel
+#define cudaMemcpy hipMemcpy
+#define cudaMemcpyAsync hipMemcpyAsync
+#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+#define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
+#define cudaMalloc hipMalloc
+#define cudaFree hipFree
+#define cudaMemset hipMemset
+#define cudaIpcMemHandle_t hipIpcMemHandle_t
+#define cudaIpcGetMemHandle hipIpcGetMemHandle
+#define cudaIpcOpenMemHandle hipIpcOpenMemHandle
+#define cudaIpcCloseMemHandle hipIpcCloseMemHandle
+#define cudaIpcMemLazyEnablePeerAccess hipIpcMemLazyEnablePeerAccess
 #endif
 
-#ifndef USE_ROCM
+#if defined(USE_ROCM)
+using fp32_t = float;
+using fp16_t = __half;
+using bf16_t = __hip_bfloat16;
+using fp8_e4m3_t = uint8_t;
+using fp8_e5m2_t = uint8_t;
+using fp32x2_t = float2;
+using fp16x2_t = half2;
+using bf16x2_t = __hip_bfloat162;
+using fp8x2_e4m3_t = uint16_t;
+using fp8x2_e5m2_t = uint16_t;
+using fp32x4_t = float4;
+#elif defined(USE_MUSA) || defined(__MUSACC__)
 using fp32_t = float;
 using fp16_t = __half;
 using bf16_t = __mt_bfloat16;
@@ -69,14 +111,14 @@ using fp32x4_t = float4;
 #else
 using fp32_t = float;
 using fp16_t = __half;
-using bf16_t = __hip_bfloat16;
-using fp8_e4m3_t = uint8_t;
-using fp8_e5m2_t = uint8_t;
+using bf16_t = __nv_bfloat16;
+using fp8_e4m3_t = __nv_fp8_e4m3;
+using fp8_e5m2_t = __nv_fp8_e5m2;
 using fp32x2_t = float2;
-using fp16x2_t = half2;
-using bf16x2_t = __hip_bfloat162;
-using fp8x2_e4m3_t = uint16_t;
-using fp8x2_e5m2_t = uint16_t;
+using fp16x2_t = __half2;
+using bf16x2_t = __nv_bfloat162;
+using fp8x2_e4m3_t = __nv_fp8x2_e4m3;
+using fp8x2_e5m2_t = __nv_fp8x2_e5m2;
 using fp32x4_t = float4;
 #endif
 
@@ -203,16 +245,29 @@ namespace host {
 /**
  * \brief Check the CUDA error code and panic with location info on failure.
  */
+#if defined(USE_MUSA) || defined(__MUSACC__)
 inline void RuntimeDeviceCheck(::musaError_t error, DebugInfo location = {}) {
   if (error != ::musaSuccess) {
     [[unlikely]];
     ::host::panic(location, "CUDA error: ", ::musaGetErrorString(error));
   }
 }
+#else
+inline void RuntimeDeviceCheck(::cudaError_t error, DebugInfo location = {}) {
+  if (error != ::cudaSuccess) {
+    [[unlikely]];
+    ::host::panic(location, "CUDA error: ", ::cudaGetErrorString(error));
+  }
+}
+#endif
 
 /// \brief Check the last CUDA error (calls `cudaGetLastError`).
 inline void RuntimeDeviceCheck(DebugInfo location = {}) {
+#if defined(USE_MUSA) || defined(__MUSACC__)
   return RuntimeDeviceCheck(::musaGetLastError(), location);
+#else
+  return RuntimeDeviceCheck(::cudaGetLastError(), location);
+#endif
 }
 
 /**
@@ -243,7 +298,7 @@ struct LaunchKernel {
   explicit LaunchKernel(
       dim3 grid_dim,
       dim3 block_dim,
-      musaStream_t stream,
+      cudaStream_t stream,
       std::size_t dynamic_shared_mem_bytes = 0,
       DebugInfo location = {}) noexcept
       : m_config(s_make_config(grid_dim, block_dim, stream, dynamic_shared_mem_bytes)), m_location(location) {}
@@ -251,18 +306,25 @@ struct LaunchKernel {
   LaunchKernel(const LaunchKernel&) = delete;
   LaunchKernel& operator=(const LaunchKernel&) = delete;
 
-  static auto resolve_device(DLDevice device) -> musaStream_t {
-    return static_cast<musaStream_t>(::TVMFFIEnvGetStream(device.device_type, device.device_id));
+  static auto resolve_device(DLDevice device) -> cudaStream_t {
+    return static_cast<cudaStream_t>(::TVMFFIEnvGetStream(device.device_type, device.device_id));
   }
 
   auto enable_pdl(bool enabled = true) -> LaunchKernel& {
 #ifdef USE_ROCM
     (void)enabled;
     m_config.numAttrs = 0;
-#else
+#elif defined(USE_MUSA) || defined(__MUSACC__)
     if (enabled) {
       auto& attr = m_attrs[m_config.numAttrs++];
       attr.id = musaLaunchAttributeIgnore;
+      attr.val.programmaticStreamSerializationAllowed = true;
+      m_config.attrs = m_attrs;
+    }
+#else
+    if (enabled) {
+      auto& attr = m_attrs[m_config.numAttrs++];
+      attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
       attr.val.programmaticStreamSerializationAllowed = true;
       m_config.attrs = m_attrs;
     }
@@ -273,9 +335,14 @@ struct LaunchKernel {
   auto enable_cluster(dim3 cluster_dim) -> LaunchKernel& {
 #ifdef USE_ROCM
     (void)cluster_dim;
-#else
+#elif defined(USE_MUSA) || defined(__MUSACC__)
     auto& attr = m_attrs[m_config.numAttrs++];
     attr.id = musaLaunchAttributeClusterDimension;
+    attr.val.clusterDim = {cluster_dim.x, cluster_dim.y, cluster_dim.z};
+    m_config.attrs = m_attrs;
+#else
+    auto& attr = m_attrs[m_config.numAttrs++];
+    attr.id = cudaLaunchAttributeClusterDimension;
     attr.val.clusterDim = {cluster_dim.x, cluster_dim.y, cluster_dim.z};
     m_config.attrs = m_attrs;
 #endif
@@ -293,8 +360,10 @@ struct LaunchKernel {
         m_config.stream,
         std::forward<Args>(args)...);
     RuntimeDeviceCheck(m_location);
-#else
+#elif defined(USE_MUSA) || defined(__MUSACC__)
     RuntimeDeviceCheck(::musaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
+#else
+    RuntimeDeviceCheck(::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
 #endif
   }
 
@@ -302,9 +371,9 @@ struct LaunchKernel {
   static auto s_make_config(  // Make a config for kernel launch
       dim3 grid_dim,
       dim3 block_dim,
-      musaStream_t stream,
-      std::size_t smem) -> musaLaunchConfig_t {
-    auto config = ::musaLaunchConfig_t{};
+      cudaStream_t stream,
+      std::size_t smem) -> cudaLaunchConfig_t {
+    auto config = ::cudaLaunchConfig_t{};
     config.gridDim = grid_dim;
     config.blockDim = block_dim;
     config.dynamicSmemBytes = smem;
@@ -313,9 +382,9 @@ struct LaunchKernel {
     return config;
   }
 
-  musaLaunchConfig_t m_config;
+  cudaLaunchConfig_t m_config;
   const DebugInfo m_location;
-  musaLaunchAttribute m_attrs[2];
+  cudaLaunchAttribute m_attrs[2];
 };
 
 }  // namespace host

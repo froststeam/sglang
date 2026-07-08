@@ -5,7 +5,9 @@
 #include <sgl_kernel/utils.cuh>
 
 #include <cstdint>
+#if defined(USE_MUSA) || defined(__MUSACC__)
 #include <musa_fp8.h>
+#endif
 
 // Small helpers shared by the DeepSeek-V4 FP8/UE8M0 quantization kernels
 // (silu_and_mul_masked_post_quant, store, mega_moe_pre_dispatch, ...).
