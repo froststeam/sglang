@@ -10,7 +10,9 @@
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 
 #include <cstdint>
+#if defined(USE_MUSA) || defined(__MUSACC__)
 #include <musa_fp8.h>
+#endif
 
 namespace {
 

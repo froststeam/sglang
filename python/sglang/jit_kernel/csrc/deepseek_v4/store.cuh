@@ -13,7 +13,9 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
+#if defined(USE_MUSA) || defined(__MUSACC__)
 #include <musa_fp8.h>
+#endif
 
 namespace {
 

@@ -17,7 +17,9 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#if defined(USE_MUSA) || defined(__MUSACC__)
 #include <musa_bf16.h>
+#endif
 
 #if defined(__CUDACC__) || defined(__MUSACC__)
 #include <sgl_kernel/utils.cuh>
@@ -55,10 +57,12 @@ struct _dtype_trait<T, typename std::enable_if<std::is_floating_point<T>::value>
       static_cast<std::uint8_t>(sizeof(T) * 8),
       1};
 };
+#if defined(USE_MUSA) || defined(__MUSACC__)
 template <>
 struct _dtype_trait<__mt_bfloat16, void> {
   static constexpr DLDataType value = DLDataType{DLDataTypeCode::kDLBfloat, 16, 1};
 };
+#endif
 
 #if defined(__CUDACC__) || defined(__MUSACC__)
 template <>
@@ -66,14 +70,9 @@ struct _dtype_trait<fp16_t, void> {
   static constexpr DLDataType value = DLDataType{DLDataTypeCode::kDLFloat, 16, 1};
 };
 
-#if !defined(__MUSACC__)
+#if !defined(__MUSACC__) && !defined(USE_MUSA)
 template <>
 struct _dtype_trait<bf16_t, void> {
-  static constexpr DLDataType value = DLDataType{DLDataTypeCode::kDLBfloat, 16, 1};
-};
-
-template <>
-struct _dtype_trait<__mt_bfloat16, void> {
   static constexpr DLDataType value = DLDataType{DLDataTypeCode::kDLBfloat, 16, 1};
 };
 
