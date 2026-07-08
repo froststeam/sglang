@@ -643,6 +643,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.server_args.enable_eplb and (not self.is_draft_worker)
             else None
         )
+        self.eplb_disagg_transfer_busy = False
         self.expert_location_updater = ExpertLocationUpdater()
 
         (
@@ -2481,21 +2482,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         Covers framework-level warmups and optional model-specific warmups.
         """
         if self.device == "musa":
-            from sglang.srt.hardware_backend.musa.layers.linear_auto_tune import (
-                maybe_autotune_musa_linear_gemv,
-            )
-            from sglang.srt.hardware_backend.musa.layers.moe_auto_tune import (
-                maybe_autotune_musa_moe_deepgemm_threshold,
-            )
+            try:
+                from sglang.srt.hardware_backend.musa.layers.linear_auto_tune import (
+                    maybe_autotune_musa_linear_gemv,
+                )
 
-            maybe_autotune_musa_linear_gemv(
-                self.model,
-                rank=self.tp_rank,
-            )
-            maybe_autotune_musa_moe_deepgemm_threshold(
-                self.model,
-                rank=self.tp_rank,
-            )
+                maybe_autotune_musa_linear_gemv(
+                    self.model,
+                    rank=self.tp_rank,
+                )
+            except ImportError:
+                logger.info("Skip MUSA linear GEMV autotune: module unavailable.")
+
+            try:
+                from sglang.srt.hardware_backend.musa.layers.moe_auto_tune import (
+                    maybe_autotune_musa_moe_deepgemm_threshold,
+                )
+
+                maybe_autotune_musa_moe_deepgemm_threshold(
+                    self.model,
+                    rank=self.tp_rank,
+                )
+            except ImportError:
+                logger.info("Skip MUSA MoE DeepGEMM autotune: module unavailable.")
 
         if self.device != "cuda":
             return
@@ -3397,7 +3406,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         if self.eplb_manager is not None:
-            self.eplb_manager.on_forward_pass_end()
+            disagg_transfer_pending = self.eplb_disagg_transfer_busy or (
+                self.server_args.disaggregation_mode == "prefill"
+                and forward_batch.forward_mode.is_extend()
+            )
+            self.eplb_manager.on_forward_pass_end(
+                disagg_transfer_pending=disagg_transfer_pending
+            )
 
         if dumper.may_enable:
             dumper.step()

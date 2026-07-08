@@ -684,8 +684,13 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def get_moe_weights(self):
+        # EPLB only rebalances physical routed experts. Fused shared expert
+        # slots live after each rank's routed slots and must stay stable.
+        num_local_experts_for_eplb = (
+            self.experts.num_local_experts - self.num_fused_shared_experts
+        )
         return [
-            x.data
+            x.data[:num_local_experts_for_eplb]
             for name, x in self.experts.named_parameters()
             if name not in ["correction_bias"]
             and filter_moe_weight_param_global_expert(
@@ -2402,13 +2407,11 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
 
-        self._routed_experts_weights_of_layer = LazyValue(
-            lambda: {
-                layer_id: layer.mlp.get_moe_weights()
-                for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, DeepseekV2MoE)
-            }
-        )
+        self.routed_experts_weights_of_layer = {
+            layer_id: mlp.get_moe_weights()
+            for layer_id, layer in enumerate(self.model.layers)
+            if isinstance((mlp := getattr(layer, "mlp", None)), DeepseekV2MoE)
+        }
         self.capture_aux_hidden_states = False
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
@@ -2420,10 +2423,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         q_lora_rank = config.q_lora_rank if hasattr(config, "q_lora_rank") else None
         get_attn_tp_context().init_context(q_lora_rank, is_deepseek_nsa(config))
-
-    @property
-    def routed_experts_weights_of_layer(self):
-        return self._routed_experts_weights_of_layer.value
 
     def determine_num_fused_shared_experts(
         self, architecture: str = "DeepseekV3ForCausalLM"
