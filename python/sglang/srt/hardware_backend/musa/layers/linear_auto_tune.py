@@ -171,11 +171,43 @@ def _find_linear_targets(model: torch.nn.Module) -> list[_LinearTarget]:
     return targets
 
 
-def maybe_autotune_musa_linear_gemv(model: torch.nn.Module, *, rank: int = 0) -> None:
+def maybe_autotune_musa_linear_gemv(
+    model: torch.nn.Module, *, rank: int = 0, reuse_only: bool = False
+) -> None:
     if not is_musa() or _AUTOTUNE_MAX_TOKENS <= 0:
         return
     targets = _find_linear_targets(model)
     if not targets:
+        return
+
+    if reuse_only:
+        missing_count = sum(
+            _policy_key(
+                target.quant_kind,
+                target.input_dtype,
+                target.weight_dtype,
+                tokens,
+                target.n,
+                target.k,
+            )
+            not in _LINEAR_POLICY
+            for target in targets
+            for tokens in range(1, _AUTOTUNE_MAX_TOKENS + 1)
+        )
+        if rank == 0:
+            if missing_count:
+                logger.info(
+                    "MUSA linear autotune skipped: reusing existing policy for %d targets; "
+                    "%d token points are uncovered and will use the default GEMM path.",
+                    len(targets),
+                    missing_count,
+                )
+            else:
+                logger.info(
+                    "MUSA linear autotune skipped: existing policy covers %d targets and %d token points.",
+                    len(targets),
+                    len(targets) * _AUTOTUNE_MAX_TOKENS,
+                )
         return
 
     new_policy: dict[tuple[str, torch.dtype, torch.dtype, int, int, int], str] = {}
@@ -268,20 +300,16 @@ def _measure_target(target: _LinearTarget, tokens: int, backend: str) -> float:
     for _ in range(_AUTOTUNE_WARMUP):
         run()
     _synchronize(target.device)
-    samples = [
-        _measure_run_once_profiler_device_us(
-            target,
-            run,
-            backend=backend,
-            tokens=tokens,
-        )
-        for _ in range(_AUTOTUNE_ITERS)
-    ]
-    samples.sort()
-    median_us = samples[len(samples) // 2]
-    if median_us <= 0:
+    avg_us = _measure_run_profiler_device_us(
+        target,
+        run,
+        backend=backend,
+        tokens=tokens,
+        iters=_AUTOTUNE_ITERS,
+    )
+    if avg_us <= 0:
         raise RuntimeError("MUSA linear autotune profiler returned no GPU kernel time.")
-    return median_us
+    return avg_us
 
 
 def _make_runner(
@@ -331,13 +359,15 @@ def _get_supported_linear_quant_kind(layer: torch.nn.Module) -> Optional[str]:
     return None
 
 
-def _measure_run_once_profiler_device_us(
+def _measure_run_profiler_device_us(
     target: _LinearTarget,
     run: Callable[[], torch.Tensor],
     *,
     backend: str,
     tokens: int,
+    iters: int,
 ) -> float:
+    iters = max(1, iters)
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CUDA],
         record_shapes=False,
@@ -346,7 +376,8 @@ def _measure_run_once_profiler_device_us(
         with_flops=False,
         with_modules=False,
     ) as prof:
-        run()
+        for _ in range(iters):
+            run()
         _synchronize(target.device)
 
     rows = []
@@ -356,6 +387,7 @@ def _measure_run_once_profiler_device_us(
             rows.append((device_us, event.key))
 
     total_us = sum(device_us for device_us, _ in rows)
+    avg_us = total_us / iters
     if _AUTOTUNE_PROFILER_TOPK > 0:
         rows.sort(reverse=True)
         top_rows = ", ".join(
@@ -363,16 +395,19 @@ def _measure_run_once_profiler_device_us(
             for device_us, name in rows[:_AUTOTUNE_PROFILER_TOPK]
         )
         logger.info(
-            "MUSA linear autotune profiler: quant=%s tokens=%s n=%s k=%s backend=%s gpu_kernel_sum=%.1fus%s",
+            "MUSA linear autotune profiler: quant=%s tokens=%s n=%s k=%s backend=%s "
+            "iters=%s gpu_kernel_sum=%.1fus avg=%.1fus%s",
             target.quant_kind,
             tokens,
             target.n,
             target.k,
             backend,
+            iters,
             total_us,
+            avg_us,
             f" top=[{top_rows}]" if top_rows else "",
         )
-    return total_us
+    return avg_us
 
 
 def _profiler_self_device_time_us(event: Any) -> float:

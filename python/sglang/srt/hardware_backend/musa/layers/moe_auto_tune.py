@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import os
-import statistics
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -86,6 +85,7 @@ def maybe_autotune_musa_moe_deepgemm_threshold(
     model: torch.nn.Module,
     *,
     rank: int = 0,
+    reuse_only: bool = False,
 ) -> None:
     if not is_musa() or not get_moe_runner_backend().is_mixed():
         return
@@ -95,6 +95,22 @@ def maybe_autotune_musa_moe_deepgemm_threshold(
         logger.info(
             "Skip MUSA MoE DeepGEMM threshold autotune: no mixed MoE layer found."
         )
+        return
+
+    if reuse_only:
+        policy = get_musa_moe_bucket_policy()
+        if rank == 0:
+            if policy is None:
+                logger.info(
+                    "MUSA MoE bucket autotune skipped: no existing policy to reuse; "
+                    "using Triton fallback."
+                )
+            else:
+                logger.info(
+                    "MUSA MoE bucket autotune skipped: reusing existing policy with "
+                    "%d buckets.",
+                    len(policy),
+                )
         return
 
     policy: tuple[MusaMoeBucket, ...] | None = None
@@ -644,19 +660,22 @@ def _measure_one(
                 _run_once(target, _make_dispatch_output(target, num_tokens))
             _synchronize(target.device)
 
-            samples = []
-            for _ in range(iters):
-                dispatch_output = _make_dispatch_output(target, num_tokens)
-                _synchronize(target.device)
-                samples.append(
-                    _measure_run_once_device_us(
-                        target,
-                        dispatch_output,
-                        backend=backend,
-                        num_tokens=num_tokens,
-                    )
+            dispatch_outputs = [
+                _make_dispatch_output(target, num_tokens) for _ in range(iters)
+            ]
+            _synchronize(target.device)
+            avg_us = _measure_run_profiler_device_us(
+                target,
+                dispatch_outputs,
+                backend=backend,
+                num_tokens=num_tokens,
+                iters=iters,
+            )
+            if avg_us <= 0:
+                raise RuntimeError(
+                    "MUSA MoE bucket autotune profiler returned no GPU kernel time."
                 )
-            return statistics.median(samples)
+            return avg_us
     finally:
         set_musa_moe_bucket_policy(old_policy)
 
@@ -673,33 +692,15 @@ def _temporary_musa_gemv_max_tokens(max_tokens: int):
         triton_runner._MUSA_MOE_GEMV_SWIGLU_MAX_TOKENS = old_value
 
 
-def _measure_run_once_device_us(
+def _measure_run_profiler_device_us(
     target: _MusaMoeAutotuneTarget,
-    dispatch_output: StandardDispatchOutput,
+    dispatch_outputs: list[StandardDispatchOutput],
     *,
     backend: str,
     num_tokens: int,
+    iters: int,
 ) -> float:
-    profiler_us = _measure_run_once_profiler_device_us(
-        target,
-        dispatch_output,
-        backend=backend,
-        num_tokens=num_tokens,
-    )
-    if profiler_us <= 0:
-        raise RuntimeError(
-            "MUSA MoE bucket autotune profiler returned no GPU kernel time."
-        )
-    return profiler_us
-
-
-def _measure_run_once_profiler_device_us(
-    target: _MusaMoeAutotuneTarget,
-    dispatch_output: StandardDispatchOutput,
-    *,
-    backend: str,
-    num_tokens: int,
-) -> float:
+    iters = max(1, iters)
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CUDA],
         record_shapes=False,
@@ -708,7 +709,8 @@ def _measure_run_once_profiler_device_us(
         with_flops=False,
         with_modules=False,
     ) as prof:
-        _run_once(target, dispatch_output)
+        for dispatch_output in dispatch_outputs:
+            _run_once(target, dispatch_output)
         _synchronize(target.device)
 
     rows = []
@@ -718,6 +720,7 @@ def _measure_run_once_profiler_device_us(
             rows.append((device_us, event.key))
 
     total_us = sum(device_us for device_us, _ in rows)
+    avg_us = total_us / max(1, iters)
     if _AUTOTUNE_PROFILER_TOPK > 0:
         rows.sort(reverse=True)
         top_rows = ", ".join(
@@ -725,13 +728,16 @@ def _measure_run_once_profiler_device_us(
             for device_us, name in rows[:_AUTOTUNE_PROFILER_TOPK]
         )
         logger.info(
-            "MUSA MoE bucket autotune profiler: tokens=%s backend=%s gpu_kernel_sum=%.1fus%s",
+            "MUSA MoE bucket autotune profiler: tokens=%s backend=%s "
+            "iters=%s gpu_kernel_sum=%.1fus avg=%.1fus%s",
             num_tokens,
             backend,
+            iters,
             total_us,
+            avg_us,
             f" top=[{top_rows}]" if top_rows else "",
         )
-    return total_us
+    return avg_us
 
 
 def _profiler_self_device_time_us(event: Any) -> float:
