@@ -2482,29 +2482,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         Covers framework-level warmups and optional model-specific warmups.
         """
         if self.device == "musa":
-            try:
-                from sglang.srt.hardware_backend.musa.layers.linear_auto_tune import (
-                    maybe_autotune_musa_linear_gemv,
-                )
+            from sglang.srt.hardware_backend.musa.layers.linear_auto_tune import (
+                maybe_autotune_musa_linear_gemv,
+            )
+            from sglang.srt.hardware_backend.musa.layers.moe_auto_tune import (
+                maybe_autotune_musa_moe_deepgemm_threshold,
+            )
 
-                maybe_autotune_musa_linear_gemv(
-                    self.model,
-                    rank=self.tp_rank,
-                )
-            except ImportError:
-                logger.info("Skip MUSA linear GEMV autotune: module unavailable.")
-
-            try:
-                from sglang.srt.hardware_backend.musa.layers.moe_auto_tune import (
-                    maybe_autotune_musa_moe_deepgemm_threshold,
-                )
-
-                maybe_autotune_musa_moe_deepgemm_threshold(
-                    self.model,
-                    rank=self.tp_rank,
-                )
-            except ImportError:
-                logger.info("Skip MUSA MoE DeepGEMM autotune: module unavailable.")
+            maybe_autotune_musa_linear_gemv(
+                self.model,
+                rank=self.tp_rank,
+                reuse_only=self.is_draft_worker,
+            )
+            maybe_autotune_musa_moe_deepgemm_threshold(
+                self.model,
+                rank=self.tp_rank,
+                reuse_only=self.is_draft_worker,
+            )
 
         if self.device != "cuda":
             return

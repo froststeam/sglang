@@ -254,6 +254,43 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 )
             return True
 
+        def load_fused_shared_expert_weight(
+            name: str,
+            params_dict: dict,
+            loaded_weight: torch.Tensor,
+        ) -> bool:
+            if (
+                "shared_expert." not in name
+                or "shared_expert_gate" in name
+                or num_experts is None
+            ):
+                return False
+
+            shared_expert_params_mapping = [
+                ("experts.w13_", "shared_expert.gate_proj.", "w1"),
+                ("experts.w2_", "shared_expert.down_proj.", "w2"),
+                ("experts.w13_", "shared_expert.up_proj.", "w3"),
+            ]
+            for param_name, weight_name, shard_id in shared_expert_params_mapping:
+                if weight_name not in name:
+                    continue
+
+                name_mapped = name.replace(weight_name, param_name)
+                if name_mapped not in params_dict:
+                    return False
+
+                param = params_dict[name_mapped]
+                weight_loader = param.weight_loader
+                weight_loader(
+                    param,
+                    loaded_weight,
+                    name_mapped,
+                    shard_id=shard_id,
+                    expert_id=num_experts,
+                )
+                return True
+            return False
+
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
@@ -370,6 +407,12 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 else:
                     # Skip expert weight if not handled by current rank
                     if is_expert_weight:
+                        continue
+
+                    if load_fused_shared_expert_weight(
+                        name, params_dict, loaded_weight
+                    ):
+                        loaded_params.add(name)
                         continue
 
                     # 3) Regular non-stacked / non-expert parameters, use default loader
