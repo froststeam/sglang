@@ -10,8 +10,6 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.distributed
-from tqdm import tqdm
-
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.parallel_state import P2PWork
@@ -33,6 +31,7 @@ from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
 from sglang.srt.utils.common import get_device_module, is_musa, is_xpu
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +113,8 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                if self.cur_batch and self.launch_event is not None:
+                    self.device_module.current_stream().wait_event(self.launch_event)
                 if self.server_args.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -131,9 +132,6 @@ class SchedulerPPMixin:
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
                     if self.cur_batch:
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
                         with torch.profiler.record_function(
                             "send_proxy_dict_to_next_stage"
                         ):
