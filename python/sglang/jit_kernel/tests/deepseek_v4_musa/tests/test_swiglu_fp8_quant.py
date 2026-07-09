@@ -4,7 +4,6 @@ import types
 
 import pytest
 import torch
-import triton
 
 from sglang.jit_kernel.deepseek_v4 import silu_and_mul_masked_post_quant
 from sglang.test.ci.ci_register import register_musa_ci
@@ -30,20 +29,14 @@ silu_and_mul_contig_post_quant_musa = MUSA_OPS.silu_and_mul_contig_post_quant_mu
 silu_and_mul_masked_post_quant_musa = MUSA_OPS.silu_and_mul_masked_post_quant_musa
 
 
-def test_prefill_musa_fp8_quant_helper_batches_groups_per_cta(monkeypatch) -> None:
+def test_prefill_musa_fp8_quant_helper_uses_musa_csrc_v2(monkeypatch) -> None:
     calls = []
 
-    class FakeKernel:
-        def __getitem__(self, grid):
-            def launch(*args, **kwargs):
-                calls.append((grid, args, kwargs))
-
-            return launch
+    def fake_quant(*args, **kwargs):
+        calls.append((args, kwargs))
 
     monkeypatch.setattr(fp8_kernel, "_is_musa", True)
-    monkeypatch.setattr(
-        fp8_kernel, "_per_token_group_quant_8bit_multi_group", FakeKernel()
-    )
+    monkeypatch.setattr(fp8_kernel, "sgl_per_token_group_quant_8bit", fake_quant)
 
     x = torch.empty((512, 4096), dtype=torch.bfloat16)
     x_q = torch.empty_like(x, dtype=torch.float8_e4m3fn)
@@ -62,13 +55,11 @@ def test_prefill_musa_fp8_quant_helper_batches_groups_per_cta(monkeypatch) -> No
         scale_ue8m0=False,
     )
 
-    total_groups = x.numel() // 128
-    groups_per_cta, num_warps = fp8_kernel._musa_prefill_fp8_quant_launch_config(
-        x.shape[0], x.shape[-1]
-    )
-    assert calls[0][0] == (triton.cdiv(total_groups, groups_per_cta),)
-    assert calls[0][2]["GROUPS_PER_CTA"] == groups_per_cta
-    assert calls[0][2]["num_warps"] == num_warps
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[:7] == (x, x_q, x_s, 128, 1e-10, -448.0, 448.0)
+    assert args[7:10] == (False, False, None)
+    assert kwargs == {"enable_v2": True}
 
 
 def test_prefill_musa_fp8_quant_helper_keeps_decode_on_fallback(monkeypatch) -> None:

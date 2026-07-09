@@ -425,23 +425,18 @@ def _try_musa_prefill_per_token_group_quant_8bit(
     if total_groups < _MUSA_PREFILL_FP8_QUANT_MIN_GROUPS:
         return False
 
-    groups_per_cta, num_warps = _musa_prefill_fp8_quant_launch_config(
-        x.shape[0], x.shape[-1]
-    )
-    _per_token_group_quant_8bit_multi_group[
-        (triton.cdiv(total_groups, groups_per_cta),)
-    ](
+    sgl_per_token_group_quant_8bit(
         x,
         x_q,
         x_s,
-        total_groups,
+        group_size,
         eps,
-        bit8_min=bit8_min,
-        bit8_max=bit8_max,
-        GROUP_SIZE=group_size,
-        GROUPS_PER_CTA=groups_per_cta,
-        num_warps=num_warps,
-        num_stages=1,
+        bit8_min,
+        bit8_max,
+        scale_ue8m0,
+        fuse_silu_and_mul,
+        masked_m,
+        enable_v2=True,
     )
     return True
 
