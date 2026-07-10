@@ -899,10 +899,12 @@ class BenchmarkMetrics:
     mean_ttft_ms: float
     median_ttft_ms: float
     std_ttft_ms: float
+    p90_ttft_ms: float
     p99_ttft_ms: float
     mean_tpot_ms: float
     median_tpot_ms: float
     std_tpot_ms: float
+    p90_tpot_ms: float
     p99_tpot_ms: float
     mean_itl_ms: float
     median_itl_ms: float
@@ -1118,10 +1120,12 @@ def calculate_metrics(
         * 1000,  # ttfts is empty if streaming is not supported by backend
         median_ttft_ms=np.median(ttfts or 0) * 1000,
         std_ttft_ms=np.std(ttfts or 0) * 1000,
+        p90_ttft_ms=np.percentile(ttfts or 0, 90) * 1000,
         p99_ttft_ms=np.percentile(ttfts or 0, 99) * 1000,
         mean_tpot_ms=np.mean(tpots or 0) * 1000,
         median_tpot_ms=np.median(tpots or 0) * 1000,
         std_tpot_ms=np.std(tpots or 0) * 1000,
+        p90_tpot_ms=np.percentile(tpots or 0, 90) * 1000,
         p99_tpot_ms=np.percentile(tpots or 0, 99) * 1000,
         mean_itl_ms=np.mean(itls or 0) * 1000,
         median_itl_ms=np.median(itls or 0) * 1000,
@@ -1564,6 +1568,7 @@ async def benchmark(
         print("{s:{c}^{n}}".format(s="Time to First Token", n=50, c="-"))
         print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
         print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
+        print("{:<40} {:<10.2f}".format("P90 TTFT (ms):", metrics.p90_ttft_ms))
         print("{:<40} {:<10.2f}".format("P99 TTFT (ms):", metrics.p99_ttft_ms))
         print(
             "{s:{c}^{n}}".format(
@@ -1572,6 +1577,7 @@ async def benchmark(
         )
         print("{:<40} {:<10.2f}".format("Mean TPOT (ms):", metrics.mean_tpot_ms))
         print("{:<40} {:<10.2f}".format("Median TPOT (ms):", metrics.median_tpot_ms))
+        print("{:<40} {:<10.2f}".format("P90 TPOT (ms):", metrics.p90_tpot_ms))
         print("{:<40} {:<10.2f}".format("P99 TPOT (ms):", metrics.p99_tpot_ms))
         print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
         print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
@@ -1622,10 +1628,12 @@ async def benchmark(
             "mean_ttft_ms": metrics.mean_ttft_ms,
             "median_ttft_ms": metrics.median_ttft_ms,
             "std_ttft_ms": metrics.std_ttft_ms,
+            "p90_ttft_ms": metrics.p90_ttft_ms,
             "p99_ttft_ms": metrics.p99_ttft_ms,
             "mean_tpot_ms": metrics.mean_tpot_ms,
             "median_tpot_ms": metrics.median_tpot_ms,
             "std_tpot_ms": metrics.std_tpot_ms,
+            "p90_tpot_ms": metrics.p90_tpot_ms,
             "p99_tpot_ms": metrics.p99_tpot_ms,
             "mean_itl_ms": metrics.mean_itl_ms,
             "median_itl_ms": metrics.median_itl_ms,
