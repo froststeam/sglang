@@ -34,6 +34,8 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 MATE_MLA_WORKSPACE_SIZE_BYTES = 128 * 1024 * 1024
+MINIMAX_M2_DECODE_NUM_SPLITS = 16
+MINIMAX_M2_DECODE_SPLIT_MAX_BS = 4
 
 
 def flash_attn_with_kvcache(
@@ -140,6 +142,8 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         self.num_hidden_layers = model_runner.model_config.num_hidden_layers
         self.first_k_dense_replace = model_runner.model_config.first_k_dense_replace
         self.full_attention_interval = model_runner.model_config.full_attention_interval
+        architectures = getattr(model_runner.model_config.hf_config, "architectures", [])
+        self._is_minimax_m2 = "MiniMaxM2ForCausalLM" in (architectures or [])
         if not self.use_mla:
             (
                 self._full_attention_layout,
@@ -318,6 +322,36 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
             )
         )
 
+    def _num_splits_for_no_mla_full_kvcache(self, forward_batch: ForwardBatch) -> int:
+        """Keep MiniMax-M2 decode-like full-attention metadata/calls aligned."""
+        if not self._is_minimax_m2:
+            return self.num_splits
+
+        batch_size = getattr(forward_batch, "batch_size", None)
+        if batch_size is None or batch_size > MINIMAX_M2_DECODE_SPLIT_MAX_BS:
+            return self.num_splits
+
+        forward_mode = forward_batch.forward_mode
+        if (
+            forward_mode.is_decode_or_idle()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend()
+        ):
+            return MINIMAX_M2_DECODE_NUM_SPLITS
+        return self.num_splits
+
+    def _num_splits_for_no_mla_call(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        is_swa_layer: bool = False,
+        is_cross_attention: bool = False,
+        use_local_attn: bool = False,
+    ) -> int:
+        if is_swa_layer or is_cross_attention or use_local_attn:
+            return self.num_splits
+        return self._num_splits_for_no_mla_full_kvcache(forward_batch)
+
     def _is_context_parallel_extend(self, forward_batch: ForwardBatch) -> bool:
         return (
             forward_batch.forward_mode.is_context_parallel_extend()
@@ -376,6 +410,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         window_size: Tuple[int, int],
         page_size: int,
         attention_layout: Optional[Tuple[int, int, int, int]] = None,
+        num_splits: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         assert not self.use_mla
         if cache_seqlens is None or cu_seqlens_q is None:
@@ -399,7 +434,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
             causal=causal,
             window_size=window_size,
             has_softcap=self.has_softcap,
-            num_splits=self.num_splits,
+            num_splits=self.num_splits if num_splits is None else num_splits,
         )
 
     def _should_skip_mla_scheduler_metadata_update(
@@ -797,6 +832,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         cu_seqlens_k_new: Optional[torch.Tensor],
         max_seqlen_k: int,
         causal: bool,
+        num_splits: Optional[int] = None,
     ):
         # Base self-attention metadata is only useful for full-attention layers.
         # In all-SWA models this would never be consumed, so keep the attr clear
@@ -814,6 +850,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     causal=causal,
                     window_size=(-1, -1),
                     page_size=self.page_size,
+                    num_splits=num_splits,
                 ),
             )
         else:
@@ -925,6 +962,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         metadata_expand,
         *,
         page_size: int,
+        num_splits: Optional[int] = None,
     ):
         if not self._has_full_attention_layer:
             setattr(metadata_expand, "scheduler_metadata", None)
@@ -945,6 +983,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                 causal=False,
                 window_size=(-1, -1),
                 page_size=page_size,
+                num_splits=num_splits,
             ),
         )
 
@@ -996,6 +1035,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         forward_batch: ForwardBatch,
         *,
         use_cascade: bool,
+        num_splits: Optional[int] = None,
     ):
         # Speculative cascade performs a second kvcache call over the expanded
         # draft/verify tokens. Target-verify disables cascade for SWA layers, so
@@ -1037,6 +1077,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         self._init_full_spec_decode_expand_scheduler_metadata(
             metadata_expand,
             page_size=expand_page_size,
+            num_splits=num_splits,
         )
         self._init_swa_spec_decode_expand_scheduler_metadata(
             metadata,
@@ -1071,12 +1112,14 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
             needs_kvcache_metadata or metadata.encoder_lens_int32 is not None
         )
         cu_seqlens_k_new = None if is_decode else metadata.cu_seqlens_k
+        full_num_splits = self._num_splits_for_no_mla_full_kvcache(forward_batch)
         self._init_full_attention_metadata(
             metadata,
             needs_kvcache_metadata=needs_kvcache_metadata,
             cu_seqlens_k_new=cu_seqlens_k_new,
             max_seqlen_k=metadata.max_seq_len_k,
             causal=not use_cascade,
+            num_splits=full_num_splits,
         )
         self._init_swa_attention_metadata(
             metadata,
@@ -1099,6 +1142,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
             metadata,
             forward_batch,
             use_cascade=use_cascade,
+            num_splits=full_num_splits,
         )
 
     def _init_scheduler_metadata(self, forward_batch: ForwardBatch):
@@ -1108,10 +1152,13 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
             self._init_no_mla_scheduler_metadata(forward_batch)
 
     @staticmethod
-    def _synthetic_forward_batch_for_scheduler_metadata(forward_mode, spec_info):
+    def _synthetic_forward_batch_for_scheduler_metadata(
+        forward_mode, spec_info, batch_size: Optional[int] = None
+    ):
         return SimpleNamespace(
             forward_mode=forward_mode,
             spec_info=spec_info,
+            batch_size=batch_size,
             attn_cp_metadata=None,
         )
 
@@ -1138,7 +1185,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         spec_info,
     ):
         forward_batch_for_init = self._synthetic_forward_batch_for_scheduler_metadata(
-            forward_mode, spec_info
+            forward_mode, spec_info, batch_size=bs
         )
         self._init_scheduler_metadata_for_batch(
             forward_batch_for_init,
@@ -1157,7 +1204,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
     ):
         """Regenerate replay metadata without changing graph-captured addresses."""
         forward_batch_for_init = self._synthetic_forward_batch_for_scheduler_metadata(
-            forward_mode, spec_info
+            forward_mode, spec_info, batch_size=bs
         )
         self._prepare_attn_cp_metadata_for_init(
             forward_batch_for_init,
@@ -1511,6 +1558,12 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                 or forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend(include_v2=True)
             ):
+                num_splits = self._num_splits_for_no_mla_call(
+                    forward_batch,
+                    is_swa_layer=is_swa_layer,
+                    is_cross_attention=layer.is_cross_attention,
+                    use_local_attn=use_local_attn,
+                )
                 scheduler_metadata = self._scheduler_metadata_for_kvcache(
                     scheduler_metadata_owner,
                     is_swa_layer=is_swa_layer,
@@ -1534,7 +1587,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
                     scheduler_metadata=scheduler_metadata,
-                    num_splits=self.num_splits,
+                    num_splits=num_splits,
                     **kwargs,
                 )
             else:
@@ -1583,7 +1636,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     scheduler_metadata=self._spec_decode_expand_scheduler_metadata(
                         is_swa_layer=is_swa_layer,
                     ),
-                    num_splits=self.num_splits,
+                    num_splits=self._num_splits_for_no_mla_full_kvcache(forward_batch),
                     **kwargs,
                 )
                 o, _ = merge_state_v2_wrapper(
@@ -1875,6 +1928,10 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                         )
                 cache_seqlens = metadata.cache_seqlens_int32
                 max_seqlen_q = metadata.max_seq_len_q
+                decode_num_splits = self._num_splits_for_no_mla_call(
+                    forward_batch,
+                    is_swa_layer=is_swa_layer,
+                )
                 q_reshaped = q.contiguous().view(
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
@@ -1898,7 +1955,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                         metadata,
                         is_swa_layer=is_swa_layer,
                     ),
-                    num_splits=self.num_splits,
+                    num_splits=decode_num_splits,
                     **kwargs,
                 )
                 if use_cascade_attn:
@@ -1923,7 +1980,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                             scheduler_metadata=self._spec_decode_expand_scheduler_metadata(
                                 is_swa_layer=is_swa_layer,
                             ),
-                            num_splits=self.num_splits,
+                            num_splits=decode_num_splits,
                             **kwargs,
                         )
                     )

@@ -384,6 +384,13 @@ class MusaJitCustomAllreduce:
         self._last_rank_data: Optional[torch.Tensor] = None
         self._graph_inputs: dict[int, torch.Tensor] = {}
         self._shot_decision_cache: dict[tuple[int, bool, bool], int] = {}
+        self._context_on_record_graph_input = _env_flag(
+            (
+                "SGLANG_CUSTOM_AR_CONTEXT_ON_RECORD_GRAPH_INPUT",
+                "SGL_CUSTOM_AR_CONTEXT_ON_RECORD_GRAPH_INPUT",
+            ),
+            False,
+        )
         self._launch_context_enabled = _env_flag(
             ("SGLANG_CUSTOM_AR_LAUNCH_CONTEXT", "SGL_CUSTOM_AR_LAUNCH_CONTEXT"),
             True,
@@ -540,8 +547,11 @@ class MusaJitCustomAllreduce:
         self._last_rank_data = rank_data
         return rank_data
 
-    def _record_graph_input(self, inp: torch.Tensor) -> None:
+    def _record_graph_input(self, inp: torch.Tensor, shot: Optional[int] = None) -> None:
         self._graph_inputs.setdefault(int(inp.data_ptr()), inp)
+        if shot is not None and self._context_on_record_graph_input:
+            if self._use_launch_context(shot):
+                self._context_for_input(inp, shot)
 
     def register_graph_buffers(self) -> None:
         for inp in tuple(self._graph_inputs.values()):
@@ -771,7 +781,7 @@ class MusaJitCustomAllreduce:
 
         out = None
         if self._IS_CAPTURING:
-            self._record_graph_input(input)
+            self._record_graph_input(input, shot)
             out = torch.empty_like(input)
             if is_graph_launch:
                 if self._use_launch_context(shot):
