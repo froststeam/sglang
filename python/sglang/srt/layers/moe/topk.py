@@ -1184,12 +1184,14 @@ def biased_grouped_topk_gpu(
     elif (
         _is_musa
         and (
-            gating_output.shape[1] // num_expert_group <= 32
+            (
+                gating_output.shape[1] // num_expert_group <= 32
+                and is_power_of_two(correction_bias.shape[0])
+            )
             or (
                 num_expert_group == 1 and gating_output.shape[1] in {160, 256, 384}
-            )  # XXX (MUSA): will support more cases in the future
+            )  # single-group shapes are handled by mate's static kernel
         )
-        and is_power_of_two(correction_bias.shape[0])
     ):
         topk_weights, topk_ids = moe_fused_gate(
             gating_output.to(dtype=torch.float32),
