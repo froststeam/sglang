@@ -93,6 +93,8 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             prefix=add_prefix("mtp", prefix),
             is_nextn=True,
         )
+        self.num_fused_shared_experts = self._get_num_fused_shared_experts()
+        self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
 
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
@@ -115,6 +117,15 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             num_logical_experts=text_config.num_experts,
             num_groups=None,
         )
+
+    def _get_num_fused_shared_experts(self):
+        if not (
+            hasattr(self.model, "layers")
+            and len(self.model.layers) > 0
+            and hasattr(self.model.layers[0].mlp, "num_fused_shared_experts")
+        ):
+            return 0
+        return self.model.layers[0].mlp.num_fused_shared_experts
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
@@ -263,6 +274,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 "shared_expert." not in name
                 or "shared_expert_gate" in name
                 or num_experts is None
+                or not self.enable_shared_expert_fusion
             ):
                 return False
 
