@@ -209,6 +209,9 @@ def _can_run_musa_moe_gemv_swiglu(
     quant_info: TritonMoeQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> bool:
+    if runner_config.musa_moe_gemv_enabled is False:
+        return False
+
     hidden_size = hidden_states.shape[1]
     element_size = quant_info.w13_weight.element_size()
     if element_size <= 0:
@@ -223,8 +226,14 @@ def _can_run_musa_moe_gemv_swiglu(
 
     return (
         _is_musa
-        and _MUSA_MOE_GEMV_SWIGLU_MAX_TOKENS > 0
-        and 0 < hidden_states.shape[0] <= _MUSA_MOE_GEMV_SWIGLU_MAX_TOKENS
+        and (
+            runner_config.musa_moe_gemv_enabled is True
+            or (
+                _MUSA_MOE_GEMV_SWIGLU_MAX_TOKENS > 0
+                and hidden_states.shape[0] <= _MUSA_MOE_GEMV_SWIGLU_MAX_TOKENS
+            )
+        )
+        and hidden_states.shape[0] > 0
         and hidden_states.is_contiguous()
         and runner_config.num_local_experts == quant_info.w13_weight.shape[0]
         and runner_config.num_local_experts == quant_info.w2_weight.shape[0]

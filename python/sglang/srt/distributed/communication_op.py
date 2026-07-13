@@ -40,6 +40,42 @@ def tensor_model_parallel_fused_allreduce_rmsnorm(
     return get_tp_group().fused_allreduce_rmsnorm(input_, residual_inp_, weight_, eps)
 
 
+def attention_tensor_model_parallel_fused_allreduce_rmsnorm(
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Fused all-reduce + RMSNorm across attention parallel group."""
+    return get_attn_tp_group().fused_allreduce_rmsnorm(
+        input_, residual_inp_, weight_, eps
+    )
+
+
+def moe_tensor_model_parallel_fused_allreduce_rmsnorm(
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Fused all-reduce + RMSNorm across MoE tensor parallel group."""
+    return get_moe_tp_group().fused_allreduce_rmsnorm(
+        input_, residual_inp_, weight_, eps
+    )
+
+
+def moe_expert_parallel_fused_allreduce_rmsnorm(
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Fused all-reduce + RMSNorm across MoE expert parallel group."""
+    return get_moe_ep_group().fused_allreduce_rmsnorm(
+        input_, residual_inp_, weight_, eps
+    )
+
+
 def tensor_model_parallel_all_gather(
     input_: torch.Tensor, dim: int = -1
 ) -> torch.Tensor:

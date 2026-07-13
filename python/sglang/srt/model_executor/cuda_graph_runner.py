@@ -27,6 +27,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 import tqdm
 from torch.profiler import ProfilerActivity, profile
 
@@ -38,6 +39,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
+    get_attn_tp_group,
+    get_moe_ep_group,
+    get_moe_tp_group,
     graph_capture,
     set_pdmux_status,
 )
@@ -220,9 +224,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
                     name: torch.zeros(
                         (
                             max_bs,
-                            hc_hidden_size
-                            if is_mhc and name == "hidden_states"
-                            else pp_proxy_hidden_size,
+                            (
+                                hc_hidden_size
+                                if is_mhc and name == "hidden_states"
+                                else pp_proxy_hidden_size
+                            ),
                         ),
                         dtype=dtype,
                     )
@@ -991,11 +997,87 @@ class CudaGraphRunner:
             return BreakableCUDAGraph()
         return torch.cuda.CUDAGraph()
 
+    def _custom_allreduce_graph_groups(self) -> List[GroupCoordinator]:
+        groups = [self.model_runner.tp_group]
+        for get_group in (get_moe_ep_group, get_moe_tp_group, get_attn_tp_group):
+            try:
+                groups.append(get_group())
+            except AssertionError:
+                pass
+
+        unique_groups = []
+        seen_comms = set()
+        for group in groups:
+            ca_comm = getattr(group, "ca_comm", None)
+            if ca_comm is None or id(ca_comm) in seen_comms:
+                continue
+            if not getattr(
+                ca_comm, "requires_graph_capture_registration_recapture", False
+            ):
+                continue
+            seen_comms.add(id(ca_comm))
+            unique_groups.append(group)
+        return unique_groups
+
+    def _register_one_custom_allreduce_graph_buffers(
+        self, group: GroupCoordinator
+    ) -> int:
+        ca_comm = group.ca_comm
+        count = ca_comm.register_graph_buffers()
+        local_count = count if isinstance(count, int) else 0
+        if dist.is_initialized():
+            count_tensor = torch.tensor([local_count], dtype=torch.int64)
+            sync_group = getattr(group, "cpu_group", None)
+            dist.all_reduce(
+                count_tensor,
+                op=dist.ReduceOp.MAX,
+                group=sync_group or ca_comm.group,
+            )
+            return int(count_tensor.item())
+        return local_count
+
+    def _register_custom_allreduce_graph_buffers(self) -> int:
+        registered = 0
+        for group in self._custom_allreduce_graph_groups():
+            registered += self._register_one_custom_allreduce_graph_buffers(group)
+        return registered
+
+    def _prepare_custom_allreduce_graph_replay(self) -> None:
+        for group in self._custom_allreduce_graph_groups():
+            ca_comm = getattr(group, "ca_comm", None)
+            prepare_graph_replay = getattr(ca_comm, "prepare_graph_replay", None)
+            if prepare_graph_replay is not None:
+                prepare_graph_replay()
+
+    def _prepare_custom_allreduce_graph_capture(self) -> None:
+        for group in self._custom_allreduce_graph_groups():
+            ca_comm = getattr(group, "ca_comm", None)
+            prepare_graph_capture = getattr(ca_comm, "prepare_graph_capture", None)
+            if prepare_graph_capture is not None:
+                prepare_graph_capture()
+
+    def _begin_custom_allreduce_graph_capture_registration(self) -> None:
+        for group in self._custom_allreduce_graph_groups():
+            ca_comm = getattr(group, "ca_comm", None)
+            begin_graph_capture_registration = getattr(
+                ca_comm, "begin_graph_capture_registration", None
+            )
+            if begin_graph_capture_registration is not None:
+                begin_graph_capture_registration()
+
+    def _end_custom_allreduce_graph_capture_registration(self) -> None:
+        for group in self._custom_allreduce_graph_groups():
+            ca_comm = getattr(group, "ca_comm", None)
+            end_graph_capture_registration = getattr(
+                ca_comm, "end_graph_capture_registration", None
+            )
+            if end_graph_capture_registration is not None:
+                end_graph_capture_registration()
+
     def capture_one_batch_size(
         self, bs: int, forward: Callable, stream_idx: Optional[int] = None
     ):
         buffers: DecodeInputBuffers = self.buffers
-        graph = self._create_device_graph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
 
@@ -1210,12 +1292,43 @@ class CudaGraphRunner:
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
         # Set graph pool id globally to be able to use symmetric memory
-        set_graph_pool_id(get_global_graph_memory_pool())
+        graph_pool = get_global_graph_memory_pool()
+        set_graph_pool_id(graph_pool)
 
-        out = self._capture_graph(
-            graph, get_global_graph_memory_pool(), stream, run_once
-        )
+        max_graph_register_recaptures = 2
+        graph = None
+        out = None
+        self._begin_custom_allreduce_graph_capture_registration()
+        try:
+            for attempt in range(max_graph_register_recaptures + 1):
+                graph = self._create_device_graph()
+                self._prepare_custom_allreduce_graph_capture()
+                out = self._capture_graph(graph, graph_pool, stream, run_once)
+                registered = self._register_custom_allreduce_graph_buffers()
+                if registered == 0:
+                    break
+                if attempt == max_graph_register_recaptures:
+                    raise RuntimeError(
+                        "MUSA JIT custom allreduce registered "
+                        f"{registered} graph buffers after "
+                        f"{max_graph_register_recaptures + 1} capture attempts. "
+                        "Refusing to keep a graph that may contain placeholder outputs."
+                    )
+                log_info_on_rank0(
+                    logger,
+                    "Registered "
+                    f"{registered} MUSA JIT custom allreduce graph buffers; "
+                    "recapturing CUDA graph to use the registered path.",
+                )
+                graph = None
+                out = None
+                self.device_module.synchronize()
+                self.model_runner.tp_group.barrier()
+        finally:
+            self._end_custom_allreduce_graph_capture_registration()
 
+        if graph is None or out is None:
+            raise RuntimeError("Failed to capture CUDA graph")
         return graph, out
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
@@ -1371,6 +1484,7 @@ class CudaGraphRunner:
             else contextlib.nullcontext()
         )
         with ctx:
+            self._prepare_custom_allreduce_graph_replay()
             self.graphs[graph_key].replay()
 
         output = self.output_buffers[graph_key]

@@ -40,7 +40,7 @@ _AUTOTUNE_MASKED_DEEPGEMM_MAX_BUFFER_GIB = float(
     os.getenv("SGLANG_MUSA_MOE_MASKED_DEEPGEMM_MAX_BUFFER_GIB", "0")
 )
 _MUSA_MOE_GEMV_SWIGLU_MAX_TOKENS = int(
-    os.getenv("SGLANG_MUSA_MOE_GEMV_SWIGLU_MAX_TOKENS", "16")
+    os.getenv("SGLANG_MUSA_MOE_GEMV_SWIGLU_MAX_TOKENS", "8")
 )
 _AUTOTUNE_PROFILER_TOPK = int(os.getenv("SGLANG_MUSA_MOE_AUTOTUNE_PROFILER_TOPK", "0"))
 _DEEPGEMM_BLOCK_M_SMALL = 128
@@ -273,7 +273,7 @@ def _measure_bucket_point(
         gemv_us = _measure_one(
             target,
             num_tokens,
-            backend=_TRITON_BACKEND,
+            backend=_GEMV_BACKEND,
             warmup=warmup,
             iters=iters,
             gemv_max_tokens_override=_MUSA_MOE_GEMV_SWIGLU_MAX_TOKENS,

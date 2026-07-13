@@ -21,6 +21,9 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     is_weak_contiguous,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.musa.jit_kernel.csrc.custom_all_reduce_rmsnorm import (
+    MusaJitCustomAllreduceRMSNorm,
+)
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
@@ -364,6 +367,7 @@ class CustomAllreduce:
 class MusaJitCustomAllreduce:
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
     _MAX_CAR_SIZE = 512 * 1024 * 1024
+    requires_graph_capture_registration_recapture = False
 
     def __init__(
         self,
@@ -380,9 +384,19 @@ class MusaJitCustomAllreduce:
         self._rank_data_context_cache: dict[tuple[int, int], int] = {}
         self._unregistered_context_cache: dict[tuple[int, int], int] = {}
         self._opened_ipc_ptrs: dict[bytes, int] = {}
+        self._musa_lib = None
+        self._mu_pointer_get_attribute = None
         self._last_input_ptr: Optional[int] = None
         self._last_rank_data: Optional[torch.Tensor] = None
-        self._graph_inputs: dict[int, torch.Tensor] = {}
+        self._graph_inputs: list[tuple[torch.Tensor, Optional[int]]] = []
+        self._graph_registered_input_sequence: list[
+            tuple[tuple[object, ...], torch.Tensor, torch.Tensor]
+        ] = []
+        self._graph_registered_sequence_signature: tuple[
+            tuple[tuple[object, ...], tuple[int, ...]], ...
+        ] = ()
+        self._graph_registered_cursor = 0
+        self._graph_registered_miss = False
         self._shot_decision_cache: dict[tuple[int, bool, bool], int] = {}
         self._context_on_record_graph_input = _env_flag(
             (
@@ -425,6 +439,7 @@ class MusaJitCustomAllreduce:
         self._unregistered_context_pybind_launchers = {}
         self._unregistered_context_pybind_creators = {}
         self._unregistered_context_pybind_disposers = {}
+        self._fused_rmsnorm = MusaJitCustomAllreduceRMSNorm(self)
         self._torchop_context_enabled = _env_flag(
             ("SGLANG_CUSTOM_AR_TORCHOP_CONTEXT", "SGL_CUSTOM_AR_TORCHOP_CONTEXT"),
             False,
@@ -447,10 +462,29 @@ class MusaJitCustomAllreduce:
             ),
             False,
         )
+        self._graph_registered_input_enabled = _env_flag(
+            (
+                "SGLANG_MUSA_CUSTOM_AR_GRAPH_REGISTERED_INPUT",
+                "SGL_CUSTOM_AR_GRAPH_REGISTERED_INPUT",
+            ),
+            True,
+        )
+        self.requires_graph_capture_registration_recapture = (
+            self._graph_registered_input_enabled
+        )
         self.rank_data = torch.tensor(
             self.buffer_ptrs + [0] * (8 - self.world_size), dtype=torch.int64
         )
         self.signal_ptrs_cpu = torch.tensor(self.meta_ptrs, dtype=torch.int64)
+        # Device slots match FlashInfer/sgl-kernel graph handling: the graph
+        # captures a stable RankData* and replay reads the registered pointers
+        # from the slot content filled after buffer registration.
+        self._graph_rank_data_slots = torch.empty(
+            (16384, 8), dtype=torch.int64, device=self.device
+        )
+        self._graph_rank_data_slot_next = 0
+        self._graph_capture_slot_base: Optional[int] = None
+        self._graph_capture_slot_count = 0
         self.disabled = False
         self.original_disabled = False
 
@@ -458,14 +492,13 @@ class MusaJitCustomAllreduce:
     def capture(self):
         try:
             self._graph_inputs.clear()
+            self._graph_registered_cursor = 0
+            self._graph_registered_miss = False
             self._IS_CAPTURING = True
             yield
         finally:
             self._IS_CAPTURING = False
-            try:
-                if not self.disabled:
-                    self.register_graph_buffers()
-            finally:
+            if not self._graph_registered_input_enabled:
                 self._graph_inputs.clear()
 
     def should_custom_ar(self, inp: torch.Tensor):
@@ -478,18 +511,22 @@ class MusaJitCustomAllreduce:
             return False
         return is_weak_contiguous(inp)
 
+    def _should_fused_rmsnorm_custom_ar(self, inp: torch.Tensor):
+        return self._fused_rmsnorm._should_fused_rmsnorm_custom_ar(inp)
+
     def _get_base_ptr_and_offset(self, inp: torch.Tensor) -> tuple[int, int]:
         ptr_value = int(inp.data_ptr())
-        musa = ctypes.CDLL("libmusa.so")
-        mu_pointer_get_attribute = musa.muPointerGetAttribute
-        mu_pointer_get_attribute.restype = ctypes.c_int
-        mu_pointer_get_attribute.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.c_ulonglong,
-        ]
+        if self._mu_pointer_get_attribute is None:
+            self._musa_lib = ctypes.CDLL("libmusa.so")
+            self._mu_pointer_get_attribute = self._musa_lib.muPointerGetAttribute
+            self._mu_pointer_get_attribute.restype = ctypes.c_int
+            self._mu_pointer_get_attribute.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_ulonglong,
+            ]
         base_ptr = ctypes.c_void_p()
-        err = mu_pointer_get_attribute(
+        err = self._mu_pointer_get_attribute(
             ctypes.byref(base_ptr),
             11,  # MU_POINTER_ATTRIBUTE_RANGE_START_ADDR
             ctypes.c_ulonglong(ptr_value),
@@ -511,22 +548,19 @@ class MusaJitCustomAllreduce:
         offsets = [int(t.item()) for t in offset_list]
         return handles, offsets
 
-    def _rank_data_for_input(self, inp: torch.Tensor) -> torch.Tensor:
+    def _local_ipc_record_for_input(self, inp: torch.Tensor) -> tuple[int, bytes, int]:
         ptr_value = int(inp.data_ptr())
-        if ptr_value == self._last_input_ptr and self._last_rank_data is not None:
-            return self._last_rank_data
-        cached = self._rank_data_cache.get(ptr_value)
-        if cached is not None:
-            self._last_input_ptr = ptr_value
-            self._last_rank_data = cached
-            return cached
-
         base_value, offset = self._get_base_ptr_and_offset(inp)
         lib = CudaRTLibrary()
         handle = lib.cudaIpcGetMemHandle(ctypes.c_void_p(base_value))
-        handles, offsets = self._gather_ipc_meta((bytes(handle), offset))
+        return ptr_value, bytes(handle), offset
+
+    def _rank_data_from_ipc_records(
+        self, ptr_value: int, records: list[tuple[int, bytes, int]]
+    ) -> torch.Tensor:
+        lib = CudaRTLibrary()
         ptrs: List[int] = []
-        for i, (h, off) in enumerate(zip(handles, offsets)):
+        for i, (_, h, off) in enumerate(records):
             if i == self.rank:
                 ptrs.append(ptr_value)
             else:
@@ -541,22 +575,274 @@ class MusaJitCustomAllreduce:
                     self._opened_ipc_ptrs[h] = opened_base
                 ptrs.append(opened_base + int(off))
         ptrs += [0] * (8 - self.world_size)
-        rank_data = torch.tensor(ptrs, dtype=torch.int64)
+        return torch.tensor(ptrs, dtype=torch.int64)
+
+    @staticmethod
+    def _rank_data_ptr_tuple(rank_data: torch.Tensor) -> tuple[int, ...]:
+        return tuple(int(value) for value in rank_data.tolist())
+
+    def _rank_data_for_input(
+        self, inp: torch.Tensor, refresh: bool = False
+    ) -> torch.Tensor:
+        ptr_value = int(inp.data_ptr())
+        if (
+            not refresh
+            and ptr_value == self._last_input_ptr
+            and self._last_rank_data is not None
+        ):
+            return self._last_rank_data
+        if not refresh:
+            cached = self._rank_data_cache.get(ptr_value)
+            if cached is not None:
+                self._last_input_ptr = ptr_value
+                self._last_rank_data = cached
+                return cached
+
+        _, handle, offset = self._local_ipc_record_for_input(inp)
+        handles, offsets = self._gather_ipc_meta((handle, offset))
+        rank_data = self._rank_data_from_ipc_records(
+            ptr_value,
+            [(0, h, off) for h, off in zip(handles, offsets)],
+        )
         self._rank_data_cache[ptr_value] = rank_data
         self._last_input_ptr = ptr_value
         self._last_rank_data = rank_data
         return rank_data
 
-    def _record_graph_input(self, inp: torch.Tensor, shot: Optional[int] = None) -> None:
-        self._graph_inputs.setdefault(int(inp.data_ptr()), inp)
+    def _context_for_rank_data(
+        self, ptr_value: int, shot: int, rank_data: torch.Tensor
+    ) -> int:
+        key = (ptr_value, int(shot))
+        cached = self._rank_data_context_cache.get(key)
+        if cached is not None:
+            return cached
+        context_ptr = self._jit_ar.create_context(
+            rank_data,
+            self.signal_ptrs_cpu,
+            int(self.meta_ptrs[self.rank]),
+            self.rank,
+            self.world_size,
+            shot,
+        )
+        self._rank_data_context_cache[key] = context_ptr
+        return context_ptr
+
+    def _rank_data_for_registered_input(
+        self,
+        inp: torch.Tensor,
+        shot: Optional[int] = None,
+        prefer_device_slot: bool = False,
+    ) -> Optional[torch.Tensor]:
+        is_graph_launch = (
+            self._IS_CAPTURING
+            and torch.get_device_module().is_current_stream_capturing()
+        )
+        if is_graph_launch:
+            self._record_graph_input(inp, shot)
+            signature = self._graph_input_signature(inp, shot)
+            cursor = self._graph_registered_cursor
+            self._graph_registered_cursor += 1
+            if cursor < len(self._graph_registered_input_sequence):
+                cached_signature, rank_data, rank_data_slot = (
+                    self._graph_registered_input_sequence[cursor]
+                )
+                if cached_signature == signature and self._rank_data_ptr_tuple(
+                    rank_data
+                )[self.rank] == int(inp.data_ptr()):
+                    if prefer_device_slot:
+                        return rank_data_slot
+                    return rank_data
+            if self._graph_registered_input_sequence:
+                self._graph_registered_miss = True
+            return None
+        ptr_value = int(inp.data_ptr())
+        cached = self._rank_data_cache.get(ptr_value)
+        if cached is not None:
+            self._last_input_ptr = ptr_value
+            self._last_rank_data = cached
+        return cached
+
+    @staticmethod
+    def _graph_input_signature(
+        inp: torch.Tensor, shot: Optional[int]
+    ) -> tuple[object, ...]:
+        return (
+            tuple(int(dim) for dim in inp.shape),
+            str(inp.dtype),
+            int(inp.numel()),
+            int(inp.element_size()),
+            shot,
+        )
+
+    def _record_graph_input(self, inp: torch.Tensor, shot: Optional[int]) -> None:
+        self._graph_inputs.append((inp, int(shot) if shot is not None else None))
         if shot is not None and self._context_on_record_graph_input:
             if self._use_launch_context(shot):
-                self._context_for_input(inp, shot)
+                self._context_for_input(inp, int(shot))
 
-    def register_graph_buffers(self) -> None:
-        for inp in tuple(self._graph_inputs.values()):
-            if self.should_custom_ar(inp):
-                self._rank_data_for_input(inp)
+    def _graph_object_broadcast_device(self) -> Union[str, torch.device]:
+        try:
+            backend = str(dist.get_backend(group=self.group)).lower()
+        except Exception:
+            backend = ""
+        if "gloo" in backend:
+            return "cpu"
+        return self.device
+
+    def register_graph_buffers(self) -> int:
+        if not self._graph_registered_input_enabled:
+            self._graph_inputs.clear()
+            self._graph_registered_input_sequence.clear()
+            self._graph_registered_sequence_signature = ()
+            self._graph_registered_cursor = 0
+            return 0
+
+        entries = []
+        try:
+            for inp, shot in tuple(self._graph_inputs):
+                ptr_value = int(inp.data_ptr())
+                if not self.should_custom_ar(
+                    inp
+                ) and not self._should_fused_rmsnorm_custom_ar(inp):
+                    continue
+                signature = self._graph_input_signature(inp, shot)
+                ptr_value, handle, offset = self._local_ipc_record_for_input(inp)
+                entries.append((ptr_value, handle, offset, shot, signature))
+
+            all_entries = [None for _ in range(self.world_size)]
+            all_entries[self.rank] = entries
+            ranks = dist.get_process_group_ranks(group=self.group)
+            broadcast_device = self._graph_object_broadcast_device()
+            for i, rank in enumerate(ranks):
+                holder = [all_entries[i]]
+                dist.broadcast_object_list(
+                    holder, src=rank, group=self.group, device=broadcast_device
+                )
+                all_entries[i] = holder[0]
+
+            entry_counts = [len(rank_entries or ()) for rank_entries in all_entries]
+            if len(set(entry_counts)) != 1:
+                raise RuntimeError(
+                    "MUSA JIT custom allreduce graph input registration mismatch: "
+                    f"rank entry counts are {entry_counts}."
+                )
+
+            registered = 0
+            new_sequence = []
+            new_sequence_signature = []
+            slot_base = (
+                self._graph_capture_slot_base
+                if self._graph_capture_slot_base is not None
+                else self._graph_rank_data_slot_next
+            )
+            for idx, (ptr_value, handle, offset, shot, signature) in enumerate(entries):
+                slot_index = slot_base + idx
+                if slot_index >= self._graph_rank_data_slots.size(0):
+                    raise RuntimeError(
+                        "MUSA JIT custom allreduce graph input registration "
+                        "exceeds device rank-data slot capacity "
+                        f"({self._graph_rank_data_slots.size(0)})."
+                    )
+                rank_records = []
+                rank_signatures = []
+                for rank_entries in all_entries:
+                    peer_ptr, peer_handle, peer_offset, _, peer_signature = (
+                        rank_entries[idx]
+                    )
+                    rank_records.append((peer_ptr, peer_handle, peer_offset))
+                    rank_signatures.append(peer_signature)
+
+                if any(
+                    peer_signature != signature for peer_signature in rank_signatures
+                ):
+                    raise RuntimeError(
+                        "MUSA JIT custom allreduce graph input registration "
+                        f"order mismatch at entry {idx}: {rank_signatures}."
+                    )
+
+                rank_data = self._rank_data_from_ipc_records(ptr_value, rank_records)
+                graph_signature = (
+                    signature,
+                    self._rank_data_ptr_tuple(rank_data),
+                )
+                rank_data_slot = self._graph_rank_data_slots[slot_index]
+                rank_data_slot.copy_(
+                    rank_data.to(device=self.device, non_blocking=False)
+                )
+                new_sequence.append((signature, rank_data, rank_data_slot))
+                new_sequence_signature.append(graph_signature)
+                self._rank_data_cache[ptr_value] = rank_data
+                self._last_input_ptr = ptr_value
+                self._last_rank_data = rank_data
+            new_sequence_signature = tuple(new_sequence_signature)
+            if self._graph_registered_sequence_signature != new_sequence_signature:
+                registered += 1
+                self._graph_registered_sequence_signature = new_sequence_signature
+            elif self._graph_registered_miss:
+                registered += 1
+            torch.get_device_module().synchronize()
+            if self._graph_capture_slot_base is not None:
+                self._graph_capture_slot_count = max(
+                    self._graph_capture_slot_count, len(new_sequence)
+                )
+            self._graph_registered_input_sequence = new_sequence
+            self._graph_registered_cursor = 0
+            self._graph_registered_miss = False
+            return registered
+        finally:
+            self._graph_inputs.clear()
+
+    def begin_graph_capture_registration(self) -> None:
+        if not self._graph_registered_input_enabled:
+            return
+        self._graph_registered_input_sequence.clear()
+        self._graph_registered_sequence_signature = ()
+        self._graph_registered_cursor = 0
+        self._graph_registered_miss = False
+        self._graph_capture_slot_base = self._graph_rank_data_slot_next
+        self._graph_capture_slot_count = 0
+
+    def end_graph_capture_registration(self) -> None:
+        if not self._graph_registered_input_enabled:
+            return
+        if self._graph_capture_slot_base is not None:
+            self._graph_rank_data_slot_next = max(
+                self._graph_rank_data_slot_next,
+                self._graph_capture_slot_base + self._graph_capture_slot_count,
+            )
+        self._graph_capture_slot_base = None
+        self._graph_capture_slot_count = 0
+        self._graph_registered_input_sequence.clear()
+        self._graph_registered_sequence_signature = ()
+        self._graph_registered_cursor = 0
+        self._graph_registered_miss = False
+
+    def prepare_graph_capture(self) -> None:
+        if self._graph_registered_input_enabled:
+            self._graph_registered_cursor = 0
+            self._graph_registered_miss = False
+
+    def prepare_graph_replay(self) -> None:
+        if self._graph_registered_input_enabled:
+            self._graph_registered_cursor = 0
+
+    def fused_allreduce_rmsnorm(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        return self._fused_rmsnorm.fused_allreduce_rmsnorm(
+            input_, residual_inp_, weight_, eps
+        )
+
+    def fused_allreduce_residual(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        return self._fused_rmsnorm.fused_allreduce_residual(input_, residual_inp_)
 
     def _launch_registered(
         self, rank_data: torch.Tensor, out: torch.Tensor, shot: int
@@ -757,7 +1043,6 @@ class MusaJitCustomAllreduce:
     def custom_all_reduce(self, input: torch.Tensor) -> Optional[torch.Tensor]:
         if not self.should_custom_ar(input):
             return None
-        ptr_value = int(input.data_ptr())
         input_bytes = input.numel() * input.element_size()
         is_graph_launch = (
             self._IS_CAPTURING
@@ -781,29 +1066,27 @@ class MusaJitCustomAllreduce:
 
         out = None
         if self._IS_CAPTURING:
-            self._record_graph_input(input, shot)
             out = torch.empty_like(input)
             if is_graph_launch:
-                if self._use_launch_context(shot):
-                    context_ptr = self._rank_data_context_cache.get(
-                        (ptr_value, int(shot))
+                if self._graph_registered_input_enabled:
+                    rank_data = self._rank_data_for_registered_input(
+                        input, shot, prefer_device_slot=True
                     )
-                    if context_ptr is not None:
-                        self._launch_registered_context(context_ptr, out, shot)
-                    else:
-                        self._launch_unregistered(input, out, shot)
-                else:
-                    rank_data = self._rank_data_cache.get(ptr_value)
                     if rank_data is not None:
                         self._launch_registered(rank_data, out, shot)
                     else:
-                        self._launch_unregistered(input, out, shot)
-            else:
-                if self._use_launch_context(shot):
-                    self._context_for_input(input, shot)
+                        out.zero_()
                 else:
-                    self._rank_data_for_input(input)
-                self._launch_unregistered(input, out, shot)
+                    self._launch_unregistered(input, out, shot)
+            else:
+                if is_in_piecewise_cuda_graph():
+                    self._launch_unregistered(input, out, shot)
+                else:
+                    # Run the real eager-style path during graph warmup so the
+                    # JIT module is built before stream capture. The first
+                    # actual capture can still record a placeholder while IPC
+                    # rank data is registered for the recapture.
+                    self._launch_unregistered(input, out, shot)
         else:
             out = torch.empty_like(input)
             # Match the sgl custom AR eager path: stage through the shared
@@ -811,7 +1094,8 @@ class MusaJitCustomAllreduce:
             # pointer. The unregistered launch takes `input` as an explicit
             # tensor argument and orders a same-stream D2D copy before AR,
             # preserving producer/lifetime dependencies under serving buffer
-            # reuse. Graph capture still uses the registered path above.
+            # reuse. Graph capture uses registered inputs by default and can
+            # disable them via SGLANG_MUSA_CUSTOM_AR_GRAPH_REGISTERED_INPUT=0.
             if self._pybind_unregistered_enabled:
                 self._launch_unregistered_pybind(input, out, shot)
             else:
@@ -838,6 +1122,12 @@ class MusaJitCustomAllreduce:
             for ptr in self._opened_ipc_ptrs.values():
                 lib.cudaIpcCloseMemHandle(ctypes.c_void_p(ptr))
             self._opened_ipc_ptrs.clear()
+            self._rank_data_cache.clear()
+            self._graph_registered_input_sequence.clear()
+            self._graph_registered_sequence_signature = ()
+            self._graph_registered_cursor = 0
+            self._last_input_ptr = None
+            self._last_rank_data = None
             CustomAllreduce.free_shared_buffer(self.buffer_ptrs, group=self.group)
             CustomAllreduce.free_shared_buffer(self.meta_ptrs, group=self.group)
         self.disabled = True

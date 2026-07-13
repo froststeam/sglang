@@ -668,8 +668,9 @@ class GroupCoordinator:
                     input_, residual_inp_, weight_, eps
                 )
             except Exception:
-                # Fall back to custom_fused_ar_rms path below.
-                pass
+                if not hasattr(ca_comm, "custom_fused_ar_rms"):
+                    raise
+                # Fall back to the legacy custom_fused_ar_rms path below.
 
         if not hasattr(ca_comm, "custom_fused_ar_rms"):
             return None
