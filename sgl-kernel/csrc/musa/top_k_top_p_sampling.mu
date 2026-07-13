@@ -21,7 +21,11 @@
 #include <torch/all.h>
 
 #include "torch_musa/csrc/aten/musa/UnpackRaw.muh"
+#if __has_include(<flashinfer/sampling.muh>)
 #include <flashinfer/sampling.muh>
+#else
+#include <flashinfer/sampling.cuh>
+#endif
 #include <mutex>
 
 #include "musa.h"
