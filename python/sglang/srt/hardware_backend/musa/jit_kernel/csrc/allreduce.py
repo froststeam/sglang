@@ -349,6 +349,380 @@ def _load_custom_ar_module(
     )
 
 
+def _fused_rmsnorm_token_2stage(
+    world_size: int, row_hidden: int = 0, override: int = -1
+) -> int:
+    default = 1 if world_size in (4, 8) else 0
+    if override >= 0:
+        default = int(override)
+    return default
+
+
+def _fused_rmsnorm_default_blocks(
+    world_size: int,
+    token_2stage: int,
+    config: CompileConfig,
+    short_rows: bool = False,
+    row_hidden: int = 0,
+    small_rows: bool = False,
+) -> int:
+    if world_size == 2 and row_hidden == 1024 and not short_rows:
+        return 80
+    if world_size == 8 and token_2stage:
+        if row_hidden == 1536:
+            return 180
+        if row_hidden == 3072:
+            return 120
+        return 120
+    if world_size == 4 and token_2stage:
+        if row_hidden % 8 != 0:
+            return 40
+        if row_hidden == 1536:
+            return 120
+        if row_hidden == 1024 and short_rows:
+            return 240
+        if row_hidden == 4096 and short_rows:
+            return 80
+        if row_hidden == 4096:
+            return 56
+        if row_hidden in (1024, 2048, 4096, 8192) and not short_rows:
+            return 80
+        return 56
+    if world_size == 8 and row_hidden == 1536 and not short_rows:
+        return 60
+    return config.blocks
+
+
+def _fused_rmsnorm_abi_max_blocks(
+    world_size: int, token_2stage: int, config: CompileConfig
+) -> int:
+    blocks = [
+        config.max_blocks,
+        _fused_rmsnorm_default_blocks(world_size, token_2stage, config),
+    ]
+    for row_hidden in (512, 1024, 2048, 4096, 8192):
+        for short_rows in (False, True):
+            for small_rows in (False, True):
+                blocks.append(
+                    _fused_rmsnorm_default_blocks(
+                        world_size,
+                        token_2stage,
+                        config,
+                        short_rows=short_rows,
+                        row_hidden=row_hidden,
+                        small_rows=small_rows,
+                    )
+                )
+    return max(blocks)
+
+
+def _is_power_of_2(value: int) -> bool:
+    return value > 0 and (value & (value - 1)) == 0
+
+
+def _fused_rmsnorm_config(
+    world_size: int,
+    config: CompileConfig,
+    token_2stage: int,
+    short_rows: bool = False,
+    row_hidden: int = 0,
+    small_rows: bool = False,
+) -> CompileConfig:
+    fused_vector_load = config.vector_load
+    fused_threads = (
+        (row_hidden // 8)
+        if small_rows
+        and world_size in (2, 4, 8)
+        and (world_size == 2 or token_2stage)
+        and row_hidden in (512, 1024, 2048, 4096)
+        else (
+            (row_hidden // 8)
+            if world_size == 2
+            and short_rows
+            and 512 <= row_hidden <= 8192
+            and row_hidden % 8 == 0
+            and not _is_power_of_2(row_hidden)
+            else (
+                512
+                if world_size == 2
+                and 6144 <= row_hidden <= 8192
+                and row_hidden % 8 == 0
+                and not _is_power_of_2(row_hidden)
+                else (
+                    256
+                    if world_size == 2 and row_hidden == 512
+                    else (
+                        512
+                        if world_size == 4 and row_hidden % 8 != 0
+                        else (
+                            512
+                            if world_size == 2 and (row_hidden == 1024 and short_rows)
+                            else (
+                                1024
+                                if world_size == 4
+                                and token_2stage
+                                and row_hidden in (4096, 8192)
+                                else (
+                                    512
+                                    if world_size == 8
+                                    and row_hidden == 1536
+                                    and not token_2stage
+                                    and not short_rows
+                                    else (
+                                        (row_hidden // 8)
+                                        if world_size == 2
+                                        and row_hidden in (1024, 2048)
+                                        else (
+                                            512
+                                            if short_rows and world_size == 2
+                                            else (
+                                                1024
+                                                if world_size == 2
+                                                else (
+                                                    512
+                                                    if world_size in (4, 8)
+                                                    and token_2stage
+                                                    else config.threads
+                                                )
+                                            )
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+        )
+    )
+    fused_blocks = _fused_rmsnorm_default_blocks(
+        world_size, token_2stage, config, short_rows, row_hidden, small_rows
+    )
+    fused_dynamic_blocks = (
+        0
+        if (
+            (world_size == 8 and token_2stage)
+            or (
+                world_size == 8
+                and row_hidden == 1536
+                and not token_2stage
+                and not short_rows
+            )
+        )
+        else config.dynamic_blocks
+    )
+    fused_max_blocks = _fused_rmsnorm_abi_max_blocks(world_size, token_2stage, config)
+    fused_max_blocks = max(fused_max_blocks, fused_blocks)
+    return replace(
+        config,
+        threads=fused_threads,
+        blocks=fused_blocks,
+        vector_load=fused_vector_load,
+        max_blocks=fused_max_blocks,
+        dynamic_blocks=fused_dynamic_blocks,
+    )
+
+
+def _load_custom_ar_fused_rmsnorm_module(
+    world_size: int,
+    config: CompileConfig,
+    short_rows: bool = False,
+    row_hidden: int = 0,
+    small_rows: bool = False,
+    cache_policy: int = 0,
+    row_skip_end_barrier_override: int = -1,
+    push_polling_override: int = -1,
+    lamport_push_override: int = -1,
+    token_2stage_override: int = -1,
+    row_warp_inv_rms_override: int = -1,
+):
+    token_2stage = _fused_rmsnorm_token_2stage(
+        world_size, row_hidden, token_2stage_override
+    )
+    config = _fused_rmsnorm_config(
+        world_size, config, token_2stage, short_rows, row_hidden, small_rows
+    )
+    shfl_2stage = 0
+    packed_1stage = (
+        1 if world_size == 2 and row_hidden == 8192 and not token_2stage else 0
+    )
+    safe_packed_1stage = 0
+    vec2rank_1stage = 1
+    partial_packed_non8 = 1
+    vec2_non8 = 0
+    vec4_non8 = 0
+    regcache_2rank = 1 if short_rows and world_size == 2 else 0
+    no_cache_policy = cache_policy == 1
+    cache_hidden_limit_default = (
+        0
+        if no_cache_policy
+        else (
+            1536
+            if world_size == 8
+            and row_hidden == 1536
+            and not token_2stage
+            and not short_rows
+            else (
+                8192
+                if (
+                    world_size == 4
+                    and token_2stage
+                    and row_hidden > 4096
+                    and row_hidden % 8 != 0
+                )
+                else (
+                    4096
+                    if world_size == 2 or (world_size in (4, 8) and token_2stage)
+                    else 2048
+                )
+            )
+        )
+    )
+    cache_hidden_limit = cache_hidden_limit_default
+    typed_cache_hidden_limit = 0 if no_cache_policy else 8192
+    h8192_blocks = 16
+    weight_cache_hidden_limit = (
+        0
+        if (
+            (
+                world_size == 8
+                and row_hidden == 1536
+                and not token_2stage
+                and not short_rows
+            )
+            or (world_size == 4 and row_hidden == 8192 and (short_rows or small_rows))
+        )
+        else 8192
+    )
+    row_weight_cache = (
+        1 if world_size == 8 and token_2stage and row_hidden == 6144 else 0
+    )
+    row_weight_cache_min_rows = (
+        4096
+        if world_size == 8 and token_2stage and row_hidden == 6144
+        else 512 if world_size == 8 and token_2stage else 2048
+    )
+    row_shared_inv_rms = (
+        1 if world_size == 8 and token_2stage and row_hidden == 1024 else 0
+    )
+    row_warp_inv_rms = 0
+    if row_warp_inv_rms_override >= 0:
+        row_warp_inv_rms = int(row_warp_inv_rms_override)
+    row_skip_end_barrier = 0
+    if row_skip_end_barrier_override >= 0:
+        row_skip_end_barrier = int(row_skip_end_barrier_override)
+    use_row_bypass_load = (
+        (world_size == 4 and token_2stage)
+        or (world_size == 8 and token_2stage and row_hidden == 1536)
+        or (world_size == 8 and token_2stage and row_hidden == 8192)
+    )
+    sums_bypass_load = 3 if use_row_bypass_load else 0
+    tmp_with_residual = (
+        1
+        if token_2stage
+        and (
+            (
+                world_size == 4
+                and (
+                    row_hidden in (512, 1024) or (row_hidden == 4096 and not short_rows)
+                )
+            )
+            or (
+                world_size == 8
+                and (row_hidden == 1536 or (row_hidden in (1024, 2048) and small_rows))
+            )
+        )
+        else 0
+    )
+    warp_rows = 0
+    push_polling = 0
+    if push_polling_override >= 0:
+        push_polling = int(push_polling_override)
+    push_slots = 2
+    push_skip_end_barrier = 0
+    lamport_push = 0
+    if lamport_push_override >= 0:
+        lamport_push = int(lamport_push_override)
+    push_min_rows = 128 if lamport_push else 1
+    push_max_rows = 128
+    lamport_end_barrier = 1
+    small_rows_flag = (
+        1
+        if small_rows
+        and world_size in (2, 4, 8)
+        and (world_size == 2 or token_2stage)
+        and row_hidden in (512, 1024, 2048, 4096)
+        else 0
+    )
+    name = (
+        "sgl_musa_ar_rn_"
+        + _compile_name_short(SHOT_ONE_STAGE, config)
+        + (
+            f"_r2{token_2stage}_s2{shfl_2stage}_p1{packed_1stage}"
+            f"_sp{safe_packed_1stage}_v2{vec2rank_1stage}"
+            f"_rc{regcache_2rank}"
+            f"_c{cache_hidden_limit}_tc{typed_cache_hidden_limit}"
+            f"_cp{cache_policy}"
+            f"_h8{h8192_blocks}"
+            f"_wc{weight_cache_hidden_limit}_rw{row_weight_cache}"
+            f"_rm{row_weight_cache_min_rows}"
+            f"_si{row_shared_inv_rms}_wi{row_warp_inv_rms}"
+            f"_eb{row_skip_end_barrier}"
+            f"_pn8{partial_packed_non8}"
+            f"_vn8{vec2_non8}"
+            f"_v4n8{vec4_non8}"
+            f"_sb{sums_bypass_load}"
+            f"_tr{tmp_with_residual}"
+            f"_wr{warp_rows}"
+            f"_pp{push_polling}"
+            f"_pm{push_min_rows}"
+            f"_px{push_max_rows}"
+            f"_psl{push_slots}"
+            f"_pse{push_skip_end_barrier}"
+            f"_lp{lamport_push}"
+            f"_leb{lamport_end_barrier}"
+            f"_sr{small_rows_flag}"
+            f"_m2_r2s"
+        )
+    )
+    return load_musa_jit(
+        name,
+        ("distributed/custom_all_reduce_rmsnorm.mu",),
+        extra_musa_cflags=_musa_cflags(config)
+        + (
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_TOKEN_2STAGE={token_2stage}",
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_SHFL_2STAGE={shfl_2stage}",
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_PACKED_1STAGE={packed_1stage}",
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_SAFE_PACKED_1STAGE={safe_packed_1stage}",
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_VEC2RANK_1STAGE={vec2rank_1stage}",
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_PARTIAL_PACKED_NON8={partial_packed_non8}",
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_VEC2_NON8={vec2_non8}",
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_VEC4_NON8={vec4_non8}",
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_REGCACHE_2RANK={regcache_2rank}",
+            f"-DSGL_CUSTOM_AR_RMSNORM_CACHE_HIDDEN_LIMIT={cache_hidden_limit}",
+            f"-DSGL_CUSTOM_AR_RMSNORM_T_CACHE_HIDDEN_LIMIT={typed_cache_hidden_limit}",
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_H8192_BLOCKS={h8192_blocks}",
+            f"-DSGL_CUSTOM_AR_RMSNORM_WEIGHT_CACHE_HIDDEN_LIMIT={weight_cache_hidden_limit}",
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_ROW_WEIGHT_CACHE={row_weight_cache}",
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_ROW_WEIGHT_CACHE_MIN_ROWS={row_weight_cache_min_rows}",
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_ROW_SHARED_INV_RMS={row_shared_inv_rms}",
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_ROW_WARP_INV_RMS={row_warp_inv_rms}",
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_ROW_SKIP_END_BARRIER={row_skip_end_barrier}",
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_SUMS_BYPASS_LOAD={sums_bypass_load}",
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_TMP_WITH_RESIDUAL={tmp_with_residual}",
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_WARP_ROWS={warp_rows}",
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_PUSH_POLLING={push_polling}",
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_PUSH_MIN_ROWS={push_min_rows}",
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_PUSH_MAX_ROWS={push_max_rows}",
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_PUSH_SLOTS={push_slots}",
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_PUSH_SKIP_END_BARRIER={push_skip_end_barrier}",
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_LAMPORT_PUSH={lamport_push}",
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_LAMPORT_END_BARRIER={lamport_end_barrier}",
+            f"-DSGL_CUSTOM_AR_FUSED_RMSNORM_SMALL_ROWS={small_rows_flag}",
+        ),
+    )
+
+
 def _compile_name(shot: int, config: CompileConfig) -> str:
     return (
         f"sglang_musa_custom_all_reduce_s{shot}_t{config.threads}_b{config.blocks}"
@@ -357,6 +731,17 @@ def _compile_name(shot: int, config: CompileConfig) -> str:
         f"_pp{config.push_polling}_p16{config.push_16b_asm}"
         f"_ds{config.double_store_2shot}_r2s{config.one_shot_2rank_special}"
         f"_psb{config.push_skip_start_barrier}"
+    )
+
+
+def _compile_name_short(shot: int, config: CompileConfig) -> str:
+    return (
+        f"s{shot}_t{config.threads}_b{config.blocks}"
+        f"_v{config.vector_load}_a{config.atomic_barrier}"
+        f"_m{config.max_blocks}_d{config.dynamic_blocks}"
+        f"_q{config.push_polling}_p{config.push_16b_asm}"
+        f"_ds{config.double_store_2shot}_r{config.one_shot_2rank_special}"
+        f"_ps{config.push_skip_start_barrier}"
     )
 
 
@@ -395,6 +780,60 @@ def _custom_ar_module(world_size: int, shot: int):
         if config.push_16b_asm == 0 or config.push_16b_asm_forced:
             raise
         return _load_custom_ar_module(world_size, shot, replace(config, push_16b_asm=0))
+
+
+@functools.lru_cache(maxsize=96)
+def _custom_ar_fused_rmsnorm_module(
+    world_size: int,
+    short_rows: bool = False,
+    row_hidden: int = 0,
+    small_rows: bool = False,
+    cache_policy: int = 0,
+    row_skip_end_barrier: bool = False,
+    push_polling: int = -1,
+    lamport_push: int = -1,
+    token_2stage_override: int = -1,
+    row_warp_inv_rms_override: int = -1,
+):
+    token_2stage = _fused_rmsnorm_token_2stage(
+        world_size, row_hidden, token_2stage_override
+    )
+    forced_shot = _force_shot()
+    if forced_shot in (SHOT_ONE_STAGE, SHOT_TWO_STAGE, SHOT_TWO_STAGE_512):
+        shot = forced_shot
+    else:
+        shot = SHOT_TWO_STAGE if token_2stage else SHOT_ONE_STAGE
+    config = _compile_config(world_size, shot)
+    try:
+        return _load_custom_ar_fused_rmsnorm_module(
+            world_size,
+            config,
+            short_rows,
+            row_hidden,
+            small_rows,
+            int(cache_policy),
+            int(bool(row_skip_end_barrier)),
+            int(push_polling),
+            int(lamport_push),
+            int(token_2stage_override),
+            int(row_warp_inv_rms_override),
+        )
+    except Exception:
+        if config.push_16b_asm == 0 or config.push_16b_asm_forced:
+            raise
+        return _load_custom_ar_fused_rmsnorm_module(
+            world_size,
+            replace(config, push_16b_asm=0),
+            short_rows,
+            row_hidden,
+            small_rows,
+            int(cache_policy),
+            int(bool(row_skip_end_barrier)),
+            int(push_polling),
+            int(lamport_push),
+            int(token_2stage_override),
+            int(row_warp_inv_rms_override),
+        )
 
 
 @functools.lru_cache(maxsize=32)
@@ -464,6 +903,22 @@ def meta_size(world_size: int = 8) -> int:
         _compile_config(world_size, shot).max_blocks
         for shot in _module_shots(world_size)
     )
+    if world_size in (2, 4, 8):
+        token_2stage = _fused_rmsnorm_token_2stage(world_size)
+        forced_shot = _force_shot()
+        if forced_shot in (SHOT_ONE_STAGE, SHOT_TWO_STAGE, SHOT_TWO_STAGE_512):
+            fused_shot = forced_shot
+        else:
+            fused_shot = SHOT_TWO_STAGE if token_2stage else SHOT_ONE_STAGE
+        base_fused_config = _compile_config(world_size, fused_shot)
+        # The fused RMSNorm kernels compute their scratch base as `signal + 1`,
+        # so every shape-specific fused module in a communicator must agree on
+        # the Signal ABI size.  Otherwise a smaller module writes scratch into
+        # the larger module's counter area during graph replay.
+        max_blocks = max(
+            max_blocks,
+            _fused_rmsnorm_abi_max_blocks(world_size, token_2stage, base_fused_config),
+        )
 
     def align(value: int, alignment: int = 128) -> int:
         return ((value + alignment - 1) // alignment) * alignment
@@ -474,6 +929,9 @@ def meta_size(world_size: int = 8) -> int:
     offset = align(offset) + flag_bytes * max_blocks * max_ranks
     offset = align(offset) + 2 * flag_bytes * max_blocks * max_ranks
     offset = align(offset) + flag_bytes * max_blocks
+    offset = align(offset) + flag_bytes
+    offset = align(offset) + flag_bytes
+    offset = align(offset) + flag_bytes
     return align(offset)
 
 
@@ -574,6 +1032,138 @@ def launch_unregistered_func(world_size: int, shot: int):
     return _custom_ar_module(
         int(world_size), int(shot)
     ).sgl_musa_custom_ar_launch_unregistered
+
+
+def launch_fused_allreduce_rmsnorm_unregistered_func(
+    world_size: int,
+    hidden: int = 0,
+    short_rows: bool = False,
+    small_rows: bool = False,
+    cache_policy: int = 0,
+    row_skip_end_barrier: bool = False,
+    push_polling: int = -1,
+    lamport_push: int = -1,
+    row_warp_inv_rms_override: int = -1,
+):
+    return _custom_ar_fused_rmsnorm_module(
+        int(world_size),
+        bool(short_rows),
+        int(hidden),
+        bool(small_rows),
+        int(cache_policy),
+        bool(row_skip_end_barrier),
+        int(push_polling),
+        int(lamport_push),
+        -1,
+        int(row_warp_inv_rms_override),
+    ).sgl_musa_custom_ar_fused_allreduce_rmsnorm_unregistered
+
+
+def launch_fused_allreduce_rmsnorm_registered_func(
+    world_size: int,
+    hidden: int = 0,
+    short_rows: bool = False,
+    small_rows: bool = False,
+    cache_policy: int = 0,
+    row_skip_end_barrier: bool = False,
+    row_warp_inv_rms_override: int = -1,
+):
+    return _custom_ar_fused_rmsnorm_module(
+        int(world_size),
+        bool(short_rows),
+        int(hidden),
+        bool(small_rows),
+        int(cache_policy),
+        bool(row_skip_end_barrier),
+        0,
+        0,
+        -1,
+        int(row_warp_inv_rms_override),
+    ).sgl_musa_custom_ar_fused_allreduce_rmsnorm_registered
+
+
+def launch_fused_allreduce_residual_unregistered_func(
+    world_size: int, hidden: int = 0, row_warp_inv_rms_override: int = -1
+):
+    return _custom_ar_fused_rmsnorm_module(
+        int(world_size),
+        row_hidden=int(hidden),
+        cache_policy=0,
+        push_polling=0,
+        lamport_push=0,
+        row_warp_inv_rms_override=int(row_warp_inv_rms_override),
+    ).sgl_musa_custom_ar_fused_allreduce_residual_unregistered
+
+
+def launch_fused_allreduce_residual_registered_func(
+    world_size: int, hidden: int = 0, row_warp_inv_rms_override: int = -1
+):
+    return _custom_ar_fused_rmsnorm_module(
+        int(world_size),
+        row_hidden=int(hidden),
+        cache_policy=0,
+        push_polling=0,
+        lamport_push=0,
+        row_warp_inv_rms_override=int(row_warp_inv_rms_override),
+    ).sgl_musa_custom_ar_fused_allreduce_residual_registered
+
+
+def launch_fused_allreduce_residual_sums_registered_func(
+    world_size: int, hidden: int = 0
+):
+    return _custom_ar_fused_rmsnorm_module(
+        int(world_size),
+        row_hidden=int(hidden),
+        cache_policy=0,
+        push_polling=0,
+        lamport_push=0,
+    ).sgl_musa_custom_ar_fused_allreduce_residual_sums_registered
+
+
+def launch_fused_allreduce_rmsnorm_row_registered_func(
+    world_size: int,
+    hidden: int = 0,
+    short_rows: bool = False,
+    small_rows: bool = False,
+    row_skip_end_barrier: bool = False,
+    token_2stage_override: int = 1,
+    row_warp_inv_rms_override: int = -1,
+):
+    return _custom_ar_fused_rmsnorm_module(
+        int(world_size),
+        bool(short_rows),
+        int(hidden),
+        bool(small_rows),
+        0,
+        bool(row_skip_end_barrier),
+        0,
+        0,
+        int(token_2stage_override),
+        int(row_warp_inv_rms_override),
+    ).sgl_musa_custom_ar_fused_allreduce_rmsnorm_row_registered
+
+
+def launch_fused_allreduce_rmsnorm_row_unregistered_func(
+    world_size: int,
+    hidden: int = 0,
+    short_rows: bool = False,
+    small_rows: bool = False,
+    row_skip_end_barrier: bool = False,
+    token_2stage_override: int = 1,
+    row_warp_inv_rms_override: int = -1,
+):
+    return _custom_ar_fused_rmsnorm_module(
+        int(world_size),
+        bool(short_rows),
+        int(hidden),
+        bool(small_rows),
+        0,
+        bool(row_skip_end_barrier),
+        0,
+        0,
+        int(token_2stage_override),
+        int(row_warp_inv_rms_override),
+    ).sgl_musa_custom_ar_fused_allreduce_rmsnorm_row_unregistered
 
 
 def launch_unregistered(

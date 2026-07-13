@@ -74,6 +74,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
+    is_musa,
     is_npu,
     is_sm90_supported,
     is_sm100_supported,
@@ -84,6 +85,7 @@ _is_flashinfer_available = is_flashinfer_available()
 _is_sm90_supported = _is_cuda and is_sm90_supported()
 _is_sm100_supported = _is_cuda and is_sm100_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+_is_musa = is_musa()
 _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
@@ -181,6 +183,18 @@ def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
         and get_tensor_model_parallel_world_size() != 6
         and not is_dp_attention_enabled()
         and get_global_server_args().enable_aiter_allreduce_fusion
+    )
+
+
+def apply_musa_custom_ar_all_reduce_fusion(input_tensor: torch.Tensor):
+    n = input_tensor.shape[-1]
+    total_bytes = input_tensor.numel() * input_tensor.element_size()
+    return (
+        _is_musa
+        and total_bytes > 0
+        and n <= 16384
+        and get_tensor_model_parallel_world_size() in (2, 4, 8)
+        and not is_dp_attention_enabled()
     )
 
 
@@ -520,6 +534,7 @@ class LayerCommunicator:
             ):
                 if (
                     apply_aiter_all_reduce_fusion(hidden_states)
+                    or apply_musa_custom_ar_all_reduce_fusion(hidden_states)
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
                     hidden_states, residual = (
@@ -747,6 +762,12 @@ class LayerCommunicator:
                     and batch_size > 0
                     and get_tensor_model_parallel_world_size() != 6
                     and get_global_server_args().enable_aiter_allreduce_fusion
+                )
+                or (
+                    _is_musa
+                    and batch_size > 0
+                    and get_tensor_model_parallel_world_size() in (2, 4, 8)
+                    and not is_dp_attention_enabled()
                 )
             )
             and (not self.is_last_layer)
@@ -996,6 +1017,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
             handled = False
             if (
                 apply_aiter_all_reduce_fusion(hidden_states)
+                or apply_musa_custom_ar_all_reduce_fusion(hidden_states)
                 or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
             ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(

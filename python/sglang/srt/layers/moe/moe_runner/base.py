@@ -50,6 +50,11 @@ class MoeRunnerConfig:
     gemm1_clamp_limit: Optional[float] = None
     swiglu_limit: Optional[float] = None
 
+    # MUSA mixed-runner policy override. None preserves the standalone Triton
+    # runner's threshold-based fallback; mixed mode sets this explicitly from
+    # the autotuned bucket so a "triton" bucket cannot silently run GEMV.
+    musa_moe_gemv_enabled: Optional[bool] = None
+
 
 @dataclass
 class RunnerInput(ABC):

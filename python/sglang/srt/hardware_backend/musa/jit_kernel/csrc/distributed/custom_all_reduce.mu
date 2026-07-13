@@ -67,6 +67,9 @@ struct alignas(128) Signal {
   alignas(128) FlagType self_counter[kMaxBlocks][kMaxRanks];
   alignas(128) FlagType peer_counter[2][kMaxBlocks][kMaxRanks];
   alignas(128) FlagType push_epoch[kMaxBlocks];
+  alignas(128) FlagType lamport_counter;
+  alignas(128) FlagType lamport_flag;
+  alignas(128) FlagType lamport_clear_packed;
 };
 
 struct __align__(16) RankData {
@@ -578,7 +581,16 @@ __device__ __forceinline__ void shfl_reduce(float* res) {
 
 template <typename T, int nranks, int vlen = 8>
 __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) custom_all_reduce_2shot(
-    RankData data, RankSignals sg, Signal* self_sg, T* __restrict__ out, int rank, int size) {
+    RankData data,
+    const RankData* data_ptr,
+    RankSignals sg,
+    Signal* self_sg,
+    T* __restrict__ out,
+    int rank,
+    int size) {
+  if (data_ptr != nullptr) {
+    data = *data_ptr;
+  }
   constexpr int nranks_sft = (nranks >> 1) - (nranks >> 3);
   constexpr int coalesce_num = 8;
   constexpr int coalesce_sft = 3;
@@ -713,7 +725,17 @@ int select_block_limit(int packed_size, int shot) {
 }
 
 template <typename T, int nranks>
-void launch_ar(RankData data, RankSignals sg, Signal* self_sg, const T* input, T* out, int rank, int size, int shot, musaStream_t stream) {
+void launch_ar(
+    RankData data,
+    const RankData* data_ptr,
+    RankSignals sg,
+    Signal* self_sg,
+    const T* input,
+    T* out,
+    int rank,
+    int size,
+    int shot,
+    musaStream_t stream) {
   const int pack = packed_t<T>::P::size;
   TVM_FFI_ICHECK_EQ(size % pack, 0);
   int packed_size = size / pack;
@@ -734,7 +756,8 @@ void launch_ar(RankData data, RankSignals sg, Signal* self_sg, const T* input, T
     if constexpr (std::is_same<T, float>::value) {
       cross_device_reduce_2stage<T, nranks><<<blocks, kDefaultThreads, 0, stream>>>(data, sg, self_sg, out, rank, packed_size);
     } else {
-      custom_all_reduce_2shot<T, nranks><<<blocks, kDefaultThreads, 0, stream>>>(data, sg, self_sg, out, rank, packed_size);
+      custom_all_reduce_2shot<T, nranks><<<blocks, kDefaultThreads, 0, stream>>>(
+          data, data_ptr, sg, self_sg, out, rank, packed_size);
     }
   } else {
     TVM_FFI_THROW(ValueError) << "shot must be 0, 1, 2, 3, or 4";
@@ -742,19 +765,30 @@ void launch_ar(RankData data, RankSignals sg, Signal* self_sg, const T* input, T
 }
 
 template <typename T>
-void dispatch_world_size(RankData data, RankSignals sg, Signal* self_sg, const T* input, T* out, int rank, int world_size, int size, int shot, musaStream_t stream) {
+void dispatch_world_size(
+    RankData data,
+    const RankData* data_ptr,
+    RankSignals sg,
+    Signal* self_sg,
+    const T* input,
+    T* out,
+    int rank,
+    int world_size,
+    int size,
+    int shot,
+    musaStream_t stream) {
   switch (world_size) {
     case 2:
-      launch_ar<T, 2>(data, sg, self_sg, input, out, rank, size, shot, stream);
+      launch_ar<T, 2>(data, data_ptr, sg, self_sg, input, out, rank, size, shot, stream);
       break;
     case 4:
-      launch_ar<T, 4>(data, sg, self_sg, input, out, rank, size, shot, stream);
+      launch_ar<T, 4>(data, data_ptr, sg, self_sg, input, out, rank, size, shot, stream);
       break;
     case 6:
-      launch_ar<T, 6>(data, sg, self_sg, input, out, rank, size, shot, stream);
+      launch_ar<T, 6>(data, data_ptr, sg, self_sg, input, out, rank, size, shot, stream);
       break;
     case 8:
-      launch_ar<T, 8>(data, sg, self_sg, input, out, rank, size, shot, stream);
+      launch_ar<T, 8>(data, data_ptr, sg, self_sg, input, out, rank, size, shot, stream);
       break;
     default:
       TVM_FFI_THROW(ValueError) << "world_size must be one of 2/4/6/8";
@@ -786,7 +820,10 @@ void sgl_musa_custom_ar_launch(
     int64_t world_size,
     int64_t shot) {
   CHECK_MUSA_CONTIGUOUS(out);
-  TVM_FFI_ICHECK_EQ(rank_data.device().device_type, kDLCPU);
+  const bool rank_data_on_cpu = rank_data.device().device_type == kDLCPU;
+  const bool rank_data_on_musa =
+      rank_data.device().device_type == out.device().device_type;
+  TVM_FFI_ICHECK(rank_data_on_cpu || rank_data_on_musa);
   TVM_FFI_ICHECK(rank_data.IsContiguous());
   TVM_FFI_ICHECK(dtype_equal(rank_data.dtype(), dl_int64));
   TVM_FFI_ICHECK_GE(rank_data.size(0), kMaxRanks);
@@ -802,9 +839,15 @@ void sgl_musa_custom_ar_launch(
     sg.signals[i] = reinterpret_cast<Signal*>(ptrs[i]);
   }
   RankData data{};
-  const auto* rank_ptrs = static_cast<const int64_t*>(rank_data.data_ptr());
-  for (int i = 0; i < kMaxRanks; ++i) {
-    data.ptrs[i] = reinterpret_cast<const void*>(rank_ptrs[i]);
+  const RankData* device_data_ptr = nullptr;
+  if (rank_data_on_cpu) {
+    const auto* rank_ptrs = static_cast<const int64_t*>(rank_data.data_ptr());
+    for (int i = 0; i < kMaxRanks; ++i) {
+      data.ptrs[i] = reinterpret_cast<const void*>(rank_ptrs[i]);
+    }
+  } else {
+    TVM_FFI_ICHECK_EQ(rank_data.device().device_id, out.device().device_id);
+    device_data_ptr = reinterpret_cast<const RankData*>(rank_data.data_ptr());
   }
   auto* self_sg = reinterpret_cast<Signal*>(self_signal_ptr);
   auto stream = get_stream(out.device());
@@ -814,13 +857,13 @@ void sgl_musa_custom_ar_launch(
 
   if (dtype_equal(out.dtype(), dl_float16)) {
     auto* out_ptr = static_cast<half*>(out.data_ptr());
-    dispatch_world_size(data, sg, self_sg, out_ptr, out_ptr, static_cast<int>(rank), static_cast<int>(world_size), size, static_cast<int>(shot), stream);
+    dispatch_world_size(data, device_data_ptr, sg, self_sg, out_ptr, out_ptr, static_cast<int>(rank), static_cast<int>(world_size), size, static_cast<int>(shot), stream);
   } else if (dtype_equal(out.dtype(), dl_bfloat16)) {
     auto* out_ptr = static_cast<__mt_bfloat16*>(out.data_ptr());
-    dispatch_world_size(data, sg, self_sg, out_ptr, out_ptr, static_cast<int>(rank), static_cast<int>(world_size), size, static_cast<int>(shot), stream);
+    dispatch_world_size(data, device_data_ptr, sg, self_sg, out_ptr, out_ptr, static_cast<int>(rank), static_cast<int>(world_size), size, static_cast<int>(shot), stream);
   } else if (dtype_equal(out.dtype(), dl_float32)) {
     auto* out_ptr = static_cast<float*>(out.data_ptr());
-    dispatch_world_size(data, sg, self_sg, out_ptr, out_ptr, static_cast<int>(rank), static_cast<int>(world_size), size, static_cast<int>(shot), stream);
+    dispatch_world_size(data, device_data_ptr, sg, self_sg, out_ptr, out_ptr, static_cast<int>(rank), static_cast<int>(world_size), size, static_cast<int>(shot), stream);
   } else {
     TVM_FFI_THROW(ValueError) << "custom ar only supports fp16/bf16/fp32";
   }
@@ -884,11 +927,11 @@ void sgl_musa_custom_ar_launch_unregistered(
   const int size = static_cast<int>(numel64);
 
   if (dtype_equal(out.dtype(), dl_float16)) {
-    dispatch_world_size(data, sg, self_sg, static_cast<const half*>(inp.data_ptr()), static_cast<half*>(out.data_ptr()), static_cast<int>(rank), static_cast<int>(world_size), size, static_cast<int>(shot), stream);
+    dispatch_world_size(data, nullptr, sg, self_sg, static_cast<const half*>(inp.data_ptr()), static_cast<half*>(out.data_ptr()), static_cast<int>(rank), static_cast<int>(world_size), size, static_cast<int>(shot), stream);
   } else if (dtype_equal(out.dtype(), dl_bfloat16)) {
-    dispatch_world_size(data, sg, self_sg, static_cast<const __mt_bfloat16*>(inp.data_ptr()), static_cast<__mt_bfloat16*>(out.data_ptr()), static_cast<int>(rank), static_cast<int>(world_size), size, static_cast<int>(shot), stream);
+    dispatch_world_size(data, nullptr, sg, self_sg, static_cast<const __mt_bfloat16*>(inp.data_ptr()), static_cast<__mt_bfloat16*>(out.data_ptr()), static_cast<int>(rank), static_cast<int>(world_size), size, static_cast<int>(shot), stream);
   } else if (dtype_equal(out.dtype(), dl_float32)) {
-    dispatch_world_size(data, sg, self_sg, static_cast<const float*>(inp.data_ptr()), static_cast<float*>(out.data_ptr()), static_cast<int>(rank), static_cast<int>(world_size), size, static_cast<int>(shot), stream);
+    dispatch_world_size(data, nullptr, sg, self_sg, static_cast<const float*>(inp.data_ptr()), static_cast<float*>(out.data_ptr()), static_cast<int>(rank), static_cast<int>(world_size), size, static_cast<int>(shot), stream);
   } else {
     TVM_FFI_THROW(ValueError) << "custom ar only supports fp16/bf16/fp32";
   }
@@ -945,13 +988,13 @@ void sgl_musa_custom_ar_launch_context(
 
   if (dtype_equal(out.dtype(), dl_float16)) {
     auto* out_ptr = static_cast<half*>(out.data_ptr());
-    dispatch_world_size(ctx->data, ctx->sg, ctx->self_sg, out_ptr, out_ptr, ctx->rank, ctx->world_size, size, static_cast<int>(shot), stream);
+    dispatch_world_size(ctx->data, nullptr, ctx->sg, ctx->self_sg, out_ptr, out_ptr, ctx->rank, ctx->world_size, size, static_cast<int>(shot), stream);
   } else if (dtype_equal(out.dtype(), dl_bfloat16)) {
     auto* out_ptr = static_cast<__mt_bfloat16*>(out.data_ptr());
-    dispatch_world_size(ctx->data, ctx->sg, ctx->self_sg, out_ptr, out_ptr, ctx->rank, ctx->world_size, size, static_cast<int>(shot), stream);
+    dispatch_world_size(ctx->data, nullptr, ctx->sg, ctx->self_sg, out_ptr, out_ptr, ctx->rank, ctx->world_size, size, static_cast<int>(shot), stream);
   } else if (dtype_equal(out.dtype(), dl_float32)) {
     auto* out_ptr = static_cast<float*>(out.data_ptr());
-    dispatch_world_size(ctx->data, ctx->sg, ctx->self_sg, out_ptr, out_ptr, ctx->rank, ctx->world_size, size, static_cast<int>(shot), stream);
+    dispatch_world_size(ctx->data, nullptr, ctx->sg, ctx->self_sg, out_ptr, out_ptr, ctx->rank, ctx->world_size, size, static_cast<int>(shot), stream);
   } else {
     TVM_FFI_THROW(ValueError) << "custom ar only supports fp16/bf16/fp32";
   }
@@ -970,11 +1013,11 @@ extern "C" void sgl_musa_custom_ar_launch_context_raw_nocheck(
   auto stream = reinterpret_cast<musaStream_t>(stream_value);
   const int size = static_cast<int>(numel);
   if (dtype_code == 0) {
-    dispatch_world_size(ctx->data, ctx->sg, ctx->self_sg, static_cast<half*>(out), static_cast<half*>(out), ctx->rank, ctx->world_size, size, static_cast<int>(shot), stream);
+    dispatch_world_size(ctx->data, nullptr, ctx->sg, ctx->self_sg, static_cast<half*>(out), static_cast<half*>(out), ctx->rank, ctx->world_size, size, static_cast<int>(shot), stream);
   } else if (dtype_code == 1) {
-    dispatch_world_size(ctx->data, ctx->sg, ctx->self_sg, static_cast<__mt_bfloat16*>(out), static_cast<__mt_bfloat16*>(out), ctx->rank, ctx->world_size, size, static_cast<int>(shot), stream);
+    dispatch_world_size(ctx->data, nullptr, ctx->sg, ctx->self_sg, static_cast<__mt_bfloat16*>(out), static_cast<__mt_bfloat16*>(out), ctx->rank, ctx->world_size, size, static_cast<int>(shot), stream);
   } else {
-    dispatch_world_size(ctx->data, ctx->sg, ctx->self_sg, static_cast<float*>(out), static_cast<float*>(out), ctx->rank, ctx->world_size, size, static_cast<int>(shot), stream);
+    dispatch_world_size(ctx->data, nullptr, ctx->sg, ctx->self_sg, static_cast<float*>(out), static_cast<float*>(out), ctx->rank, ctx->world_size, size, static_cast<int>(shot), stream);
   }
 }
 
@@ -1013,11 +1056,11 @@ extern "C" void sgl_musa_custom_ar_launch_unregistered_raw_nocheck(
   }
 
   if (dtype_code == 0) {
-    dispatch_world_size(data, sg, self_sg, static_cast<const half*>(inp), static_cast<half*>(out), static_cast<int>(rank), static_cast<int>(world_size), size, static_cast<int>(shot), stream);
+    dispatch_world_size(data, nullptr, sg, self_sg, static_cast<const half*>(inp), static_cast<half*>(out), static_cast<int>(rank), static_cast<int>(world_size), size, static_cast<int>(shot), stream);
   } else if (dtype_code == 1) {
-    dispatch_world_size(data, sg, self_sg, static_cast<const __mt_bfloat16*>(inp), static_cast<__mt_bfloat16*>(out), static_cast<int>(rank), static_cast<int>(world_size), size, static_cast<int>(shot), stream);
+    dispatch_world_size(data, nullptr, sg, self_sg, static_cast<const __mt_bfloat16*>(inp), static_cast<__mt_bfloat16*>(out), static_cast<int>(rank), static_cast<int>(world_size), size, static_cast<int>(shot), stream);
   } else {
-    dispatch_world_size(data, sg, self_sg, static_cast<const float*>(inp), static_cast<float*>(out), static_cast<int>(rank), static_cast<int>(world_size), size, static_cast<int>(shot), stream);
+    dispatch_world_size(data, nullptr, sg, self_sg, static_cast<const float*>(inp), static_cast<float*>(out), static_cast<int>(rank), static_cast<int>(world_size), size, static_cast<int>(shot), stream);
   }
 }
 
@@ -1064,11 +1107,11 @@ extern "C" void sgl_musa_custom_ar_launch_unregistered_context_raw_nocheck(
   }
 
   if (dtype_code == 0) {
-    dispatch_world_size(ctx->data, ctx->sg, ctx->self_sg, static_cast<const half*>(ctx->input), static_cast<half*>(out), ctx->rank, ctx->world_size, size, static_cast<int>(shot), stream);
+    dispatch_world_size(ctx->data, nullptr, ctx->sg, ctx->self_sg, static_cast<const half*>(ctx->input), static_cast<half*>(out), ctx->rank, ctx->world_size, size, static_cast<int>(shot), stream);
   } else if (dtype_code == 1) {
-    dispatch_world_size(ctx->data, ctx->sg, ctx->self_sg, static_cast<const __mt_bfloat16*>(ctx->input), static_cast<__mt_bfloat16*>(out), ctx->rank, ctx->world_size, size, static_cast<int>(shot), stream);
+    dispatch_world_size(ctx->data, nullptr, ctx->sg, ctx->self_sg, static_cast<const __mt_bfloat16*>(ctx->input), static_cast<__mt_bfloat16*>(out), ctx->rank, ctx->world_size, size, static_cast<int>(shot), stream);
   } else {
-    dispatch_world_size(ctx->data, ctx->sg, ctx->self_sg, static_cast<const float*>(ctx->input), static_cast<float*>(out), ctx->rank, ctx->world_size, size, static_cast<int>(shot), stream);
+    dispatch_world_size(ctx->data, nullptr, ctx->sg, ctx->self_sg, static_cast<const float*>(ctx->input), static_cast<float*>(out), ctx->rank, ctx->world_size, size, static_cast<int>(shot), stream);
   }
 }
 

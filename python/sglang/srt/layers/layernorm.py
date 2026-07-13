@@ -132,9 +132,16 @@ def _forward_with_allreduce_fusion(
     """Shared allreduce-fused RMSNorm logic usable by any norm."""
     if residual is not None:
         from sglang.srt.distributed import (
+            attention_tensor_model_parallel_all_reduce,
+            attention_tensor_model_parallel_fused_allreduce_rmsnorm,
             get_attn_tensor_model_parallel_world_size,
             get_moe_expert_parallel_world_size,
             get_moe_tensor_parallel_world_size,
+            get_tensor_model_parallel_world_size,
+            moe_expert_parallel_all_reduce,
+            moe_expert_parallel_fused_allreduce_rmsnorm,
+            moe_tensor_model_parallel_all_reduce,
+            moe_tensor_model_parallel_fused_allreduce_rmsnorm,
             tensor_model_parallel_all_reduce,
             tensor_model_parallel_fused_allreduce_rmsnorm,
         )
@@ -144,24 +151,39 @@ def _forward_with_allreduce_fusion(
 
         if use_attn_tp_group:
             world_size = get_attn_tensor_model_parallel_world_size()
+            all_reduce = attention_tensor_model_parallel_all_reduce
+            fused_allreduce_rmsnorm = (
+                attention_tensor_model_parallel_fused_allreduce_rmsnorm
+            )
         else:
             if get_moe_expert_parallel_world_size() > 1:
                 world_size = get_moe_expert_parallel_world_size()
-            else:
+                all_reduce = moe_expert_parallel_all_reduce
+                fused_allreduce_rmsnorm = moe_expert_parallel_fused_allreduce_rmsnorm
+            elif get_moe_tensor_parallel_world_size() > 1:
                 world_size = get_moe_tensor_parallel_world_size()
+                all_reduce = moe_tensor_model_parallel_all_reduce
+                fused_allreduce_rmsnorm = (
+                    moe_tensor_model_parallel_fused_allreduce_rmsnorm
+                )
+            else:
+                world_size = get_tensor_model_parallel_world_size()
+                all_reduce = tensor_model_parallel_all_reduce
+                fused_allreduce_rmsnorm = tensor_model_parallel_fused_allreduce_rmsnorm
 
         if world_size > 1:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
 
-            # Prefer AITER fused AR+RMSNorm when enabled on AMD.
-            if _use_aiter:
-                fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
+            # Prefer platform-native fused AR+RMSNorm when available.
+            if _use_aiter or _is_musa:
+                fused_result = fused_allreduce_rmsnorm(
                     x, residual, weight, norm_module.variance_epsilon
                 )
                 if fused_result is not None:
                     return fused_result
-            else:
+
+            if not _use_aiter and not _is_musa:
                 fused_result = flashinfer_allreduce_residual_rmsnorm(
                     input_tensor=x,
                     residual=residual,
@@ -174,8 +196,11 @@ def _forward_with_allreduce_fusion(
 
             # For AITER route, preserve correctness when fused path is unavailable.
             if _use_aiter and get_global_server_args().enable_aiter_allreduce_fusion:
-                x = tensor_model_parallel_all_reduce(x)
+                x = all_reduce(x)
                 return norm_module.forward(x, residual, None)
+
+            x = all_reduce(x)
+            return norm_module.forward(x, residual, None)
 
     return norm_module.forward(x, residual, post_residual_addition)
 
@@ -711,7 +736,7 @@ class GemmaRMSNorm(MultiPlatformOp):
             residual,
             post_residual_addition,
             self.gemma_weight,
-            use_attn_tp_group=True,
+            use_attn_tp_group=use_attn_tp_group,
         )
 
 

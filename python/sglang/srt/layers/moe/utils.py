@@ -58,6 +58,24 @@ def _apply_deep_gemm_bucket(deep_gemm_runner: Any, bucket: MusaMoeBucket) -> Any
     return runner
 
 
+def _apply_triton_bucket(triton_runner: Any, bucket: MusaMoeBucket) -> Any:
+    """Return a cached Triton variant whose GEMV choice follows the bucket."""
+    gemv_enabled = bucket.backend == "gemv"
+    cache_name = "_musa_moe_gemv_runner" if gemv_enabled else "_musa_moe_triton_runner"
+    runner = getattr(triton_runner, cache_name, None)
+    if runner is not None:
+        return runner
+
+    runner = copy(triton_runner)
+    runner.config = copy(triton_runner.config)
+    runner.config.musa_moe_gemv_enabled = gemv_enabled
+    if getattr(triton_runner, "runner_core", None) is not None:
+        runner.runner_core = copy(triton_runner.runner_core)
+        runner.runner_core.config = runner.config
+    setattr(triton_runner, cache_name, runner)
+    return runner
+
+
 def select_musa_moe_runner(
     num_tokens: int,
     triton_runner: Any,
@@ -67,11 +85,11 @@ def select_musa_moe_runner(
         for bucket in _MUSA_MOE_BUCKET_POLICY:
             if num_tokens <= bucket.max_tokens:
                 if bucket.backend in ("triton", "gemv"):
-                    return triton_runner
+                    return _apply_triton_bucket(triton_runner, bucket)
                 return _apply_deep_gemm_bucket(deep_gemm_runner, bucket)
         last_bucket = _MUSA_MOE_BUCKET_POLICY[-1]
         if last_bucket.backend in ("triton", "gemv"):
-            return triton_runner
+            return _apply_triton_bucket(triton_runner, last_bucket)
         return _apply_deep_gemm_bucket(deep_gemm_runner, last_bucket)
 
     return triton_runner
