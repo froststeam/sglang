@@ -29,9 +29,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+PIP_INDEX_URL="${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple}"
 PIP_TIMEOUT="${PIP_TIMEOUT:-30}"
 PIP_RETRIES="${PIP_RETRIES:-2}"
+SGLANG_CI_PIP_VERBOSE="${SGLANG_CI_PIP_VERBOSE:-0}"
 PIP_INSTALL=(
   python3 -m pip install
   --index-url "${PIP_INDEX_URL}"
@@ -287,9 +288,15 @@ install_checkout_sglang_extra() {
   fi
 
   echo "Install checkout SGLang ${extra} extra..."
-  EXTRA_INSTALL_ARGS=(-v "./python[${extra}]" --user)
+  EXTRA_INSTALL_ARGS=("./python[${extra}]" --user)
+  if [ "${SGLANG_CI_PIP_VERBOSE}" = "1" ]; then
+    EXTRA_INSTALL_ARGS=(-v "${EXTRA_INSTALL_ARGS[@]}")
+  fi
   if [ "${SGLANG_CI_EDITABLE_INSTALL}" = "1" ]; then
-    EXTRA_INSTALL_ARGS=(-v -e "./python[${extra}]" --user)
+    EXTRA_INSTALL_ARGS=(-e "./python[${extra}]" --user)
+    if [ "${SGLANG_CI_PIP_VERBOSE}" = "1" ]; then
+      EXTRA_INSTALL_ARGS=(-v "${EXTRA_INSTALL_ARGS[@]}")
+    fi
   fi
   (cd "${REPO_ROOT}" && "${PIP_INSTALL[@]}" "${EXTRA_INSTALL_ARGS[@]}")
 }
@@ -344,6 +351,7 @@ echo "  install sglang dependencies: ${SGLANG_CI_INSTALL_DEPS}"
 echo "  install system build dependencies: ${SGLANG_CI_INSTALL_SYSTEM_DEPS}"
 echo "  upgrade pip tools: ${SGLANG_CI_UPGRADE_PIP_TOOLS}"
 echo "  upgrade torchada: ${SGLANG_CI_UPGRADE_TORCHADA}"
+echo "  pip verbose: ${SGLANG_CI_PIP_VERBOSE}"
 echo "  install lock timeout seconds: ${SGLANG_CI_INSTALL_LOCK_TIMEOUT_SECONDS}"
 echo "  ci test packages: ${SGLANG_CI_TEST_PACKAGES}"
 echo "  install lmms-eval: ${SGLANG_CI_INSTALL_LMMS_EVAL}"
@@ -482,9 +490,15 @@ EXTRAS="dev_musa"
 if [ -n "${OPTIONAL_DEPS}" ]; then
   EXTRAS="${EXTRAS},${OPTIONAL_DEPS}"
 fi
-SGLANG_INSTALL_ARGS=(-v "./python[${EXTRAS}]" --user)
+SGLANG_INSTALL_ARGS=("./python[${EXTRAS}]" --user)
+if [ "${SGLANG_CI_PIP_VERBOSE}" = "1" ]; then
+  SGLANG_INSTALL_ARGS=(-v "${SGLANG_INSTALL_ARGS[@]}")
+fi
 if [ "${SGLANG_CI_EDITABLE_INSTALL}" = "1" ]; then
-  SGLANG_INSTALL_ARGS=(-v -e "./python[${EXTRAS}]" --user)
+  SGLANG_INSTALL_ARGS=(-e "./python[${EXTRAS}]" --user)
+  if [ "${SGLANG_CI_PIP_VERBOSE}" = "1" ]; then
+    SGLANG_INSTALL_ARGS=(-v "${SGLANG_INSTALL_ARGS[@]}")
+  fi
 fi
 if [ "${SGLANG_CI_INSTALL_DEPS}" != "1" ]; then
   SGLANG_INSTALL_ARGS+=(--no-deps)

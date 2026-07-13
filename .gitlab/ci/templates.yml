@@ -98,7 +98,13 @@
   variables:
     PYTHONUSERBASE: "/data/gitlab-ci/python-user-base/${CI_PROJECT_PATH_SLUG}/${CI_COMMIT_SHA}"
   script:
-    - bash scripts/ci/musa/ci_install_dependency.sh
+    - mkdir -p ci_artifacts/musa-install-dependency
+    - set -o pipefail; bash scripts/ci/musa/ci_install_dependency.sh 2>&1 | tee ci_artifacts/musa-install-dependency/install.log
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - ci_artifacts/musa-install-dependency/
 
 .musa-benchmark-correctness-job:
   stage: stage-a
@@ -138,7 +144,7 @@
       if [ -n "${MUSA_RUN_SUITE_EXTRA_PIP_PACKAGES:-}" ]; then
         python3 -m pip install \
           --user \
-          --index-url "${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" \
+          --index-url "${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple}" \
           --timeout "${PIP_TIMEOUT:-30}" \
           --retries "${PIP_RETRIES:-2}" \
           --cache-dir "${PIP_CACHE_DIR:-/data/gitlab-ci/pip-cache}" \

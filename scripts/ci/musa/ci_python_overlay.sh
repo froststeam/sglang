@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+PIP_INDEX_URL="${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple}"
 PIP_TIMEOUT="${PIP_TIMEOUT:-30}"
 PIP_RETRIES="${PIP_RETRIES:-2}"
 PIP_CACHE_DIR="${PIP_CACHE_DIR:-/data/gitlab-ci/pip-cache}"
