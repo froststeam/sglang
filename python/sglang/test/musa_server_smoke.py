@@ -601,6 +601,9 @@ class MusaServerSmokeTest(CustomTestCase):
                 other_args=server_args,
                 return_stdout_stderr=cls.server_log_files,
                 device="musa",
+                health_endpoint=os.getenv(
+                    "MUSA_SMOKE_SERVER_HEALTH_ENDPOINT", "/health_generate"
+                ),
             )
         except Exception:
             _close_server_log_files(cls.server_log_files)

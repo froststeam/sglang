@@ -778,6 +778,7 @@ def _wait_for_server_health(
     base_url: str,
     api_key: Optional[str],
     timeout_duration: float,
+    health_endpoint: str = "/health_generate",
 ) -> Tuple[bool, Optional[str]]:
     """Wait for server health check to pass.
 
@@ -786,6 +787,7 @@ def _wait_for_server_health(
         base_url: Base URL for health check
         api_key: Optional API key for authorization
         timeout_duration: Maximum wait time in seconds
+        health_endpoint: Health endpoint path
 
     Returns:
         Tuple of (success, error_message)
@@ -803,7 +805,7 @@ def _wait_for_server_health(
                     "Authorization": f"Bearer {api_key}",
                 }
                 response = session.get(
-                    f"{base_url}/health_generate",
+                    f"{base_url}{health_endpoint}",
                     headers=headers,
                     timeout=5,
                 )
@@ -832,6 +834,7 @@ def popen_launch_server(
     device: str = "auto",
     pd_separated: bool = False,
     num_replicas: Optional[int] = None,
+    health_endpoint: str = "/health_generate",
 ):
     """Launch a server process with automatic device detection and offline/online retry.
 
@@ -846,6 +849,7 @@ def popen_launch_server(
         device: Device type ("auto", "cuda", "rocm" or "cpu")
         pd_separated: Whether to use PD separated mode
         num_replicas: Number of replicas for mixed PD mode
+        health_endpoint: Health endpoint path used to wait for startup
 
     Returns:
         Started subprocess.Popen object
@@ -919,7 +923,9 @@ def popen_launch_server(
 
     # First launch attempt
     process = _launch_server_process(command, env, return_stdout_stderr, model)
-    success, error_msg = _wait_for_server_health(process, base_url, api_key, timeout)
+    success, error_msg = _wait_for_server_health(
+        process, base_url, api_key, timeout, health_endpoint
+    )
 
     # If offline launch failed and offline was enabled, retry with online mode
     if not success and offline_enabled:
@@ -948,7 +954,7 @@ def popen_launch_server(
         env["HF_HUB_OFFLINE"] = "0"
         process = _launch_server_process(command, env, return_stdout_stderr, model)
         success, error_msg = _wait_for_server_health(
-            process, base_url, api_key, timeout
+            process, base_url, api_key, timeout, health_endpoint
         )
 
         if success:
