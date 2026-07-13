@@ -94,7 +94,7 @@
 
 .musa-install-dependency-job:
   stage: mr-setup
-  timeout: 30m
+  timeout: 60m
   variables:
     PYTHONUSERBASE: "/data/gitlab-ci/python-user-base/${CI_PROJECT_PATH_SLUG}/${CI_COMMIT_SHA}"
   script:

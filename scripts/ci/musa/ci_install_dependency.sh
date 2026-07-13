@@ -50,15 +50,18 @@ MUSA_CI_SSH_KNOWN_HOSTS="${MUSA_CI_SSH_KNOWN_HOSTS:-sh-code.mthreads.com}"
 TORCH_VERSION="${TORCH_VERSION:-2.9.0}"
 SGLANG_CI_INSTALL_DEPS="${SGLANG_CI_INSTALL_DEPS:-1}"
 SGLANG_CI_INSTALL_SYSTEM_DEPS="${SGLANG_CI_INSTALL_SYSTEM_DEPS:-1}"
+SGLANG_CI_UPGRADE_PIP_TOOLS="${SGLANG_CI_UPGRADE_PIP_TOOLS:-0}"
 SGLANG_CI_UPGRADE_TORCHADA="${SGLANG_CI_UPGRADE_TORCHADA:-1}"
+SGLANG_CI_INSTALL_LOCK_TIMEOUT_SECONDS="${SGLANG_CI_INSTALL_LOCK_TIMEOUT_SECONDS:-3600}"
 SGLANG_CI_TEST_PACKAGES="${SGLANG_CI_TEST_PACKAGES:-pytest tabulate}"
 SGLANG_CI_INSTALL_LMMS_EVAL="${SGLANG_CI_INSTALL_LMMS_EVAL:-1}"
 LMMS_EVAL_PACKAGE_SPEC="${LMMS_EVAL_PACKAGE_SPEC:-lmms-eval==0.5.0}"
-LMMS_EVAL_RUNTIME_DEPS="${LMMS_EVAL_RUNTIME_DEPS:-evaluate>=0.4.0 pytablewriter sacrebleu>=1.5.0 sqlitedict==2.1.0 tenacity==8.3.0 python-dotenv}"
+LMMS_EVAL_RUNTIME_DEPS="${LMMS_EVAL_RUNTIME_DEPS:-evaluate>=0.4.0 pytablewriter sacrebleu>=1.5.0 sqlitedict==2.1.0 tenacity==8.3.0 python-dotenv decord qwen-vl-utils>=0.0.14 numexpr zstandard pycocoevalcap nltk hf_transfer yt-dlp ftfy latex2sympy2 openpyxl}"
 SGLANG_CI_EDITABLE_INSTALL="${SGLANG_CI_EDITABLE_INSTALL:-0}"
 MUSA_CI_CLEAN_PYTHONUSERBASE="${MUSA_CI_CLEAN_PYTHONUSERBASE:-1}"
 MUSA_CI_PYTHONUSERBASE_ROOT="${MUSA_CI_PYTHONUSERBASE_ROOT:-/data/gitlab-ci/python-user-base}"
 MUSA_CI_PYTHONUSERBASE_TTL_DAYS="${MUSA_CI_PYTHONUSERBASE_TTL_DAYS:-7}"
+MUSA_CI_PYTHONUSERBASE_TRASH_ROOT="${MUSA_CI_PYTHONUSERBASE_TRASH_ROOT:-${MUSA_CI_PYTHONUSERBASE_ROOT}/.trash}"
 MUSA_CI_CLEAN_STALE_JIT_LOCKS="${MUSA_CI_CLEAN_STALE_JIT_LOCKS:-1}"
 MUSA_CI_STALE_JIT_LOCK_MIN_AGE_SECONDS="${MUSA_CI_STALE_JIT_LOCK_MIN_AGE_SECONDS:-600}"
 export MUSA_CI_CLEAN_STALE_JIT_LOCKS
@@ -69,6 +72,9 @@ export PYTHONUSERBASE
 export PATH="${PYTHONUSERBASE}/bin:${PATH}"
 export PIP_CACHE_DIR
 mkdir -p "${PIP_CACHE_DIR}"
+MUSA_CI_INSTALL_DONE="${PYTHONUSERBASE}/.install.done"
+MUSA_CI_INSTALL_LOCK="${PYTHONUSERBASE}/.install.lock"
+MUSA_CI_INSTALL_LOCK_HELD=""
 
 cleanup_old_python_user_base() {
   if [ "${MUSA_CI_CLEAN_PYTHONUSERBASE}" != "1" ]; then
@@ -80,17 +86,118 @@ cleanup_old_python_user_base() {
     return
   fi
 
-  echo "Clean old PYTHONUSERBASE dirs older than ${MUSA_CI_PYTHONUSERBASE_TTL_DAYS} days under ${MUSA_CI_PYTHONUSERBASE_ROOT}"
-  find "${MUSA_CI_PYTHONUSERBASE_ROOT}" \
-    -mindepth 3 \
-    -maxdepth 3 \
-    -type d \
-    -mtime +"${MUSA_CI_PYTHONUSERBASE_TTL_DAYS}" \
-    -print \
-    -exec rm -rf {} +
+  local cleanup_project_root=""
+  local current_cleanup_root=""
+  case "${PYTHONUSERBASE}" in
+    "${MUSA_CI_PYTHONUSERBASE_ROOT}"/*/* | "${MUSA_CI_PYTHONUSERBASE_ROOT}"/*/*/*)
+      read -r cleanup_project_root current_cleanup_root < <(
+        python3 - "${MUSA_CI_PYTHONUSERBASE_ROOT}" "${PYTHONUSERBASE}" <<'PY'
+import os
+import sys
+
+root = os.path.abspath(sys.argv[1])
+userbase = os.path.abspath(sys.argv[2])
+try:
+    rel = os.path.relpath(userbase, root)
+except ValueError:
+    sys.exit(0)
+parts = rel.split(os.sep)
+if len(parts) >= 2 and parts[0] != os.pardir:
+    print(os.path.join(root, parts[0]), os.path.join(root, parts[0], parts[1]))
+PY
+      )
+      ;;
+  esac
+  if [ -z "${cleanup_project_root}" ]; then
+    cleanup_project_root="${MUSA_CI_PYTHONUSERBASE_ROOT}/${CI_PROJECT_PATH_SLUG:-sglang}"
+  fi
+  if [ ! -d "${cleanup_project_root}" ]; then
+    return
+  fi
+
+  echo "Move old PYTHONUSERBASE dirs older than ${MUSA_CI_PYTHONUSERBASE_TTL_DAYS} days under ${cleanup_project_root} to ${MUSA_CI_PYTHONUSERBASE_TRASH_ROOT}"
+  find_args=(
+    "${cleanup_project_root}"
+    -mindepth 1
+    -maxdepth 1
+    -type d
+    -mtime +"${MUSA_CI_PYTHONUSERBASE_TTL_DAYS}"
+  )
+  if [ -n "${current_cleanup_root}" ]; then
+    find_args+=( ! -path "${current_cleanup_root}" )
+  fi
+  mkdir -p "${MUSA_CI_PYTHONUSERBASE_TRASH_ROOT}"
+  while IFS= read -r -d '' stale_dir; do
+    local stale_base
+    local stale_dest
+    stale_base="$(basename "${stale_dir}")"
+    stale_dest="${MUSA_CI_PYTHONUSERBASE_TRASH_ROOT}/${CI_PROJECT_PATH_SLUG:-sglang}.${stale_base}.$(date +%s).$$"
+    echo "Move stale PYTHONUSERBASE dir ${stale_dir} -> ${stale_dest}"
+    mv -- "${stale_dir}" "${stale_dest}" || echo "Failed to move stale PYTHONUSERBASE dir ${stale_dir}" >&2
+  done < <(find "${find_args[@]}" -print0)
 }
 
 cleanup_old_python_user_base || true
+
+release_install_lock() {
+  if [ "${MUSA_CI_INSTALL_LOCK_HELD}" = "1" ]; then
+    rm -rf "${MUSA_CI_INSTALL_LOCK}"
+  fi
+}
+
+acquire_install_lock() {
+  mkdir -p "${PYTHONUSERBASE}"
+
+  if [ -f "${MUSA_CI_INSTALL_DONE}" ]; then
+    echo "MUSA CI dependency installation already completed: ${MUSA_CI_INSTALL_DONE}"
+    exit 0
+  fi
+
+  local start_ts
+  local now_ts
+  local lock_mtime
+  start_ts="$(date +%s)"
+
+  while ! mkdir "${MUSA_CI_INSTALL_LOCK}" 2>/dev/null; do
+    if [ -f "${MUSA_CI_INSTALL_DONE}" ]; then
+      echo "MUSA CI dependency installation completed by another job: ${MUSA_CI_INSTALL_DONE}"
+      exit 0
+    fi
+
+    now_ts="$(date +%s)"
+    lock_mtime="$(python3 - "${MUSA_CI_INSTALL_LOCK}" <<'PY'
+import os
+import sys
+
+try:
+    print(int(os.path.getmtime(sys.argv[1])))
+except OSError:
+    print(0)
+PY
+)"
+    if [ "${lock_mtime}" != "0" ] && [ $((now_ts - lock_mtime)) -gt "${SGLANG_CI_INSTALL_LOCK_TIMEOUT_SECONDS}" ]; then
+      echo "Remove stale MUSA CI dependency install lock: ${MUSA_CI_INSTALL_LOCK}" >&2
+      rm -rf "${MUSA_CI_INSTALL_LOCK}"
+      continue
+    fi
+    if [ $((now_ts - start_ts)) -gt "${SGLANG_CI_INSTALL_LOCK_TIMEOUT_SECONDS}" ]; then
+      echo "Timed out waiting for MUSA CI dependency install lock: ${MUSA_CI_INSTALL_LOCK}" >&2
+      exit 1
+    fi
+
+    echo "Wait for MUSA CI dependency install lock: ${MUSA_CI_INSTALL_LOCK}"
+    sleep 10
+  done
+
+  MUSA_CI_INSTALL_LOCK_HELD="1"
+  {
+    echo "pid=$$"
+    echo "host=$(hostname)"
+    echo "job=${CI_JOB_ID:-unknown}"
+    echo "started_at=$(date -Iseconds)"
+  } > "${MUSA_CI_INSTALL_LOCK}/owner"
+  trap release_install_lock EXIT
+}
 
 setup_ssh_known_hosts() {
   if [ -z "${MUSA_CI_SSH_KNOWN_HOSTS}" ]; then
@@ -200,11 +307,10 @@ install_lmms_eval() {
 
   if [ -n "${LMMS_EVAL_RUNTIME_DEPS}" ]; then
     echo "Install lmms-eval runtime dependencies for VLM MMMU evaluation..."
-    # Install only the runtime packages needed by the openai_compatible MMMU path.
-    # lmms-eval's package metadata also pulls development, logging, video, audio,
-    # and task-specific dependencies such as wandb, black, pre-commit, and decord;
-    # those are unnecessary in this CI case and make the dependency job sensitive
-    # to large downloads.
+    # Install only runtime packages needed by the openai_compatible MMMU path.
+    # lmms-eval's metadata also pulls development/logging packages such as
+    # wandb, black, isort, and pre-commit; those are unnecessary in this CI case
+    # and make the dependency job sensitive to large downloads.
     "${PIP_INSTALL[@]}" ${LMMS_EVAL_RUNTIME_DEPS} --user
   fi
 
@@ -236,7 +342,9 @@ echo "  ssh known hosts: ${MUSA_CI_SSH_KNOWN_HOSTS}"
 echo "  torch version: ${TORCH_VERSION}"
 echo "  install sglang dependencies: ${SGLANG_CI_INSTALL_DEPS}"
 echo "  install system build dependencies: ${SGLANG_CI_INSTALL_SYSTEM_DEPS}"
+echo "  upgrade pip tools: ${SGLANG_CI_UPGRADE_PIP_TOOLS}"
 echo "  upgrade torchada: ${SGLANG_CI_UPGRADE_TORCHADA}"
+echo "  install lock timeout seconds: ${SGLANG_CI_INSTALL_LOCK_TIMEOUT_SECONDS}"
 echo "  ci test packages: ${SGLANG_CI_TEST_PACKAGES}"
 echo "  install lmms-eval: ${SGLANG_CI_INSTALL_LMMS_EVAL}"
 echo "  lmms-eval package spec: ${LMMS_EVAL_PACKAGE_SPEC}"
@@ -304,9 +412,18 @@ if [ -n "${SYSTEM_DEPS_ONLY}" ]; then
   exit 0
 fi
 
-"${PIP_INSTALL[@]}" --upgrade pip setuptools ninja --user
+acquire_install_lock
+
+if [ "${SGLANG_CI_UPGRADE_PIP_TOOLS}" = "1" ]; then
+  "${PIP_INSTALL[@]}" --upgrade pip setuptools ninja --user
+else
+  echo "Skip pip/setuptools/ninja upgrade."
+fi
 if [ "${SGLANG_CI_UPGRADE_TORCHADA}" = "1" ]; then
-  "${PIP_INSTALL[@]}" --upgrade torchada "torch==${TORCH_VERSION}" --user
+  torch_constraint_file="$(mktemp)"
+  printf "torch==%s\n" "${TORCH_VERSION}" > "${torch_constraint_file}"
+  "${PIP_INSTALL[@]}" --upgrade torchada -c "${torch_constraint_file}" --user
+  rm -f "${torch_constraint_file}"
 fi
 
 if [ -d "${WHL_DIR}" ] && compgen -G "${WHL_DIR}"/*.whl > /dev/null; then
@@ -349,6 +466,7 @@ restore_pyprojects() {
   if [ -f "${REPO_ROOT}/sgl-kernel/setup_musa.py.ci.bak" ]; then
     mv -f "${REPO_ROOT}/sgl-kernel/setup_musa.py.ci.bak" "${REPO_ROOT}/sgl-kernel/setup_musa.py"
   fi
+  release_install_lock
 }
 trap restore_pyprojects EXIT
 
@@ -394,5 +512,11 @@ sed -i "s#https://github.com/flashinfer-ai/flashinfer.git#${FLASHINFER_REPO}#g" 
 if [ -n "${GITHUB_PATH:-}" ]; then
   echo "$HOME/.local/bin" >> "${GITHUB_PATH}"
 fi
+
+{
+  echo "commit=${CI_COMMIT_SHA:-unknown}"
+  echo "job=${CI_JOB_ID:-unknown}"
+  echo "finished_at=$(date -Iseconds)"
+} > "${MUSA_CI_INSTALL_DONE}"
 
 echo "MUSA CI dependency installation finished."
