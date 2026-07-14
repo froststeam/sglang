@@ -58,7 +58,11 @@ class TestMamba(unittest.TestCase):
             device=device,
             enable_memory_saver=False,
             mamba_pool=None,
+            start_layer=2,
+            end_layer=num_layers - 2,
         )
+        assert pool.start_layer == 2
+        assert pool.end_layer == num_layers - 2
         assert pool._transfer_full_attention_id(global_interval - 1) == 0
         assert pool._transfer_full_attention_id(2 * global_interval - 1) == 1
         with self.assertRaises(ValueError) as context:

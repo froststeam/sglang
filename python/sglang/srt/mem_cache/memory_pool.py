@@ -1433,6 +1433,7 @@ class HybridLinearKVPool(KVCache):
         kv_lora_rank: int = None,
         qk_rope_head_dim: int = None,
         start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -1440,6 +1441,7 @@ class HybridLinearKVPool(KVCache):
         self.full_layer_nums = len(full_attention_layer_ids)
         self.page_size = page_size
         self.start_layer = start_layer if start_layer is not None else 0
+        self.end_layer = end_layer
         self.layer_transfer_counter = None
         self.head_num = head_num
         self.head_dim = head_dim

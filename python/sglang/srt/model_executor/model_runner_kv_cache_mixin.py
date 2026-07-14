@@ -610,6 +610,7 @@ class ModelRunnerKVCacheMixin:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     use_mla=self.use_mla_backend,
                     start_layer=self.start_layer,
+                    end_layer=self.end_layer,
                     **extra_args,
                 )
             else:
