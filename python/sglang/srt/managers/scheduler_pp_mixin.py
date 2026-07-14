@@ -315,6 +315,12 @@ class SchedulerPPMixin:
                             msg_type="proxy",
                         )
 
+                if self.cur_batch:
+                    # Sync async forward before RDMA reads GPU memory, then
+                    # eagerly send this stage's final KV chunk.
+                    self.launch_event.synchronize()
+                    self.send_kv_chunk_pp_disagg_prefill(self.cur_batch, result)
+
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
                 consensus_bootstrapped_rids = next_consensus_bootstrapped_rids

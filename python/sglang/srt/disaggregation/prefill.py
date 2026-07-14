@@ -520,12 +520,13 @@ class SchedulerDisaggregationPrefillMixin:
             zip(batch.reqs, next_token_ids, strict=True)
         ):
             if req.is_chunked <= 0:
-                req.time_stats.set_prefill_finished_time()
+                # Eager PP requests were already sent; logprob requests stay
+                # deferred until their logprobs are available.
+                eagerly_sent = getattr(req, "kv_sent_eagerly", False)
 
-                # There is no output_ids for prefill
-                req.output_ids.append(next_token_id)
-                maybe_cache_unfinished_req(req, self.tree_cache)
-                self.disagg_prefill_inflight_queue.append(req)
+                # Eagerly-sent reqs already appended output_ids on the last rank.
+                if not (eagerly_sent and self.pp_group.is_last_rank):
+                    req.output_ids.append(next_token_id)
                 if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
                     req.output_topk_p = batch.spec_info.topk_p[i]
                     req.output_topk_index = batch.spec_info.topk_index[i]
@@ -549,8 +550,8 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
-                self.send_kv_chunk(req, last_chunk=True)
-                req.time_stats.set_prefill_transfer_queue_entry_time()
+                if not eagerly_sent:
+                    self.finalize_prefill_req_and_send_kv(req)
 
                 if req.grammar is not None:
                     # FIXME: this try-except block is for handling unexpected xgrammar issue.
@@ -794,7 +795,10 @@ class SchedulerDisaggregationPrefillMixin:
         )
         state_indices: Optional[List] = None
         if last_chunk:
-            self.disagg_metadata_buffers.set_buf(req)
+            # Only the last PP rank has the output token; others' output_ids
+            # is empty when sending eagerly.
+            if self.pp_group.is_last_rank:
+                self.disagg_metadata_buffers.set_buf(req)
 
             seq_len = len(req.fill_ids)
 
@@ -848,3 +852,34 @@ class SchedulerDisaggregationPrefillMixin:
             return
         req.disagg_kv_sender.send(page_indices, state_indices)
         req.start_send_idx = end_idx
+
+    def finalize_prefill_req_and_send_kv(self: Scheduler, req: Req) -> None:
+        """Lock the tree, enqueue for transfer tracking, and send the last KV chunk."""
+        req.time_stats.set_prefill_finished_time()
+        maybe_cache_unfinished_req(req, self.tree_cache)
+        self.disagg_prefill_inflight_queue.append(req)
+        self.send_kv_chunk(req, last_chunk=True)
+        req.time_stats.set_prefill_transfer_queue_entry_time()
+
+    def send_kv_chunk_pp_disagg_prefill(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> None:
+        """Eagerly send final-chunk KV after PP forward completion."""
+        # Spec decode metadata (hidden_states/topk) is only assigned at
+        # ring-back; eager send would ship a stale aux buffer.
+        if not self.spec_algorithm.is_none():
+            return
+
+        if self.pp_group.is_last_rank:
+            output_ids = result.next_token_ids.tolist()
+
+        # batch.chunked_req is unfinished; req.is_chunked stays stale until
+        # earlier chunks ring back.
+        for i, req in enumerate(batch.reqs):
+            if req is not batch.chunked_req and not req.return_logprob:
+                if self.pp_group.is_last_rank:
+                    req.output_ids.append(output_ids[i])
+                req.kv_sent_eagerly = True
+                self.finalize_prefill_req_and_send_kv(req)
