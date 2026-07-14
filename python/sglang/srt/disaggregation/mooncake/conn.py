@@ -1359,12 +1359,16 @@ class MooncakeKVManager(CommonKVManager):
                                     target_rank_registration_info,
                                 )
 
-                            # Only the last chunk we need to send the aux data
-                            ret = self.send_aux(
-                                req,
-                                kv_chunk.prefill_aux_index,
-                                target_rank_registration_info.dst_aux_ptrs,
-                            )
+                            # Only the last PP rank sends aux; all ranks still sync
+                            # status to preserve the decode-side response quorum.
+                            if self.pp_group.is_last_rank:
+                                ret = self.send_aux(
+                                    req,
+                                    kv_chunk.prefill_aux_index,
+                                    target_rank_registration_info.dst_aux_ptrs,
+                                )
+                            else:
+                                ret = 0
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)
