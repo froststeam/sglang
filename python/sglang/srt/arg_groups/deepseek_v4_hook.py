@@ -41,7 +41,7 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
             server_args.speculative_eagle_topk == 1
         ), f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
 
-        if not envs.SGLANG_ENABLE_SPEC_V2.get():
+        if not envs.SGLANG_ENABLE_SPEC_V2.is_set():
             envs.SGLANG_ENABLE_SPEC_V2.set(True)
             logger.warning("Spec v2 is enabled for EAGLE speculative decoding.")
 
