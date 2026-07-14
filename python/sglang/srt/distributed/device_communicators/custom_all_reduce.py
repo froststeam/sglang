@@ -397,6 +397,7 @@ class MusaJitCustomAllreduce:
         ] = ()
         self._graph_registered_cursor = 0
         self._graph_registered_miss = False
+        self._graph_registered_input_enabled = False
         self._shot_decision_cache: dict[tuple[int, bool, bool], int] = {}
         self._context_on_record_graph_input = _env_flag(
             (
