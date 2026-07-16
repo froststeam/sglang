@@ -44,6 +44,9 @@ class MiniLoadBalancer:
         self.host = router_args.host
         self.port = router_args.port
         self.timeout = router_args.request_timeout_secs
+        self.policy = router_args.policy
+        self._prefill_rr_counter = 0
+        self._decode_rr_counter = 0
         self.prefill_urls = [url[0] for url in router_args.prefill_urls]
         self.prefill_bootstrap_ports = [url[1] for url in router_args.prefill_urls]
         self.decode_urls = router_args.decode_urls
@@ -53,11 +56,11 @@ class MiniLoadBalancer:
 
     def _validate_router_args(self, router_args: RouterArgs):
         logger.warning(
-            "\x1b[33mMiniLB is only for debugging purposes, it only supports random policy!\033[0m"
+            "\x1b[33mMiniLB is only for debugging purposes, it only supports random/round_robin policy!\033[0m"
         )
 
         # NOTE: too many arguments unsupported, just validate some important ones
-        if router_args.policy != "random":
+        if router_args.policy not in ("random", "round_robin"):
             logger.warning("[MiniLB] Overriding policy to random")
             router_args.policy = "random"
 
@@ -103,8 +106,14 @@ class MiniLoadBalancer:
     def select_pair(self):
         assert len(self.prefill_urls) > 0, "No prefill servers available"
         assert len(self.decode_urls) > 0, "No decode servers available"
-        pidx = random.randint(0, len(self.prefill_urls) - 1)
-        didx = random.randint(0, len(self.decode_urls) - 1)
+        if self.policy == "round_robin":
+            pidx = self._prefill_rr_counter % len(self.prefill_urls)
+            didx = self._decode_rr_counter % len(self.decode_urls)
+            self._prefill_rr_counter += 1
+            self._decode_rr_counter += 1
+        else:
+            pidx = random.randint(0, len(self.prefill_urls) - 1)
+            didx = random.randint(0, len(self.decode_urls) - 1)
         return (
             self.prefill_urls[pidx],
             self.prefill_bootstrap_ports[pidx],
