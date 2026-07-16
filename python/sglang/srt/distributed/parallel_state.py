@@ -64,6 +64,7 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
+_is_musa_attn_tp_pynccl = envs.SGLANG_MUSA_ENABLE_ATTN_TP_PYNCCL.get()
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -256,6 +257,7 @@ class GroupCoordinator:
     ):
         # Set group info
         group_name = group_name or "anonymous"
+        self.group_name = group_name
         self.unique_name = _get_unique_name(group_name)
         _register_group(self)
 
@@ -733,15 +735,25 @@ class GroupCoordinator:
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
+    def _should_use_musa_attn_tp_pynccl_collective(self) -> bool:
+        return _is_musa_attn_tp_pynccl and self.group_name == "attention_tp"
+
+    def _should_use_pynccl_tensor_collective(self) -> bool:
+        pynccl_comm = self.pynccl_comm
+        return pynccl_comm is not None and (
+            not pynccl_comm.disabled
+            or self.is_symmetric_memory_enabled()
+            or self._should_use_musa_attn_tp_pynccl_collective()
+        )
+
     def _reduce_scatter_tensor(
         self,
         output: torch.Tensor,
         input: torch.Tensor,
     ) -> torch.Tensor:
         pynccl_comm = self.pynccl_comm
-        if pynccl_comm is not None and (
-            not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
-        ):
+        if self._should_use_pynccl_tensor_collective():
+            assert pynccl_comm is not None
             self.debug_check_symmetric_mempool(
                 self, {"output": output, "input": input}, "reduce_scatter_tensor"
             )
@@ -754,7 +766,7 @@ class GroupCoordinator:
         return output
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu:
+        if _is_npu or self._should_use_musa_attn_tp_pynccl_collective():
             self._reduce_scatter_tensor(output, input)
         else:
             reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
@@ -803,9 +815,8 @@ class GroupCoordinator:
 
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         pynccl_comm = self.pynccl_comm
-        if pynccl_comm is not None and (
-            not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
-        ):
+        if self._should_use_pynccl_tensor_collective():
+            assert pynccl_comm is not None
             self.debug_check_symmetric_mempool(
                 self, {"output": output}, "all_gather_into_tensor"
             )
@@ -817,7 +828,7 @@ class GroupCoordinator:
             )
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or _is_xpu:
+        if _is_npu or _is_xpu or self._should_use_musa_attn_tp_pynccl_collective():
             self._all_gather_into_tensor(output, input)
         else:
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
@@ -1493,6 +1504,21 @@ def get_attn_tp_group() -> GroupCoordinator:
     return _ATTN_TP
 
 
+def _validate_musa_attn_tp_pynccl(
+    group: GroupCoordinator, attn_tp_size: int, backend: str
+) -> None:
+    if not _is_musa_attn_tp_pynccl or attn_tp_size <= 1:
+        return
+
+    pynccl_comm = group.pynccl_comm
+    if pynccl_comm is None or not pynccl_comm.available:
+        raise RuntimeError(
+            "SGLANG_MUSA_ENABLE_ATTN_TP_PYNCCL requires an available PyNccl "
+            f"communicator for the attention_tp group, but initialization "
+            f"failed with backend={backend!r}."
+        )
+
+
 def get_attn_cp_group() -> GroupCoordinator:
     assert (
         _ATTN_CP is not None
@@ -1937,6 +1963,8 @@ def initialize_model_parallel(
             group_name="attention_tp",
             recovered_rank=recovered_rank,
         )
+
+        _validate_musa_attn_tp_pynccl(_ATTN_TP, attn_tp_size, backend)
 
     moe_ep_size = expert_model_parallel_size
     moe_dp_size = moe_data_model_parallel_size
