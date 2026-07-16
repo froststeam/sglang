@@ -371,7 +371,11 @@ __device__ __forceinline__ P packed_reduce(const P* ptrs[], int idx) {
 
 template <typename T, int nranks>
 __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) cross_device_reduce_1stage(
-    RankData data, RankSignals sg, Signal* self_sg, T* __restrict__ out, int rank, int size) {
+    RankData data, const RankData* data_ptr, RankSignals sg, Signal* self_sg,
+    T* __restrict__ out, int rank, int size) {
+  if (data_ptr != nullptr) {
+    data = *data_ptr;
+  }
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
   multi_rank_barrier<nranks, true>(sg, self_sg, rank);
@@ -383,7 +387,11 @@ __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) cross_device_reduce_1s
 
 template <typename T>
 __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) cross_device_reduce_1stage_2rank(
-    RankData data, RankSignals sg, Signal* self_sg, T* __restrict__ out, int rank, int size) {
+    RankData data, const RankData* data_ptr, RankSignals sg, Signal* self_sg,
+    T* __restrict__ out, int rank, int size) {
+  if (data_ptr != nullptr) {
+    data = *data_ptr;
+  }
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
   const auto* local = reinterpret_cast<const P*>(data.ptrs[rank]);
@@ -400,7 +408,11 @@ __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) cross_device_reduce_1s
 
 template <typename T, int nranks>
 __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) cross_device_push_1stage(
-    RankData data, RankSignals sg, Signal* self_sg, const T* __restrict__ input, T* __restrict__ out, int rank, int size) {
+    RankData data, const RankData* data_ptr, RankSignals sg, Signal* self_sg,
+    const T* __restrict__ input, T* __restrict__ out, int rank, int size) {
+  if (data_ptr != nullptr) {
+    data = *data_ptr;
+  }
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -745,12 +757,12 @@ void launch_ar(
     return;
   }
   if (shot == 0 || shot == 3) {
-    cross_device_push_1stage<T, nranks><<<blocks, kDefaultThreads, 0, stream>>>(data, sg, self_sg, input, out, rank, packed_size);
+    cross_device_push_1stage<T, nranks><<<blocks, kDefaultThreads, 0, stream>>>(data, data_ptr, sg, self_sg, input, out, rank, packed_size);
   } else if (shot == 1) {
     if constexpr (nranks == 2 && SGL_CUSTOM_AR_1SHOT_2RANK_SPECIAL) {
-      cross_device_reduce_1stage_2rank<T><<<blocks, kDefaultThreads, 0, stream>>>(data, sg, self_sg, out, rank, packed_size);
+      cross_device_reduce_1stage_2rank<T><<<blocks, kDefaultThreads, 0, stream>>>(data, data_ptr, sg, self_sg, out, rank, packed_size);
     } else {
-      cross_device_reduce_1stage<T, nranks><<<blocks, kDefaultThreads, 0, stream>>>(data, sg, self_sg, out, rank, packed_size);
+      cross_device_reduce_1stage<T, nranks><<<blocks, kDefaultThreads, 0, stream>>>(data, data_ptr, sg, self_sg, out, rank, packed_size);
     }
   } else if (shot == 2 || shot == 4) {
     if constexpr (std::is_same<T, float>::value) {
