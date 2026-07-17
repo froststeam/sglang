@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark fused_qk_rmsnorm_mrope_cache."""
+"""Benchmark fused_qk_rmsnorm_mrope_cache_out."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ server_args.get_global_server_args = lambda: server_args._global_server_args
 sys.modules["sglang.srt.server_args"] = server_args
 
 from sglang.srt.hardware_backend.musa.jit_kernel.csrc.norm import (
-    fused_qk_rmsnorm_mrope_cache,
+    fused_qk_rmsnorm_mrope_cache_out,
 )
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 
@@ -202,56 +202,6 @@ def make_inputs(
     )
 
 
-def check_correctness(
-    profile: BenchProfile, inputs: tuple[torch.Tensor, ...], atol: float, rtol: float
-) -> dict[str, object]:
-    q, k, v, q_weight, k_weight, positions, cos_sin_cache, k_cache, v_cache, indices = (
-        inputs
-    )
-    q_ref, k_ref = rope_ref(
-        profile,
-        positions,
-        rmsnorm_ref(q, q_weight, profile.qk_norm_gemma),
-        rmsnorm_ref(k, k_weight, profile.qk_norm_gemma),
-        cos_sin_cache,
-    )
-    v_ref = v.reshape(v.shape[0], -1)
-    k_cache.zero_()
-    v_cache.zero_()
-    section_t, section_h, section_w = profile.mrope_section
-    q_out = fused_qk_rmsnorm_mrope_cache(
-        q,
-        k,
-        v,
-        q_weight,
-        k_weight,
-        positions,
-        cos_sin_cache,
-        k_cache,
-        v_cache,
-        indices,
-        True,
-        section_t,
-        section_h,
-        section_w,
-        profile.is_interleaved,
-        QK_NORM_EPS,
-        profile.qk_norm_gemma,
-    )
-    k_cache_ref = k_ref.reshape(k_ref.shape[0], -1)
-    q_stats = error_stats(q_out, q_ref)
-    kc_stats = error_stats(k_cache[indices], k_cache_ref)
-    vc_stats = error_stats(v_cache[indices], v_ref)
-    return {
-        "passed": is_close(q_out, q_ref, atol, rtol)
-        and is_close(k_cache[indices], k_cache_ref, atol, rtol)
-        and is_close(v_cache[indices], v_ref, atol, rtol),
-        "q_max_abs": q_stats["max_abs"],
-        "kc_max_abs": kc_stats["max_abs"],
-        "vc_max_abs": vc_stats["max_abs"],
-    }
-
-
 def logical_bytes(profile: BenchProfile, m: int) -> int:
     elem_size = torch.empty(
         (), dtype=dtype_from_name(profile.dtype_name)
@@ -264,7 +214,7 @@ def logical_bytes(profile: BenchProfile, m: int) -> int:
         + kv_elems
         + kv_elems
         + q_elems
-        + 2 * kv_elems
+        + 3 * kv_elems
         + rope_elems
         + 2 * profile.head_dim
     )
@@ -297,11 +247,101 @@ def skipped_row(
         "error": reason,
         "correct": "",
         "q_max_abs": "",
+        "k_max_abs": "",
         "kc_max_abs": "",
         "vc_max_abs": "",
         "latency_us": "",
         "logical_TBps": "0.000",
         "kernel": kernel_name(),
+    }
+
+
+def print_profiles(profiles: list[BenchProfile]) -> None:
+    print_rows(
+        [
+            {
+                "model": p.name,
+                "family": p.family,
+                "tp": p.tp,
+                "q": p.q_heads,
+                "kv": p.kv_heads,
+                "hd": p.head_dim,
+                "rot": p.rot_dim,
+                "qk_norm": p.has_qk_norm,
+                "mrope": p.mrope_section,
+                "inter": p.is_interleaved,
+                "gemma": p.qk_norm_gemma,
+                "dtype": p.dtype_name,
+            }
+            for p in profiles
+        ],
+        (
+            "model",
+            "family",
+            "tp",
+            "q",
+            "kv",
+            "hd",
+            "rot",
+            "qk_norm",
+            "mrope",
+            "inter",
+            "gemma",
+            "dtype",
+        ),
+    )
+
+
+def check_correctness(
+    profile: BenchProfile, inputs: tuple, atol: float, rtol: float
+) -> dict[str, object]:
+    q, k, v, q_weight, k_weight, positions, cos_sin_cache, k_cache, v_cache, indices = (
+        inputs
+    )
+    q_ref, k_ref = rope_ref(
+        profile,
+        positions,
+        rmsnorm_ref(q, q_weight, profile.qk_norm_gemma),
+        rmsnorm_ref(k, k_weight, profile.qk_norm_gemma),
+        cos_sin_cache,
+    )
+    v_ref = v.reshape(v.shape[0], -1)
+    k_cache.zero_()
+    v_cache.zero_()
+    section_t, section_h, section_w = profile.mrope_section
+    q_out, k_out = fused_qk_rmsnorm_mrope_cache_out(
+        q,
+        k,
+        v,
+        q_weight,
+        k_weight,
+        positions,
+        cos_sin_cache,
+        k_cache,
+        v_cache,
+        indices,
+        True,
+        section_t,
+        section_h,
+        section_w,
+        profile.is_interleaved,
+        QK_NORM_EPS,
+        profile.qk_norm_gemma,
+    )
+    k_cache_ref = k_ref.reshape(k_ref.shape[0], -1)
+    q_stats = error_stats(q_out, q_ref)
+    k_stats = error_stats(k_out, k_ref)
+    kc_stats = error_stats(k_cache[indices], k_cache_ref)
+    vc_stats = error_stats(v_cache[indices], v_ref)
+    return {
+        "passed": is_close(q_out, q_ref, atol, rtol)
+        and is_close(k_out, k_ref, atol, rtol)
+        and is_close(k_cache[indices], k_cache_ref, atol, rtol)
+        and is_close(v_cache[indices], v_ref, atol, rtol),
+        "q_max_abs": q_stats["max_abs"],
+        "k_max_abs": k_stats["max_abs"],
+        "kc_max_abs": kc_stats["max_abs"],
+        "vc_max_abs": vc_stats["max_abs"],
     }
 
 
@@ -341,7 +381,7 @@ def bench_one(
     section_t, section_h, section_w = profile.mrope_section
 
     def run() -> None:
-        fused_qk_rmsnorm_mrope_cache(
+        fused_qk_rmsnorm_mrope_cache_out(
             q,
             k,
             v,
@@ -380,6 +420,7 @@ def bench_one(
         "kernel": kernel_name(),
         "correct": str(bool(correct["passed"])),
         "q_max_abs": f"{float(correct.get('q_max_abs', 0.0)):.3g}",
+        "k_max_abs": f"{float(correct.get('k_max_abs', 0.0)):.3g}",
         "kc_max_abs": f"{float(correct.get('kc_max_abs', 0.0)):.3g}",
         "vc_max_abs": f"{float(correct.get('vc_max_abs', 0.0)):.3g}",
         "latency_us": f"{seconds * 1e6:.3f}",
@@ -389,42 +430,6 @@ def bench_one(
             else "0.000"
         ),
     }
-
-
-def print_profiles(profiles: list[BenchProfile]) -> None:
-    print_rows(
-        [
-            {
-                "model": p.name,
-                "family": p.family,
-                "tp": p.tp,
-                "q": p.q_heads,
-                "kv": p.kv_heads,
-                "hd": p.head_dim,
-                "rot": p.rot_dim,
-                "qk_norm": p.has_qk_norm,
-                "mrope": p.mrope_section,
-                "inter": p.is_interleaved,
-                "gemma": p.qk_norm_gemma,
-                "dtype": p.dtype_name,
-            }
-            for p in profiles
-        ],
-        (
-            "model",
-            "family",
-            "tp",
-            "q",
-            "kv",
-            "hd",
-            "rot",
-            "qk_norm",
-            "mrope",
-            "inter",
-            "gemma",
-            "dtype",
-        ),
-    )
 
 
 def main() -> None:
@@ -530,6 +535,7 @@ def main() -> None:
             "error",
             "correct",
             "q_max_abs",
+            "k_max_abs",
             "kc_max_abs",
             "vc_max_abs",
             "latency_us",
