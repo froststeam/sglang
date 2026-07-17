@@ -1504,7 +1504,7 @@ def select_experts(
     elif (
         torch_native
         and custom_routing_function is None
-        and not use_musa_fused_shared_experts
+        and not _is_musa
     ):
         assert (
             num_token_non_padded is None

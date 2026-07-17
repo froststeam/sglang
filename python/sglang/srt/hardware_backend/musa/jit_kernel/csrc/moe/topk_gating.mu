@@ -58,6 +58,19 @@ __device__ __forceinline__ float stable_sigmoid(float x) {
 }
 
 __device__ __forceinline__ void warp_argmax(float &val, int &idx) {
+  // Keep the selected expert id valid even when an upstream row contains
+  // NaNs.  The split reduction marks non-winning lanes with INT_MAX; without
+  // sanitizing NaNs, every lane can be marked as a non-winner and INT_MAX is
+  // written as an expert id, which later makes DeepEP index out of bounds.
+  // This file is compiled with -ffast-math, so isnan()/val!=val may be
+  // optimized away. Inspect the IEEE-754 bits instead.
+  union {
+    float f;
+    uint32_t u;
+  } val_bits = {val};
+  if ((val_bits.u & 0x7fffffffu) > 0x7f800000u) {
+    val = kFloatMinimum;
+  }
 #if SGLANG_TOPK_SPLIT_ARGMAX
   const float local_val = val;
   const int local_idx = idx;
