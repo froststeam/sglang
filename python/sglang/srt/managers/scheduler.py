@@ -3018,8 +3018,6 @@ class Scheduler(
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
 
-        self._update_eplb_disagg_transfer_busy()
-
         # Run forward
         if self.is_generation:
             if (
@@ -3167,25 +3165,6 @@ class Scheduler(
             )
 
         return ret
-
-    def _update_eplb_disagg_transfer_busy(self):
-        if not self.server_args.enable_eplb:
-            return
-
-        busy = False
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            busy = (
-                len(self.disagg_prefill_inflight_queue) > 0
-                or len(self.disagg_prefill_bootstrap_queue.queue) > 0
-            )
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            busy = (
-                len(self.disagg_decode_prealloc_queue.queue) > 0
-                or len(self.disagg_decode_transfer_queue.queue) > 0
-                or len(self.disagg_decode_prealloc_queue.retracted_queue) > 0
-            )
-
-        self.tp_worker.model_runner.eplb_disagg_transfer_busy = busy
 
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult

@@ -643,7 +643,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.server_args.enable_eplb and (not self.is_draft_worker)
             else None
         )
-        self.eplb_disagg_transfer_busy = False
         self.expert_location_updater = ExpertLocationUpdater()
 
         (
@@ -3400,13 +3399,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         if self.eplb_manager is not None:
-            disagg_transfer_pending = self.eplb_disagg_transfer_busy or (
-                self.server_args.disaggregation_mode == "prefill"
-                and forward_batch.forward_mode.is_extend()
-            )
-            self.eplb_manager.on_forward_pass_end(
-                disagg_transfer_pending=disagg_transfer_pending
-            )
+            self.eplb_manager.on_forward_pass_end()
 
         if dumper.may_enable:
             dumper.step()
