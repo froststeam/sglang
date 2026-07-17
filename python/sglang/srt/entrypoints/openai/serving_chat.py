@@ -566,19 +566,6 @@ class OpenAIServingChat(OpenAIServingBase):
         else:
             result = self._apply_conversation_template(request, is_multimodal)
 
-        # For Gemma4 standard chat (no tools, no reasoning extraction), add
-        # structural stop strings so the model halts before emitting internal
-        # template markers that would leak into user-facing output.
-        if self.is_gemma4 and not (
-            (request.tools and request.tool_choice != "none")
-            or (self.reasoning_parser and request.separate_reasoning)
-        ):
-            gemma4_stops = ["<turn|>", "<|tool_response>", "<|turn>"]
-            stops = list(result.stop) if result.stop else []
-            for s in gemma4_stops:
-                if s not in stops:
-                    stops.append(s)
-            result.stop = stops
 
         result.tool_call_constraint = tool_call_constraint
         return result
