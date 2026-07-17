@@ -543,6 +543,578 @@ __global__ void fused_qk_rmsnorm_mrope_cache_h128_full_bf16_kernel(
   }
 }
 
+template <typename index_t, bool GEMMA, bool STORE_K_OUT = true,
+          bool SAME_POSITION = false, int TOKENS_PER_BLOCK = 2,
+          bool CONTIGUOUS = false>
+__global__ void fused_qk_rmsnorm_mrope_cache_h128_q8kv1_tpb2_bf16_kernel(
+    const __mt_bfloat16 *__restrict__ q, const __mt_bfloat16 *__restrict__ k,
+    const __mt_bfloat16 *__restrict__ v,
+    const __mt_bfloat16 *__restrict__ q_weight,
+    const __mt_bfloat16 *__restrict__ k_weight,
+    const int64_t *__restrict__ positions,
+    const __mt_bfloat16 *__restrict__ cos_sin_cache,
+    __mt_bfloat16 *__restrict__ q_out, __mt_bfloat16 *__restrict__ k_out,
+    __mt_bfloat16 *__restrict__ k_cache, __mt_bfloat16 *__restrict__ v_cache,
+    const index_t *__restrict__ indices, int batch, int64_t position_stride,
+    int64_t q_batch_stride, int64_t q_head_stride, int64_t k_batch_stride,
+    int64_t k_head_stride, int64_t v_batch_stride, int64_t v_head_stride,
+    int64_t q_out_batch_stride, int64_t q_out_head_stride,
+    int64_t k_out_batch_stride, int64_t k_out_head_stride,
+    int64_t k_cache_row_stride, int64_t v_cache_row_stride,
+    int64_t indices_stride, float eps) {
+  constexpr int hidden = 128;
+  constexpr int embed_dim = 64;
+  constexpr int rot_dim = 128;
+  constexpr int q_heads = 8;
+  constexpr int warps_per_token = 9;
+
+  const int tid = (int)threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int token_slot = warp / warps_per_token;
+  const int head_slot = warp - token_slot * warps_per_token;
+  const int token = (int)blockIdx.x * 2 + token_slot;
+  if (token >= batch) {
+    return;
+  }
+  const int64_t cache_idx =
+      static_cast<int64_t>(indices[(int64_t)token * indices_stride]);
+
+  if (head_slot == q_heads && lane < 16) {
+    const int col = lane * 8;
+    Vec8<__mt_bfloat16> v_vec = Vec8<__mt_bfloat16>::load(
+        v + (int64_t)token * v_batch_stride, col);
+    *(Vec8<__mt_bfloat16> *)(v_cache + cache_idx * v_cache_row_stride + col) =
+        v_vec;
+  }
+
+  const bool is_q = head_slot < q_heads;
+  const int head = is_q ? head_slot : 0;
+  const __mt_bfloat16 *__restrict__ data = is_q ? q : k;
+  const __mt_bfloat16 *__restrict__ weight = is_q ? q_weight : k_weight;
+  const int64_t base =
+      is_q ? ((int64_t)token * q_batch_stride + (int64_t)head * q_head_stride)
+           : ((int64_t)token * k_batch_stride);
+
+  const float data_0 = __bfloat162float(data[base + lane]);
+  const float data_1 = __bfloat162float(data[base + lane + 32]);
+  const float data_2 = __bfloat162float(data[base + lane + 64]);
+  const float data_3 = __bfloat162float(data[base + lane + 96]);
+  float sum =
+      data_0 * data_0 + data_1 * data_1 + data_2 * data_2 + data_3 * data_3;
+#pragma unroll
+  for (int mask = 16; mask > 0; mask >>= 1) {
+    sum += __shfl_xor_sync(0xffffffff, sum, mask);
+  }
+  const float scale = fast_rsqrt(sum * (1.0f / 128.0f) + eps);
+
+  const int rot_offset0 = lane;
+  int64_t pos0;
+  int64_t pos1;
+  if constexpr (SAME_POSITION) {
+    pos0 = positions[token];
+    pos1 = pos0;
+  } else {
+    constexpr unsigned int axis0_mask1 = 0x92492492U;
+    constexpr unsigned int axis0_mask2 = 0x24924924U;
+    constexpr unsigned int axis1_mask1 = 0x04924924U;
+    constexpr unsigned int axis1_mask2 = 0x09249249U;
+    const unsigned int lane_bit = 1U << lane;
+    const int axis0 =
+        ((axis0_mask1 & lane_bit) != 0U) +
+        (((axis0_mask2 & lane_bit) != 0U) << 1);
+    pos0 = positions[(int64_t)axis0 * position_stride + token];
+    const int axis1 =
+        ((axis1_mask1 & lane_bit) != 0U) +
+        (((axis1_mask2 & lane_bit) != 0U) << 1);
+    pos1 = positions[(int64_t)axis1 * position_stride + token];
+  }
+  const __mt_bfloat16 *__restrict__ cache_ptr0 = cos_sin_cache + pos0 * rot_dim;
+  const float cos_v0 = __bfloat162float(cache_ptr0[rot_offset0]);
+  const float sin_v0 = __bfloat162float(cache_ptr0[embed_dim + rot_offset0]);
+  const float x_weight0 =
+      __bfloat162float(weight[rot_offset0]) + (GEMMA ? 1.0f : 0.0f);
+  const float y_weight0 =
+      __bfloat162float(weight[embed_dim + rot_offset0]) +
+      (GEMMA ? 1.0f : 0.0f);
+  const float x0 = data_0 * scale * x_weight0;
+  const float y0 = data_2 * scale * y_weight0;
+  const __mt_bfloat16 x_rot0 = __float2bfloat16_rn(x0 * cos_v0 - y0 * sin_v0);
+  const __mt_bfloat16 y_rot0 = __float2bfloat16_rn(y0 * cos_v0 + x0 * sin_v0);
+
+  const int rot_offset1 = lane + 32;
+  const __mt_bfloat16 *__restrict__ cache_ptr1 = cos_sin_cache + pos1 * rot_dim;
+  const float cos_v1 = __bfloat162float(cache_ptr1[rot_offset1]);
+  const float sin_v1 = __bfloat162float(cache_ptr1[embed_dim + rot_offset1]);
+  const float x_weight1 =
+      __bfloat162float(weight[rot_offset1]) + (GEMMA ? 1.0f : 0.0f);
+  const float y_weight1 =
+      __bfloat162float(weight[embed_dim + rot_offset1]) +
+      (GEMMA ? 1.0f : 0.0f);
+  const float x1 = data_1 * scale * x_weight1;
+  const float y1 = data_3 * scale * y_weight1;
+  const __mt_bfloat16 x_rot1 = __float2bfloat16_rn(x1 * cos_v1 - y1 * sin_v1);
+  const __mt_bfloat16 y_rot1 = __float2bfloat16_rn(y1 * cos_v1 + x1 * sin_v1);
+
+  if (is_q) {
+    const int64_t q_out_base =
+        (int64_t)token * q_out_batch_stride + (int64_t)head * q_out_head_stride;
+    q_out[q_out_base + rot_offset0] = x_rot0;
+    q_out[q_out_base + embed_dim + rot_offset0] = y_rot0;
+    q_out[q_out_base + rot_offset1] = x_rot1;
+    q_out[q_out_base + embed_dim + rot_offset1] = y_rot1;
+  } else {
+    const int64_t k_cache_base = cache_idx * k_cache_row_stride;
+    k_cache[k_cache_base + rot_offset0] = x_rot0;
+    k_cache[k_cache_base + embed_dim + rot_offset0] = y_rot0;
+    k_cache[k_cache_base + rot_offset1] = x_rot1;
+    k_cache[k_cache_base + embed_dim + rot_offset1] = y_rot1;
+    if constexpr (STORE_K_OUT) {
+      const int64_t k_out_base = (int64_t)token * k_out_batch_stride;
+      k_out[k_out_base + rot_offset0] = x_rot0;
+      k_out[k_out_base + embed_dim + rot_offset0] = y_rot0;
+      k_out[k_out_base + rot_offset1] = x_rot1;
+      k_out[k_out_base + embed_dim + rot_offset1] = y_rot1;
+    }
+  }
+}
+
+template <typename index_t, bool GEMMA, bool STORE_K_OUT = true,
+          bool SAME_POSITION = false, int TOKENS_PER_BLOCK = 3,
+          bool CONTIGUOUS = false>
+__global__ void
+fused_qk_rmsnorm_mrope_cache_h128_q8kv1_tpb2_halfwarp_bf16_kernel(
+    const __mt_bfloat16 *__restrict__ q, const __mt_bfloat16 *__restrict__ k,
+    const __mt_bfloat16 *__restrict__ v,
+    const __mt_bfloat16 *__restrict__ q_weight,
+    const __mt_bfloat16 *__restrict__ k_weight,
+    const int64_t *__restrict__ positions,
+    const __mt_bfloat16 *__restrict__ cos_sin_cache,
+    __mt_bfloat16 *__restrict__ q_out, __mt_bfloat16 *__restrict__ k_out,
+    __mt_bfloat16 *__restrict__ k_cache, __mt_bfloat16 *__restrict__ v_cache,
+    const index_t *__restrict__ indices, int batch, int64_t position_stride,
+    int64_t q_batch_stride, int64_t q_head_stride, int64_t k_batch_stride,
+    int64_t k_head_stride, int64_t v_batch_stride, int64_t v_head_stride,
+    int64_t q_out_batch_stride, int64_t q_out_head_stride,
+    int64_t k_out_batch_stride, int64_t k_out_head_stride,
+    int64_t k_cache_row_stride, int64_t v_cache_row_stride,
+    int64_t indices_stride, float eps) {
+  constexpr int hidden = 128;
+  constexpr int embed_dim = 64;
+  constexpr int rot_dim = 128;
+  constexpr int q_heads = 8;
+  constexpr int halfwarps_per_token = 9;
+
+  const int tid = (int)threadIdx.x;
+  const int lane = tid & 31;
+  const int half = lane >> 4;
+  const int sublane = lane & 15;
+  const int warp = tid >> 5;
+  const int logical_halfwarp = warp * 2 + half;
+  if (logical_halfwarp >= halfwarps_per_token * TOKENS_PER_BLOCK) {
+    return;
+  }
+  const int token_slot = logical_halfwarp / halfwarps_per_token;
+  const int head_slot =
+      logical_halfwarp - token_slot * halfwarps_per_token;
+  const int token = (int)blockIdx.x * TOKENS_PER_BLOCK + token_slot;
+  if (token >= batch) {
+    return;
+  }
+  const int64_t cache_idx =
+      static_cast<int64_t>(indices[CONTIGUOUS ? token
+                                              : (int64_t)token * indices_stride]);
+
+  if (head_slot == q_heads) {
+    const int col = sublane * 8;
+    const int64_t v_base =
+        CONTIGUOUS ? (int64_t)token * hidden : (int64_t)token * v_batch_stride;
+    const int64_t v_cache_base =
+        CONTIGUOUS ? cache_idx * hidden : cache_idx * v_cache_row_stride;
+    Vec8<__mt_bfloat16> v_vec = Vec8<__mt_bfloat16>::load(v + v_base, col);
+    *(Vec8<__mt_bfloat16> *)(v_cache + v_cache_base + col) =
+        v_vec;
+  }
+
+  const int rot_offset0 = sublane;
+  const int rot_offset1 = sublane + 16;
+  const int rot_offset2 = sublane + 32;
+  const int rot_offset3 = sublane + 48;
+  const int rot_offset4 = sublane + 64;
+  const int rot_offset5 = sublane + 80;
+  const int rot_offset6 = sublane + 96;
+  const int rot_offset7 = sublane + 112;
+
+  const bool is_q = head_slot < q_heads;
+  const int head = is_q ? head_slot : 0;
+  const __mt_bfloat16 *__restrict__ data = is_q ? q : k;
+  const __mt_bfloat16 *__restrict__ weight = is_q ? q_weight : k_weight;
+  const int64_t base =
+      CONTIGUOUS
+          ? (is_q ? ((int64_t)token * q_heads + head) * hidden
+                  : (int64_t)token * hidden)
+          : (is_q ? ((int64_t)token * q_batch_stride +
+                     (int64_t)head * q_head_stride)
+                  : ((int64_t)token * k_batch_stride));
+
+  const float data_0 = __bfloat162float(data[base + rot_offset0]);
+  const float data_1 = __bfloat162float(data[base + rot_offset1]);
+  const float data_2 = __bfloat162float(data[base + rot_offset2]);
+  const float data_3 = __bfloat162float(data[base + rot_offset3]);
+  const float data_4 = __bfloat162float(data[base + rot_offset4]);
+  const float data_5 = __bfloat162float(data[base + rot_offset5]);
+  const float data_6 = __bfloat162float(data[base + rot_offset6]);
+  const float data_7 = __bfloat162float(data[base + rot_offset7]);
+  float sum = data_0 * data_0 + data_1 * data_1 + data_2 * data_2 +
+              data_3 * data_3 + data_4 * data_4 + data_5 * data_5 +
+              data_6 * data_6 + data_7 * data_7;
+  const unsigned int half_mask = half == 0 ? 0x0000ffffU : 0xffff0000U;
+#pragma unroll
+  for (int mask = 8; mask > 0; mask >>= 1) {
+    sum += __shfl_xor_sync(half_mask, sum, mask);
+  }
+  const float scale = fast_rsqrt(sum * (1.0f / 128.0f) + eps);
+
+  int64_t pos = 0;
+  int64_t pos0;
+  int64_t pos1;
+  int64_t pos2;
+  int64_t pos3;
+  if constexpr (SAME_POSITION) {
+    pos = positions[token];
+  } else {
+    constexpr unsigned int axis0_mask1 = 0x92492492U;
+    constexpr unsigned int axis0_mask2 = 0x24924924U;
+    constexpr unsigned int axis1_mask1 = 0x04924924U;
+    constexpr unsigned int axis1_mask2 = 0x09249249U;
+    const unsigned int lane_bit0 = 1U << sublane;
+    const unsigned int lane_bit1 = 1U << (sublane + 16);
+    const int axis0 =
+        ((axis0_mask1 & lane_bit0) != 0U) +
+        (((axis0_mask2 & lane_bit0) != 0U) << 1);
+    const int axis1 =
+        ((axis0_mask1 & lane_bit1) != 0U) +
+        (((axis0_mask2 & lane_bit1) != 0U) << 1);
+    const int axis2 =
+        ((axis1_mask1 & lane_bit0) != 0U) +
+        (((axis1_mask2 & lane_bit0) != 0U) << 1);
+    const int axis3 =
+        ((axis1_mask1 & lane_bit1) != 0U) +
+        (((axis1_mask2 & lane_bit1) != 0U) << 1);
+    // Positions are shared by all heads for the token; load once per axis in
+    // each half warp and broadcast to avoid repeated global position loads.
+    const int64_t axis_pos =
+        sublane < 3
+            ? positions[(int64_t)sublane * position_stride + token]
+            : 0;
+    pos0 = __shfl_sync(half_mask, axis_pos, half * 16 + axis0);
+    pos1 = __shfl_sync(half_mask, axis_pos, half * 16 + axis1);
+    pos2 = __shfl_sync(half_mask, axis_pos, half * 16 + axis2);
+    pos3 = __shfl_sync(half_mask, axis_pos, half * 16 + axis3);
+  }
+  const int64_t q_out_base =
+      CONTIGUOUS
+          ? ((int64_t)token * q_heads + head) * hidden
+          : (int64_t)token * q_out_batch_stride +
+                (int64_t)head * q_out_head_stride;
+  const int64_t k_cache_base =
+      CONTIGUOUS ? cache_idx * hidden : cache_idx * k_cache_row_stride;
+  const int64_t k_out_base =
+      CONTIGUOUS ? (int64_t)token * hidden
+                 : (int64_t)token * k_out_batch_stride;
+
+#define SGL_Q8KV1_ROTATE_STORE(XOFF, YOFF, XVAL, YVAL, POS_VALUE)           \
+  do {                                                                       \
+    const __mt_bfloat16 *__restrict__ cache_ptr =                            \
+        cos_sin_cache + (POS_VALUE)*rot_dim;                                 \
+    const float cos_v = __bfloat162float(cache_ptr[(XOFF)]);                 \
+    const float sin_v = __bfloat162float(cache_ptr[embed_dim + (XOFF)]);      \
+    const float x_weight =                                                   \
+        __bfloat162float(weight[(XOFF)]) + (GEMMA ? 1.0f : 0.0f);            \
+    const float y_weight =                                                   \
+        __bfloat162float(weight[(YOFF)]) + (GEMMA ? 1.0f : 0.0f);            \
+    const float x = (XVAL)*scale * x_weight;                                 \
+    const float y = (YVAL)*scale * y_weight;                                 \
+    const __mt_bfloat16 x_rot =                                              \
+        __float2bfloat16_rn(x * cos_v - y * sin_v);                          \
+    const __mt_bfloat16 y_rot =                                              \
+        __float2bfloat16_rn(y * cos_v + x * sin_v);                          \
+    if (is_q) {                                                              \
+      q_out[q_out_base + (XOFF)] = x_rot;                                    \
+      q_out[q_out_base + (YOFF)] = y_rot;                                    \
+    } else {                                                                 \
+      k_cache[k_cache_base + (XOFF)] = x_rot;                                \
+      k_cache[k_cache_base + (YOFF)] = y_rot;                                \
+      if constexpr (STORE_K_OUT) {                                           \
+        k_out[k_out_base + (XOFF)] = x_rot;                                  \
+        k_out[k_out_base + (YOFF)] = y_rot;                                  \
+      }                                                                      \
+    }                                                                        \
+  } while (0)
+
+  if constexpr (SAME_POSITION) {
+    const __mt_bfloat16 *__restrict__ same_cache_ptr =
+        cos_sin_cache + pos * rot_dim;
+#define SGL_Q8KV1_ROTATE_STORE_SAMEPOS(XOFF, YOFF, XVAL, YVAL)             \
+    do {                                                                     \
+      const float cos_v = __bfloat162float(same_cache_ptr[(XOFF)]);          \
+      const float sin_v =                                                    \
+          __bfloat162float(same_cache_ptr[embed_dim + (XOFF)]);              \
+      const float x_weight =                                                 \
+          __bfloat162float(weight[(XOFF)]) + (GEMMA ? 1.0f : 0.0f);          \
+      const float y_weight =                                                 \
+          __bfloat162float(weight[(YOFF)]) + (GEMMA ? 1.0f : 0.0f);          \
+      const float x = (XVAL)*scale * x_weight;                               \
+      const float y = (YVAL)*scale * y_weight;                               \
+      const __mt_bfloat16 x_rot =                                            \
+          __float2bfloat16_rn(x * cos_v - y * sin_v);                        \
+      const __mt_bfloat16 y_rot =                                            \
+          __float2bfloat16_rn(y * cos_v + x * sin_v);                        \
+      if (is_q) {                                                            \
+        q_out[q_out_base + (XOFF)] = x_rot;                                  \
+        q_out[q_out_base + (YOFF)] = y_rot;                                  \
+      } else {                                                               \
+        k_cache[k_cache_base + (XOFF)] = x_rot;                              \
+        k_cache[k_cache_base + (YOFF)] = y_rot;                              \
+        if constexpr (STORE_K_OUT) {                                         \
+          k_out[k_out_base + (XOFF)] = x_rot;                                \
+          k_out[k_out_base + (YOFF)] = y_rot;                                \
+        }                                                                    \
+      }                                                                      \
+    } while (0)
+
+    SGL_Q8KV1_ROTATE_STORE_SAMEPOS(rot_offset0, rot_offset4, data_0, data_4);
+    SGL_Q8KV1_ROTATE_STORE_SAMEPOS(rot_offset1, rot_offset5, data_1, data_5);
+    SGL_Q8KV1_ROTATE_STORE_SAMEPOS(rot_offset2, rot_offset6, data_2, data_6);
+    SGL_Q8KV1_ROTATE_STORE_SAMEPOS(rot_offset3, rot_offset7, data_3, data_7);
+
+#undef SGL_Q8KV1_ROTATE_STORE_SAMEPOS
+  } else {
+    SGL_Q8KV1_ROTATE_STORE(rot_offset0, rot_offset4, data_0, data_4, pos0);
+    SGL_Q8KV1_ROTATE_STORE(rot_offset1, rot_offset5, data_1, data_5, pos1);
+    SGL_Q8KV1_ROTATE_STORE(rot_offset2, rot_offset6, data_2, data_6, pos2);
+    SGL_Q8KV1_ROTATE_STORE(rot_offset3, rot_offset7, data_3, data_7, pos3);
+  }
+
+#undef SGL_Q8KV1_ROTATE_STORE
+}
+
+template <bool STREAMING_STORE>
+__device__ __forceinline__ void qk_mrope_store_bfloat162(
+    __mt_bfloat162 *ptr, __mt_bfloat162 value) {
+  if constexpr (STREAMING_STORE) {
+    __stcs(ptr, value);
+  } else {
+    *ptr = value;
+  }
+}
+
+template <typename index_t, bool GEMMA, bool SAME_POSITION = true,
+          int TOKENS_PER_BLOCK = 3, bool STREAMING_STORE = false>
+__global__ void
+fused_qk_rmsnorm_mrope_cache_out_h128_q8kv1_tpb2_pair_halfwarp_bf16_kernel(
+    const __mt_bfloat16 *__restrict__ q, const __mt_bfloat16 *__restrict__ k,
+    const __mt_bfloat16 *__restrict__ v,
+    const __mt_bfloat16 *__restrict__ q_weight,
+    const __mt_bfloat16 *__restrict__ k_weight,
+    const int64_t *__restrict__ positions,
+    const __mt_bfloat16 *__restrict__ cos_sin_cache,
+    __mt_bfloat16 *__restrict__ q_out, __mt_bfloat16 *__restrict__ k_out,
+    __mt_bfloat16 *__restrict__ k_cache, __mt_bfloat16 *__restrict__ v_cache,
+    const index_t *__restrict__ indices, int batch, int64_t position_stride,
+    int64_t q_batch_stride, int64_t q_head_stride, int64_t k_batch_stride,
+    int64_t k_head_stride, int64_t v_batch_stride, int64_t v_head_stride,
+    int64_t q_out_batch_stride, int64_t q_out_head_stride,
+    int64_t k_out_batch_stride, int64_t k_out_head_stride,
+    int64_t k_cache_row_stride, int64_t v_cache_row_stride,
+    int64_t indices_stride, float eps) {
+  constexpr int hidden = 128;
+  constexpr int embed_dim = 64;
+  constexpr int rot_dim = 128;
+  constexpr int q_heads = 8;
+  constexpr int halfwarps_per_token = 9;
+
+  const int tid = (int)threadIdx.x;
+  const int lane = tid & 31;
+  const int half = lane >> 4;
+  const int sublane = lane & 15;
+  const int warp = tid >> 5;
+  const int logical_halfwarp = warp * 2 + half;
+  if (logical_halfwarp >= halfwarps_per_token * TOKENS_PER_BLOCK) {
+    return;
+  }
+  const int token_slot = logical_halfwarp / halfwarps_per_token;
+  const int head_slot = logical_halfwarp - token_slot * halfwarps_per_token;
+  const int token = (int)blockIdx.x * TOKENS_PER_BLOCK + token_slot;
+  if (token >= batch) {
+    return;
+  }
+
+  const int64_t cache_idx = static_cast<int64_t>(indices[token]);
+  if (head_slot == q_heads) {
+    const int col = sublane * 8;
+    Vec8<__mt_bfloat16> v_vec =
+        Vec8<__mt_bfloat16>::load(v + (int64_t)token * hidden, col);
+    *(Vec8<__mt_bfloat16> *)(v_cache + cache_idx * hidden + col) = v_vec;
+  }
+
+  const bool is_q = head_slot < q_heads;
+  const int head = is_q ? head_slot : 0;
+  const __mt_bfloat16 *__restrict__ data = is_q ? q : k;
+  const __mt_bfloat16 *__restrict__ weight = is_q ? q_weight : k_weight;
+  const int64_t base =
+      is_q ? ((int64_t)token * q_heads + head) * hidden
+           : (int64_t)token * hidden;
+  const int pair_col = sublane * 2;
+
+  const float2 data_x0 = __bfloat1622float2(
+      *reinterpret_cast<const __mt_bfloat162 *>(data + base + pair_col));
+  const float2 data_x1 = __bfloat1622float2(
+      *reinterpret_cast<const __mt_bfloat162 *>(data + base + 32 + pair_col));
+  const float2 data_y0 = __bfloat1622float2(
+      *reinterpret_cast<const __mt_bfloat162 *>(data + base + 64 + pair_col));
+  const float2 data_y1 = __bfloat1622float2(
+      *reinterpret_cast<const __mt_bfloat162 *>(data + base + 96 + pair_col));
+  float sum = data_x0.x * data_x0.x + data_x0.y * data_x0.y +
+              data_x1.x * data_x1.x + data_x1.y * data_x1.y +
+              data_y0.x * data_y0.x + data_y0.y * data_y0.y +
+              data_y1.x * data_y1.x + data_y1.y * data_y1.y;
+  const unsigned int half_mask = half == 0 ? 0x0000ffffU : 0xffff0000U;
+#pragma unroll
+  for (int mask = 8; mask > 0; mask >>= 1) {
+    sum += __shfl_xor_sync(half_mask, sum, mask);
+  }
+  const float scale = fast_rsqrt(sum * (1.0f / 128.0f) + eps);
+
+  float2 cos0;
+  float2 sin0;
+  float2 cos1;
+  float2 sin1;
+  if constexpr (SAME_POSITION) {
+    const int64_t pos = positions[token];
+    const __mt_bfloat16 *__restrict__ cache_ptr = cos_sin_cache + pos * rot_dim;
+    cos0 = __bfloat1622float2(
+        *reinterpret_cast<const __mt_bfloat162 *>(cache_ptr + pair_col));
+    sin0 = __bfloat1622float2(*reinterpret_cast<const __mt_bfloat162 *>(
+        cache_ptr + embed_dim + pair_col));
+    cos1 = __bfloat1622float2(
+        *reinterpret_cast<const __mt_bfloat162 *>(cache_ptr + 32 + pair_col));
+    sin1 = __bfloat1622float2(*reinterpret_cast<const __mt_bfloat162 *>(
+        cache_ptr + embed_dim + 32 + pair_col));
+  } else {
+    const int axis0x = mrope_24_20_20_interleaved_axis(pair_col);
+    const int axis0y = mrope_24_20_20_interleaved_axis(pair_col + 1);
+    const int axis1x = mrope_24_20_20_interleaved_axis(pair_col + 32);
+    const int axis1y = mrope_24_20_20_interleaved_axis(pair_col + 33);
+    const int64_t axis_pos =
+        sublane < 3
+            ? positions[(int64_t)sublane * position_stride + token]
+            : 0;
+    const int64_t pos0x = __shfl_sync(half_mask, axis_pos, half * 16 + axis0x);
+    const int64_t pos0y = __shfl_sync(half_mask, axis_pos, half * 16 + axis0y);
+    const int64_t pos1x = __shfl_sync(half_mask, axis_pos, half * 16 + axis1x);
+    const int64_t pos1y = __shfl_sync(half_mask, axis_pos, half * 16 + axis1y);
+    const __mt_bfloat16 *__restrict__ cache_ptr0x =
+        cos_sin_cache + pos0x * rot_dim;
+    const __mt_bfloat16 *__restrict__ cache_ptr0y =
+        cos_sin_cache + pos0y * rot_dim;
+    const __mt_bfloat16 *__restrict__ cache_ptr1x =
+        cos_sin_cache + pos1x * rot_dim;
+    const __mt_bfloat16 *__restrict__ cache_ptr1y =
+        cos_sin_cache + pos1y * rot_dim;
+    cos0 = {__bfloat162float(cache_ptr0x[pair_col]),
+            __bfloat162float(cache_ptr0y[pair_col + 1])};
+    sin0 = {__bfloat162float(cache_ptr0x[embed_dim + pair_col]),
+            __bfloat162float(cache_ptr0y[embed_dim + pair_col + 1])};
+    cos1 = {__bfloat162float(cache_ptr1x[32 + pair_col]),
+            __bfloat162float(cache_ptr1y[32 + pair_col + 1])};
+    sin1 = {__bfloat162float(cache_ptr1x[embed_dim + 32 + pair_col]),
+            __bfloat162float(cache_ptr1y[embed_dim + 32 + pair_col + 1])};
+  }
+  float2 x_weight0 = __bfloat1622float2(
+      *reinterpret_cast<const __mt_bfloat162 *>(weight + pair_col));
+  float2 y_weight0 = __bfloat1622float2(
+      *reinterpret_cast<const __mt_bfloat162 *>(weight + 64 + pair_col));
+  float2 x_weight1 = __bfloat1622float2(
+      *reinterpret_cast<const __mt_bfloat162 *>(weight + 32 + pair_col));
+  float2 y_weight1 = __bfloat1622float2(
+      *reinterpret_cast<const __mt_bfloat162 *>(weight + 96 + pair_col));
+  if constexpr (GEMMA) {
+    x_weight0.x += 1.0f;
+    x_weight0.y += 1.0f;
+    y_weight0.x += 1.0f;
+    y_weight0.y += 1.0f;
+    x_weight1.x += 1.0f;
+    x_weight1.y += 1.0f;
+    y_weight1.x += 1.0f;
+    y_weight1.y += 1.0f;
+  }
+
+  const float2 x0 = {data_x0.x * scale * x_weight0.x,
+                     data_x0.y * scale * x_weight0.y};
+  const float2 y0 = {data_y0.x * scale * y_weight0.x,
+                     data_y0.y * scale * y_weight0.y};
+  const float2 x1 = {data_x1.x * scale * x_weight1.x,
+                     data_x1.y * scale * x_weight1.y};
+  const float2 y1 = {data_y1.x * scale * y_weight1.x,
+                     data_y1.y * scale * y_weight1.y};
+  const float2 x_rot0_f = {x0.x * cos0.x - y0.x * sin0.x,
+                           x0.y * cos0.y - y0.y * sin0.y};
+  const float2 y_rot0_f = {y0.x * cos0.x + x0.x * sin0.x,
+                           y0.y * cos0.y + x0.y * sin0.y};
+  const float2 x_rot1_f = {x1.x * cos1.x - y1.x * sin1.x,
+                           x1.y * cos1.y - y1.y * sin1.y};
+  const float2 y_rot1_f = {y1.x * cos1.x + x1.x * sin1.x,
+                           y1.y * cos1.y + x1.y * sin1.y};
+  const __mt_bfloat162 x_rot0 = __float22bfloat162_rn(x_rot0_f);
+  const __mt_bfloat162 y_rot0 = __float22bfloat162_rn(y_rot0_f);
+  const __mt_bfloat162 x_rot1 = __float22bfloat162_rn(x_rot1_f);
+  const __mt_bfloat162 y_rot1 = __float22bfloat162_rn(y_rot1_f);
+
+  if (is_q) {
+    const int64_t q_out_base = ((int64_t)token * q_heads + head) * hidden;
+    qk_mrope_store_bfloat162<STREAMING_STORE>(
+        reinterpret_cast<__mt_bfloat162 *>(q_out + q_out_base + pair_col),
+        x_rot0);
+    qk_mrope_store_bfloat162<STREAMING_STORE>(
+        reinterpret_cast<__mt_bfloat162 *>(q_out + q_out_base + 64 + pair_col),
+        y_rot0);
+    qk_mrope_store_bfloat162<STREAMING_STORE>(
+        reinterpret_cast<__mt_bfloat162 *>(q_out + q_out_base + 32 + pair_col),
+        x_rot1);
+    qk_mrope_store_bfloat162<STREAMING_STORE>(
+        reinterpret_cast<__mt_bfloat162 *>(q_out + q_out_base + 96 + pair_col),
+        y_rot1);
+  } else {
+    const int64_t k_cache_base = cache_idx * hidden;
+    qk_mrope_store_bfloat162<STREAMING_STORE>(
+        reinterpret_cast<__mt_bfloat162 *>(k_cache + k_cache_base + pair_col),
+        x_rot0);
+    qk_mrope_store_bfloat162<STREAMING_STORE>(
+        reinterpret_cast<__mt_bfloat162 *>(k_cache + k_cache_base + 64 + pair_col),
+        y_rot0);
+    qk_mrope_store_bfloat162<STREAMING_STORE>(
+        reinterpret_cast<__mt_bfloat162 *>(k_cache + k_cache_base + 32 + pair_col),
+        x_rot1);
+    qk_mrope_store_bfloat162<STREAMING_STORE>(
+        reinterpret_cast<__mt_bfloat162 *>(k_cache + k_cache_base + 96 + pair_col),
+        y_rot1);
+    const int64_t k_out_base = (int64_t)token * hidden;
+    qk_mrope_store_bfloat162<STREAMING_STORE>(
+        reinterpret_cast<__mt_bfloat162 *>(k_out + k_out_base + pair_col),
+        x_rot0);
+    qk_mrope_store_bfloat162<STREAMING_STORE>(
+        reinterpret_cast<__mt_bfloat162 *>(k_out + k_out_base + 64 + pair_col),
+        y_rot0);
+    qk_mrope_store_bfloat162<STREAMING_STORE>(
+        reinterpret_cast<__mt_bfloat162 *>(k_out + k_out_base + 32 + pair_col),
+        x_rot1);
+    qk_mrope_store_bfloat162<STREAMING_STORE>(
+        reinterpret_cast<__mt_bfloat162 *>(k_out + k_out_base + 96 + pair_col),
+        y_rot1);
+  }
+}
+
 template <typename index_t, int Q_HEADS, int K_HEADS, bool GEMMA,
           int HEADS_PER_BLOCK = 8, bool STORE_K_OUT = true>
 __global__ void fused_qk_rmsnorm_rope_cache_h128_full_bf16_kernel(
@@ -2012,6 +2584,212 @@ void launch_h128_full_mrope_cache_out_kernel(
 #undef LAUNCH_H128_FULL_MROPE_CACHE_OUT
 }
 
+template <typename index_t, bool GEMMA>
+void launch_h128_full_mrope_q8kv1_tpb2_cache_kernel(
+    ffi::TensorView q, ffi::TensorView k, ffi::TensorView v,
+    ffi::TensorView q_weight, ffi::TensorView k_weight,
+    ffi::TensorView positions, ffi::TensorView cos_sin_cache,
+    ffi::TensorView q_out, ffi::TensorView k_cache, ffi::TensorView v_cache,
+    ffi::TensorView indices, int batch, float eps, musaStream_t stream) {
+  constexpr int full_threads = 32 * 9 * 2;
+  constexpr int halfwarp_threads = 32 * 14;
+  constexpr int q_heads = 8;
+  const int full_grid = (batch + 1) / 2;
+  const int halfwarp_grid = (batch + 2) / 3;
+  const bool contiguous =
+      q.stride(0) == q_heads * 128 && q.stride(1) == 128 &&
+      k.stride(0) == 128 && k.stride(1) == 128 &&
+      v.stride(0) == 128 && v.stride(1) == 128 &&
+      q_out.stride(0) == q_heads * 128 && q_out.stride(1) == 128 &&
+      k_cache.stride(0) == 128 && v_cache.stride(0) == 128 &&
+      indices.stride(0) == 1;
+#define LAUNCH_H128_Q8KV1_TPB2_CACHE(KERNEL, GRID, THREADS,                 \
+                                     SAME_POSITION_VALUE, TPB,               \
+                                     CONTIGUOUS_VALUE)                       \
+  KERNEL<index_t, GEMMA, false, SAME_POSITION_VALUE, TPB, CONTIGUOUS_VALUE>  \
+      <<<GRID, THREADS, 0, stream>>>(                                        \
+          static_cast<const __mt_bfloat16 *>(q.data_ptr()),                  \
+          static_cast<const __mt_bfloat16 *>(k.data_ptr()),                  \
+          static_cast<const __mt_bfloat16 *>(v.data_ptr()),                  \
+          static_cast<const __mt_bfloat16 *>(q_weight.data_ptr()),           \
+          static_cast<const __mt_bfloat16 *>(k_weight.data_ptr()),           \
+          static_cast<const int64_t *>(positions.data_ptr()),                \
+          static_cast<const __mt_bfloat16 *>(cos_sin_cache.data_ptr()),      \
+          static_cast<__mt_bfloat16 *>(q_out.data_ptr()), nullptr,           \
+          static_cast<__mt_bfloat16 *>(k_cache.data_ptr()),                  \
+          static_cast<__mt_bfloat16 *>(v_cache.data_ptr()),                  \
+          static_cast<const index_t *>(indices.data_ptr()), batch,           \
+          static_cast<int64_t>(positions.stride(0)),                         \
+          static_cast<int64_t>(q.stride(0)),                                 \
+          static_cast<int64_t>(q.stride(1)),                                 \
+          static_cast<int64_t>(k.stride(0)),                                 \
+          static_cast<int64_t>(k.stride(1)),                                 \
+          static_cast<int64_t>(v.stride(0)),                                 \
+          static_cast<int64_t>(v.stride(1)),                                 \
+          static_cast<int64_t>(q_out.stride(0)),                             \
+          static_cast<int64_t>(q_out.stride(1)), 0, 0,                       \
+          static_cast<int64_t>(k_cache.stride(0)),                           \
+          static_cast<int64_t>(v_cache.stride(0)),                           \
+          static_cast<int64_t>(indices.stride(0)), eps)
+  if (positions.stride(0) == 0) {
+    if (batch >= 1024) {
+      if (contiguous) {
+        LAUNCH_H128_Q8KV1_TPB2_CACHE(
+            fused_qk_rmsnorm_mrope_cache_h128_q8kv1_tpb2_halfwarp_bf16_kernel,
+            halfwarp_grid, halfwarp_threads, true, 3, true);
+      } else {
+        LAUNCH_H128_Q8KV1_TPB2_CACHE(
+            fused_qk_rmsnorm_mrope_cache_h128_q8kv1_tpb2_halfwarp_bf16_kernel,
+            halfwarp_grid, halfwarp_threads, true, 3, false);
+      }
+    } else {
+      LAUNCH_H128_Q8KV1_TPB2_CACHE(
+          fused_qk_rmsnorm_mrope_cache_h128_q8kv1_tpb2_bf16_kernel,
+          full_grid, full_threads, true, 2, false);
+    }
+  } else {
+    if (batch >= 1024) {
+      if (contiguous) {
+        LAUNCH_H128_Q8KV1_TPB2_CACHE(
+            fused_qk_rmsnorm_mrope_cache_h128_q8kv1_tpb2_halfwarp_bf16_kernel,
+            halfwarp_grid, halfwarp_threads, false, 3, true);
+      } else {
+        LAUNCH_H128_Q8KV1_TPB2_CACHE(
+            fused_qk_rmsnorm_mrope_cache_h128_q8kv1_tpb2_halfwarp_bf16_kernel,
+            halfwarp_grid, halfwarp_threads, false, 3, false);
+      }
+    } else {
+      LAUNCH_H128_Q8KV1_TPB2_CACHE(
+          fused_qk_rmsnorm_mrope_cache_h128_q8kv1_tpb2_bf16_kernel,
+          full_grid, full_threads, false, 2, false);
+    }
+  }
+#undef LAUNCH_H128_Q8KV1_TPB2_CACHE
+}
+
+template <typename index_t, bool GEMMA>
+void launch_h128_full_mrope_q8kv1_tpb2_cache_out_kernel(
+    ffi::TensorView q, ffi::TensorView k, ffi::TensorView v,
+    ffi::TensorView q_weight, ffi::TensorView k_weight,
+    ffi::TensorView positions, ffi::TensorView cos_sin_cache,
+    ffi::TensorView q_out, ffi::TensorView k_out, ffi::TensorView k_cache,
+    ffi::TensorView v_cache, ffi::TensorView indices, int batch, float eps,
+    musaStream_t stream) {
+  constexpr int full_threads = 32 * 9 * 2;
+  constexpr int halfwarp_threads = 32 * 14;
+  constexpr int q_heads = 8;
+  const int full_grid = (batch + 1) / 2;
+  const int halfwarp_grid = (batch + 2) / 3;
+  const bool contiguous =
+      q.stride(0) == q_heads * 128 && q.stride(1) == 128 &&
+      k.stride(0) == 128 && k.stride(1) == 128 &&
+      v.stride(0) == 128 && v.stride(1) == 128 &&
+      q_out.stride(0) == q_heads * 128 && q_out.stride(1) == 128 &&
+      k_out.stride(0) == 128 && k_out.stride(1) == 128 &&
+      k_cache.stride(0) == 128 && v_cache.stride(0) == 128 &&
+      indices.stride(0) == 1;
+#define LAUNCH_H128_Q8KV1_TPB2_CACHE_OUT(KERNEL, GRID, THREADS,             \
+                                         SAME_POSITION_VALUE, TPB,           \
+                                         CONTIGUOUS_VALUE)                   \
+  KERNEL<index_t, GEMMA, true, SAME_POSITION_VALUE, TPB, CONTIGUOUS_VALUE>   \
+      <<<GRID, THREADS, 0, stream>>>(                                        \
+          static_cast<const __mt_bfloat16 *>(q.data_ptr()),                  \
+          static_cast<const __mt_bfloat16 *>(k.data_ptr()),                  \
+          static_cast<const __mt_bfloat16 *>(v.data_ptr()),                  \
+          static_cast<const __mt_bfloat16 *>(q_weight.data_ptr()),           \
+          static_cast<const __mt_bfloat16 *>(k_weight.data_ptr()),           \
+          static_cast<const int64_t *>(positions.data_ptr()),                \
+          static_cast<const __mt_bfloat16 *>(cos_sin_cache.data_ptr()),      \
+          static_cast<__mt_bfloat16 *>(q_out.data_ptr()),                    \
+          static_cast<__mt_bfloat16 *>(k_out.data_ptr()),                    \
+          static_cast<__mt_bfloat16 *>(k_cache.data_ptr()),                  \
+          static_cast<__mt_bfloat16 *>(v_cache.data_ptr()),                  \
+          static_cast<const index_t *>(indices.data_ptr()), batch,           \
+          static_cast<int64_t>(positions.stride(0)),                         \
+          static_cast<int64_t>(q.stride(0)),                                 \
+          static_cast<int64_t>(q.stride(1)),                                 \
+          static_cast<int64_t>(k.stride(0)),                                 \
+          static_cast<int64_t>(k.stride(1)),                                 \
+          static_cast<int64_t>(v.stride(0)),                                 \
+          static_cast<int64_t>(v.stride(1)),                                 \
+          static_cast<int64_t>(q_out.stride(0)),                             \
+          static_cast<int64_t>(q_out.stride(1)),                             \
+          static_cast<int64_t>(k_out.stride(0)),                             \
+          static_cast<int64_t>(k_out.stride(1)),                             \
+          static_cast<int64_t>(k_cache.stride(0)),                           \
+          static_cast<int64_t>(v_cache.stride(0)),                           \
+          static_cast<int64_t>(indices.stride(0)), eps)
+#define LAUNCH_H128_Q8KV1_PAIR_CACHE_OUT(GRID, THREADS, SAME_POSITION_VALUE, \
+                                          TPB, STREAMING)                    \
+  fused_qk_rmsnorm_mrope_cache_out_h128_q8kv1_tpb2_pair_halfwarp_bf16_kernel<\
+      index_t, GEMMA, SAME_POSITION_VALUE, TPB, STREAMING>                  \
+      <<<GRID, THREADS, 0, stream>>>(                                       \
+      static_cast<const __mt_bfloat16 *>(q.data_ptr()),                     \
+      static_cast<const __mt_bfloat16 *>(k.data_ptr()),                     \
+      static_cast<const __mt_bfloat16 *>(v.data_ptr()),                     \
+      static_cast<const __mt_bfloat16 *>(q_weight.data_ptr()),              \
+      static_cast<const __mt_bfloat16 *>(k_weight.data_ptr()),              \
+      static_cast<const int64_t *>(positions.data_ptr()),                   \
+      static_cast<const __mt_bfloat16 *>(cos_sin_cache.data_ptr()),         \
+      static_cast<__mt_bfloat16 *>(q_out.data_ptr()),                       \
+      static_cast<__mt_bfloat16 *>(k_out.data_ptr()),                       \
+      static_cast<__mt_bfloat16 *>(k_cache.data_ptr()),                     \
+      static_cast<__mt_bfloat16 *>(v_cache.data_ptr()),                     \
+      static_cast<const index_t *>(indices.data_ptr()), batch,              \
+      static_cast<int64_t>(positions.stride(0)),                            \
+      static_cast<int64_t>(q.stride(0)),                                    \
+      static_cast<int64_t>(q.stride(1)),                                    \
+      static_cast<int64_t>(k.stride(0)),                                    \
+      static_cast<int64_t>(k.stride(1)),                                    \
+      static_cast<int64_t>(v.stride(0)),                                    \
+      static_cast<int64_t>(v.stride(1)),                                    \
+      static_cast<int64_t>(q_out.stride(0)),                                \
+      static_cast<int64_t>(q_out.stride(1)),                                \
+      static_cast<int64_t>(k_out.stride(0)),                                \
+      static_cast<int64_t>(k_out.stride(1)),                                \
+      static_cast<int64_t>(k_cache.stride(0)),                              \
+      static_cast<int64_t>(v_cache.stride(0)),                              \
+      static_cast<int64_t>(indices.stride(0)), eps)
+  if (positions.stride(0) == 0) {
+    if (batch >= 256) {
+      if (contiguous) {
+        if (batch >= 8192) {
+          LAUNCH_H128_Q8KV1_PAIR_CACHE_OUT(
+              halfwarp_grid, halfwarp_threads, true, 3, true);
+        } else {
+          LAUNCH_H128_Q8KV1_PAIR_CACHE_OUT(
+              halfwarp_grid, halfwarp_threads, true, 3, false);
+        }
+      } else {
+        LAUNCH_H128_Q8KV1_TPB2_CACHE_OUT(
+            fused_qk_rmsnorm_mrope_cache_h128_q8kv1_tpb2_halfwarp_bf16_kernel,
+            halfwarp_grid, halfwarp_threads, true, 3, false);
+      }
+    } else {
+      LAUNCH_H128_Q8KV1_TPB2_CACHE_OUT(
+          fused_qk_rmsnorm_mrope_cache_h128_q8kv1_tpb2_bf16_kernel,
+          full_grid, full_threads, true, 2, false);
+    }
+  } else {
+    if (batch >= 128) {
+      if (contiguous) {
+        LAUNCH_H128_Q8KV1_PAIR_CACHE_OUT(
+            halfwarp_grid, halfwarp_threads, false, 3, false);
+      } else {
+        LAUNCH_H128_Q8KV1_TPB2_CACHE_OUT(
+            fused_qk_rmsnorm_mrope_cache_h128_q8kv1_tpb2_halfwarp_bf16_kernel,
+            halfwarp_grid, halfwarp_threads, false, 3, false);
+      }
+    } else {
+      LAUNCH_H128_Q8KV1_TPB2_CACHE_OUT(
+          fused_qk_rmsnorm_mrope_cache_h128_q8kv1_tpb2_bf16_kernel,
+          full_grid, full_threads, false, 2, false);
+    }
+  }
+#undef LAUNCH_H128_Q8KV1_PAIR_CACHE_OUT
+#undef LAUNCH_H128_Q8KV1_TPB2_CACHE_OUT
+}
+
 template <typename index_t, int Q_HEADS, int K_HEADS, bool GEMMA,
           int HEADS_PER_BLOCK = 8>
 void launch_h128_full_rope_cache_kernel(
@@ -2365,6 +3143,18 @@ void launch_fused_qk_rmsnorm_mrope_cache_bf16(
     LAUNCH_H128_MROPE_CACHE(2, 1);
     LAUNCH_H128_MROPE_CACHE(4, 1);
     LAUNCH_H128_MROPE_CACHE(4, 2);
+    if (q_heads == 8 && k_heads == 1) {
+      if (gemma) {
+        launch_h128_full_mrope_q8kv1_tpb2_cache_kernel<index_t, true>(
+            q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out,
+            k_cache, v_cache, indices, batch, eps, stream);
+      } else {
+        launch_h128_full_mrope_q8kv1_tpb2_cache_kernel<index_t, false>(
+            q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out,
+            k_cache, v_cache, indices, batch, eps, stream);
+      }
+      return;
+    }
     LAUNCH_H128_MROPE_CACHE(8, 2);
     LAUNCH_H128_MROPE_CACHE(8, 4);
     LAUNCH_H128_MROPE_CACHE(16, 4);
@@ -2741,6 +3531,18 @@ void launch_fused_qk_rmsnorm_mrope_cache_out_bf16(
     LAUNCH_H128_MROPE_CACHE_OUT(2, 1);
     LAUNCH_H128_MROPE_CACHE_OUT(4, 1);
     LAUNCH_H128_MROPE_CACHE_OUT(4, 2);
+    if (q_heads == 8 && k_heads == 1) {
+      if (gemma) {
+        launch_h128_full_mrope_q8kv1_tpb2_cache_out_kernel<index_t, true>(
+            q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out,
+            k_out, k_cache, v_cache, indices, batch, eps, stream);
+      } else {
+        launch_h128_full_mrope_q8kv1_tpb2_cache_out_kernel<index_t, false>(
+            q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out,
+            k_out, k_cache, v_cache, indices, batch, eps, stream);
+      }
+      return;
+    }
     LAUNCH_H128_MROPE_CACHE_OUT(8, 2);
     LAUNCH_H128_MROPE_CACHE_OUT(8, 4);
     LAUNCH_H128_MROPE_CACHE_OUT(16, 4);
