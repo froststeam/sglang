@@ -235,6 +235,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.is_nextn = prefix.startswith("mtp")
+        self._is_deepep_moe = get_moe_a2a_backend().is_deepep()
+        self.moe_ep_size = get_moe_expert_parallel_world_size()
         if self.tp_size > config.num_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -253,10 +255,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # n_shared_experts is not defined, but shared_expert_intermediate_size is defined, so we use 1 as the number of shared experts
             self.num_shared_experts = 1
 
+        self._fuse_shared_experts_inside_sbo = (
+            SboFlags.fuse_shared_experts_inside_sbo() and self._is_deepep_moe
+        )
         self.enable_shared_expert_fusion = (
             support_shared_expert_fusion
             and can_fuse_shared_expert(config, quant_config)
             and (_use_aiter or _is_musa)
+            and not self._fuse_shared_experts_inside_sbo
         )
         if self.enable_shared_expert_fusion:
             self.num_fused_shared_experts = self.num_shared_experts
@@ -272,9 +278,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             top_k=config.num_experts_per_tok
             + (self.num_fused_shared_experts if _is_musa else 0),
             renormalize=config.norm_topk_prob,
-            num_fused_shared_experts=(
-                self.num_fused_shared_experts if _is_musa else 0
-            ),
+            num_fused_shared_experts=(self.num_fused_shared_experts if _is_musa else 0),
             layer_id=layer_id,
         )
 
@@ -321,11 +325,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_expert", prefix),
-                **(
-                    dict(tp_rank=0, tp_size=1)
-                    if get_moe_a2a_backend().is_deepep()
-                    else {}
-                ),
+                **(dict(tp_rank=0, tp_size=1) if self._is_deepep_moe else {}),
             )
         else:
             self.shared_expert = None
@@ -340,20 +340,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         else:
             self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
-        if get_moe_a2a_backend().is_deepep():
+        if self._is_deepep_moe:
             # TODO: we will support tp < ep in the future
-            self.ep_size = get_moe_expert_parallel_world_size()
+            self.ep_size = self.moe_ep_size
             self.num_experts = (
                 config.num_experts + get_global_server_args().ep_num_redundant_experts
             )
             self.top_k = config.num_experts_per_tok
         self.is_nextn = is_nextn
 
-        self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
-
     def get_moe_weights(self):
+        num_local_experts_for_eplb = (
+            self.experts.num_local_experts - self.num_fused_shared_experts
+        )
         return [
-            x.data
+            x.data[:num_local_experts_for_eplb]
             for name, x in self.experts.named_parameters()
             if name not in ["correction_bias"]
             and filter_moe_weight_param_global_expert(
@@ -408,7 +409,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
     def _forward_shared_experts(self, hidden_states: torch.Tensor):
         shared_output = None
-        if self.shared_expert is not None:
+        if hidden_states.shape[0] > 0 and self.shared_expert is not None:
             shared_output = self.shared_expert(hidden_states)
             if self.shared_expert_gate is not None:
                 if use_intel_amx_backend(self.shared_expert_gate):
@@ -450,7 +451,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         sbo_overlap_combine_shared_flag = (
             sbo_enabled_flag and SboFlags.enable_combine_shared_one_stream_overlap()
         )
-
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
@@ -458,8 +458,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 shared_output = shared_expert_on_independent_stream(
                     hidden_states.clone(), self._forward_shared_experts
                 )
-            else:
+            elif not self.enable_shared_expert_fusion and not sbo_enabled_flag:
                 shared_output = self._forward_shared_experts(hidden_states)
+            topk_kwargs = {}
+            if self.enable_shared_expert_fusion and _is_musa:
+                topk_kwargs["shared_expert_gate_output"] = (
+                    self._get_shared_expert_gate_output(hidden_states)
+                )
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -471,6 +476,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     if not self.is_nextn
                     else None
                 ),
+                **topk_kwargs,
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)

@@ -359,6 +359,7 @@ def try_prepare_musa_qkv_for_rope_attention(
 
     can_use_cache = forward_batch.out_cache_loc is not None and (
         forward_batch.forward_mode.is_decode()
+        or forward_batch.forward_mode.is_target_verify()
         or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
     )
     if (
