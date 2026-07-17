@@ -20,6 +20,13 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
         self,
         **kwargs,
     ):
+        # Qwen3NextConfig carries MoE defaults, but dense Qwen3.5 checkpoints
+        # intentionally omit these fields. Preserve that distinction so dense
+        # models are not treated as quantized MoE models during validation.
+        kwargs.setdefault("moe_intermediate_size", None)
+        kwargs.setdefault("num_experts", None)
+        kwargs.setdefault("num_experts_per_tok", None)
+
         # HF Qwen3.5 checkpoints may provide RoPE settings under rope_parameters.
         # Normalize it before parent init so downstream code sees the expected values.
         rope_parameters = kwargs.pop("rope_parameters", None)
