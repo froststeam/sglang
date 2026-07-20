@@ -19,11 +19,17 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_linear_ramp_mask,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import cpu_has_amx_support, is_cuda, is_npu
+from sglang.srt.utils import cpu_has_amx_support, is_cuda, is_musa, is_npu
 
 _is_cuda = is_cuda()
+_is_musa = is_musa()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
+
+if _is_musa:
+    from sglang.srt.hardware_backend.musa.jit_kernel.csrc.norm import (
+        fused_qk_mrope_cache,
+    )
 
 if _is_cuda:
     from sglang.jit_kernel.rope import apply_rope_with_cos_sin_cache_inplace
@@ -227,8 +233,56 @@ class MRotaryEmbedding(RotaryEmbedding):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert positions.ndim == 1 or positions.ndim == 2
         if positions.ndim == 2 and self.mrope_section:
-            return self.forward_triton(positions, query, key)
+            if _is_musa and fused_set_kv_buffer_arg is not None:
+                num_tokens = query.shape[0]
+                num_q_heads = query.shape[-1] // self.head_size
+                num_kv_heads = key.shape[-1] // self.head_size
+                query, key = fused_qk_mrope_cache(
+                    q=query.view(num_tokens, num_q_heads, self.head_size),
+                    k=key.view(num_tokens, num_kv_heads, self.head_size),
+                    v=fused_set_kv_buffer_arg.value.view(
+                        num_tokens, num_kv_heads, self.head_size
+                    ),
+                    positions=positions,
+                    cos_sin_cache=self.cos_sin_cache,
+                    k_cache=fused_set_kv_buffer_arg.k_buffer,
+                    v_cache=fused_set_kv_buffer_arg.v_buffer,
+                    indices=fused_set_kv_buffer_arg.cache_loc,
+                    is_neox=self.is_neox_style,
+                    mrope_section_t=self.mrope_section[0],
+                    mrope_section_h=self.mrope_section[1],
+                    mrope_section_w=self.mrope_section[2],
+                    is_interleaved=self.mrope_interleaved,
+                )
+                return query.view(num_tokens, -1), key.view(num_tokens, -1)
+            query, key = self.forward_triton(positions, query, key)
+            if fused_set_kv_buffer_arg is not None:
+                # The MRoPE Triton kernel rotates Q/K in-place but, unlike the
+                # regular RoPE fused kernel, does not consume the fused cache
+                # arguments.  The caller skips its fallback cache write when
+                # these arguments are present, so complete that ownership
+                # contract here.
+                self._store_fused_kv_cache(key, fused_set_kv_buffer_arg)
+            return query, key
         return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
+
+    @staticmethod
+    def _store_fused_kv_cache(key: torch.Tensor, fused_set_kv_buffer_arg) -> None:
+        cache_loc = fused_set_kv_buffer_arg.cache_loc
+        if cache_loc.dtype != torch.long:
+            cache_loc = cache_loc.to(torch.long)
+        fused_set_kv_buffer_arg.k_buffer.index_copy_(
+            0,
+            cache_loc,
+            key.reshape(-1, fused_set_kv_buffer_arg.k_buffer.shape[-1]),
+        )
+        fused_set_kv_buffer_arg.v_buffer.index_copy_(
+            0,
+            cache_loc,
+            fused_set_kv_buffer_arg.value.reshape(
+                -1, fused_set_kv_buffer_arg.v_buffer.shape[-1]
+            ),
+        )
 
     def forward_triton(
         self,
@@ -566,4 +620,7 @@ class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
         fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert positions.ndim == 1 or positions.ndim == 2
-        return self.forward_cuda(positions, query, key)
+        query, key = self.forward_cuda(positions, query, key)
+        if fused_set_kv_buffer_arg is not None:
+            self._store_fused_kv_cache(key, fused_set_kv_buffer_arg)
+        return query, key
