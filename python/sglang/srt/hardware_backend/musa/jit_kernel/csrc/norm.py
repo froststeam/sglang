@@ -182,10 +182,60 @@ def fused_qk_rmsnorm_mrope_cache(
         int(mrope_section_h),
         int(mrope_section_w),
         bool(is_interleaved),
+        True,
         float(eps),
         bool(gemma),
     )
     return q_out
+
+
+def fused_qk_mrope_cache(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    indices: torch.Tensor,
+    is_neox: bool,
+    mrope_section_t: int,
+    mrope_section_h: int,
+    mrope_section_w: int,
+    is_interleaved: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if q.shape[0] == 0:
+        return torch.empty_like(q), torch.empty_like(k)
+    q_out = torch.empty_like(q)
+    k_out = torch.empty_like(k)
+    # The no-norm specialization ignores these two arguments. Reusing an
+    # existing contiguous head avoids allocating dummy tensors during graph
+    # capture while preserving the shared JIT entrypoint's input contract.
+    q_weight_placeholder = q[0, 0]
+    k_weight_placeholder = k[0, 0]
+    _fused_qk_rmsnorm_mrope_cache_out_custom(
+        q,
+        k,
+        v,
+        q_weight_placeholder,
+        k_weight_placeholder,
+        positions,
+        cos_sin_cache,
+        q_out,
+        k_out,
+        k_cache,
+        v_cache,
+        indices,
+        bool(is_neox),
+        int(mrope_section_t),
+        int(mrope_section_h),
+        int(mrope_section_w),
+        bool(is_interleaved),
+        False,
+        0.0,
+        False,
+    )
+    return q_out, k_out
 
 
 def fused_qk_rmsnorm_mrope_cache_out(
@@ -227,6 +277,7 @@ def fused_qk_rmsnorm_mrope_cache_out(
         int(mrope_section_h),
         int(mrope_section_w),
         bool(is_interleaved),
+        True,
         float(eps),
         bool(gemma),
     )
@@ -699,6 +750,7 @@ def _fused_qk_rmsnorm_mrope_cache_custom(
     mrope_section_h: int,
     mrope_section_w: int,
     is_interleaved: bool,
+    apply_rmsnorm: bool,
     eps: float,
     gemma: bool,
 ) -> None:
@@ -719,6 +771,7 @@ def _fused_qk_rmsnorm_mrope_cache_custom(
         int(mrope_section_h),
         int(mrope_section_w),
         bool(is_interleaved),
+        bool(apply_rmsnorm),
         float(eps),
         bool(gemma),
     )
@@ -746,6 +799,7 @@ def _fused_qk_rmsnorm_mrope_cache_out_custom(
     mrope_section_h: int,
     mrope_section_w: int,
     is_interleaved: bool,
+    apply_rmsnorm: bool,
     eps: float,
     gemma: bool,
 ) -> None:
@@ -767,6 +821,7 @@ def _fused_qk_rmsnorm_mrope_cache_out_custom(
         int(mrope_section_h),
         int(mrope_section_w),
         bool(is_interleaved),
+        bool(apply_rmsnorm),
         float(eps),
         bool(gemma),
     )

@@ -1833,7 +1833,8 @@ __global__ void fused_qk_rmsnorm_mrope_h128_full_halfwarp_bf16_kernel(
 #undef SGLANG_H128_FULL_HALF_ROTATE
 }
 
-template <typename index_t, bool WITH_CACHE, bool GEMMA>
+template <typename index_t, bool WITH_CACHE, bool GEMMA,
+          bool APPLY_RMSNORM = true>
 __global__ void fused_qk_rmsnorm_mrope_generic_bf16_kernel(
     const __mt_bfloat16 *__restrict__ q, const __mt_bfloat16 *__restrict__ k,
     const __mt_bfloat16 *__restrict__ v,
@@ -1887,22 +1888,26 @@ __global__ void fused_qk_rmsnorm_mrope_generic_bf16_kernel(
   const bool is_q = global_head < q_heads;
   const int head = is_q ? global_head : global_head - q_heads;
   const __mt_bfloat16 *__restrict__ data = is_q ? q : k;
-  const __mt_bfloat16 *__restrict__ weight = is_q ? q_weight : k_weight;
+  const __mt_bfloat16 *__restrict__ weight =
+      APPLY_RMSNORM ? (is_q ? q_weight : k_weight) : nullptr;
   const int64_t base =
       is_q ? ((int64_t)token * q_batch_stride + (int64_t)head * q_head_stride)
            : ((int64_t)token * k_batch_stride + (int64_t)head * k_head_stride);
   const int embed_dim = rot_dim >> 1;
 
-  float sum = 0.0f;
-  for (int col = lane; col < hidden; col += 32) {
-    const float value = __bfloat162float(data[base + col]);
-    sum += value * value;
-  }
+  float scale = 1.0f;
+  if constexpr (APPLY_RMSNORM) {
+    float sum = 0.0f;
+    for (int col = lane; col < hidden; col += 32) {
+      const float value = __bfloat162float(data[base + col]);
+      sum += value * value;
+    }
 #pragma unroll
-  for (int mask = 16; mask > 0; mask >>= 1) {
-    sum += __shfl_xor_sync(0xffffffff, sum, mask);
+    for (int mask = 16; mask > 0; mask >>= 1) {
+      sum += __shfl_xor_sync(0xffffffff, sum, mask);
+    }
+    scale = fast_rsqrt(sum / static_cast<float>(hidden) + eps);
   }
-  const float scale = fast_rsqrt(sum / static_cast<float>(hidden) + eps);
 
   for (int rot_offset = lane; rot_offset < embed_dim; rot_offset += 32) {
     int axis;
@@ -1923,10 +1928,14 @@ __global__ void fused_qk_rmsnorm_mrope_generic_bf16_kernel(
     const int y_index = embed_dim + rot_offset;
     const float cos_v = __bfloat162float(cache_ptr[x_index]);
     const float sin_v = __bfloat162float(cache_ptr[y_index]);
-    const float x_weight = __bfloat162float(weight[x_index]) +
-                           (GEMMA ? 1.0f : 0.0f);
-    const float y_weight = __bfloat162float(weight[y_index]) +
-                           (GEMMA ? 1.0f : 0.0f);
+    float x_weight = 1.0f;
+    float y_weight = 1.0f;
+    if constexpr (APPLY_RMSNORM) {
+      x_weight =
+          __bfloat162float(weight[x_index]) + (GEMMA ? 1.0f : 0.0f);
+      y_weight =
+          __bfloat162float(weight[y_index]) + (GEMMA ? 1.0f : 0.0f);
+    }
     const float x = __bfloat162float(data[base + x_index]) * scale * x_weight;
     const float y = __bfloat162float(data[base + y_index]) * scale * y_weight;
     const __mt_bfloat16 x_rot = __float2bfloat16_rn(x * cos_v - y * sin_v);
@@ -1959,10 +1968,13 @@ __global__ void fused_qk_rmsnorm_mrope_generic_bf16_kernel(
   }
 
   for (int col = rot_dim + lane; col < hidden; col += 32) {
-    const float weight_value =
-        __bfloat162float(weight[col]) + (GEMMA ? 1.0f : 0.0f);
-    const __mt_bfloat16 out_value =
-        __float2bfloat16_rn(__bfloat162float(data[base + col]) * scale * weight_value);
+    float weight_value = 1.0f;
+    if constexpr (APPLY_RMSNORM) {
+      weight_value =
+          __bfloat162float(weight[col]) + (GEMMA ? 1.0f : 0.0f);
+    }
+    const __mt_bfloat16 out_value = __float2bfloat16_rn(
+        __bfloat162float(data[base + col]) * scale * weight_value);
     if (is_q) {
       const int64_t out_base =
           (int64_t)token * q_out_batch_stride +
@@ -3041,7 +3053,8 @@ void launch_fused_qk_rmsnorm_mrope_cache_bf16(
     ffi::TensorView positions, ffi::TensorView cos_sin_cache,
     ffi::TensorView q_out, ffi::TensorView k_cache, ffi::TensorView v_cache,
     ffi::TensorView indices, int mrope_section_t, int mrope_section_h,
-    int mrope_section_w, bool is_interleaved, bool gemma, float eps) {
+    int mrope_section_w, bool is_interleaved, bool gemma, bool apply_rmsnorm,
+    float eps) {
   const int batch = static_cast<int>(q.size(0));
   if (batch == 0) {
     return;
@@ -3052,11 +3065,13 @@ void launch_fused_qk_rmsnorm_mrope_cache_bf16(
   const int hidden = static_cast<int>(q.size(2));
   const int rot_dim = static_cast<int>(cos_sin_cache.size(1));
   const bool use_32q4kv_h128_mrope_specialization =
-      q_heads == 32 && k_heads == 4 && hidden == 128 && rot_dim == 128 &&
+      apply_rmsnorm && q_heads == 32 && k_heads == 4 && hidden == 128 &&
+      rot_dim == 128 &&
       mrope_section_t == 24 && mrope_section_h == 20 &&
       mrope_section_w == 20;
   const bool use_h256r64_mrope_specialization =
-      gemma && is_interleaved && hidden == 256 && rot_dim == 64 &&
+      apply_rmsnorm && gemma && is_interleaved && hidden == 256 &&
+      rot_dim == 64 &&
       mrope_section_t == 11 && mrope_section_h == 11 &&
       mrope_section_w == 10;
   if (use_h256r64_mrope_specialization) {
@@ -3122,7 +3137,8 @@ void launch_fused_qk_rmsnorm_mrope_cache_bf16(
     }
   }
   const bool use_h128_full_mrope_specialization =
-      is_interleaved && hidden == 128 && rot_dim == 128 && mrope_section_t == 24 &&
+      apply_rmsnorm && is_interleaved && hidden == 128 && rot_dim == 128 &&
+      mrope_section_t == 24 &&
       mrope_section_h == 20 && mrope_section_w == 20;
   if (use_h128_full_mrope_specialization) {
 #define LAUNCH_H128_MROPE_CACHE(QH, KH)                                       \
@@ -3168,7 +3184,8 @@ void launch_fused_qk_rmsnorm_mrope_cache_bf16(
 #undef LAUNCH_H128_MROPE_CACHE
   }
   const bool use_h128_full_rope_specialization =
-      hidden == 128 && rot_dim == 128 && mrope_section_t == 64 &&
+      apply_rmsnorm && hidden == 128 && rot_dim == 128 &&
+      mrope_section_t == 64 &&
       mrope_section_h == 0 && mrope_section_w == 0 && !is_interleaved;
   if (use_h128_full_rope_specialization) {
 #define LAUNCH_H128_ROPE_CACHE(QH, KH)                                        \
@@ -3209,7 +3226,8 @@ void launch_fused_qk_rmsnorm_mrope_cache_bf16(
 #undef LAUNCH_H128_ROPE_CACHE
   }
   const bool use_h128r64_rope_specialization =
-      hidden == 128 && rot_dim == 64 && mrope_section_t == 32 &&
+      apply_rmsnorm && hidden == 128 && rot_dim == 64 &&
+      mrope_section_t == 32 &&
       mrope_section_h == 0 && mrope_section_w == 0 && !is_interleaved;
   if (use_h128r64_rope_specialization) {
 #define LAUNCH_H128R64_ROPE_CACHE(QH, KH)                                     \
@@ -3246,6 +3264,37 @@ void launch_fused_qk_rmsnorm_mrope_cache_bf16(
     constexpr int heads_per_block = 8;
     const int groups_per_token =
         (q_heads + k_heads + heads_per_block - 1) / heads_per_block;
+    if (!apply_rmsnorm) {
+      fused_qk_rmsnorm_mrope_generic_bf16_kernel<index_t, true, false, false>
+          <<<batch * groups_per_token, threads, 0, stream>>>(
+              static_cast<const __mt_bfloat16 *>(q.data_ptr()),
+              static_cast<const __mt_bfloat16 *>(k.data_ptr()),
+              static_cast<const __mt_bfloat16 *>(v.data_ptr()),
+              static_cast<const __mt_bfloat16 *>(nullptr),
+              static_cast<const __mt_bfloat16 *>(nullptr),
+              static_cast<const int64_t *>(positions.data_ptr()),
+              static_cast<const __mt_bfloat16 *>(cos_sin_cache.data_ptr()),
+              static_cast<__mt_bfloat16 *>(q_out.data_ptr()),
+              static_cast<__mt_bfloat16 *>(nullptr),
+              static_cast<__mt_bfloat16 *>(k_cache.data_ptr()),
+              static_cast<__mt_bfloat16 *>(v_cache.data_ptr()),
+              static_cast<const index_t *>(indices.data_ptr()), batch, q_heads,
+              k_heads, hidden, rot_dim,
+              static_cast<int64_t>(positions.stride(0)),
+              static_cast<int64_t>(q.stride(0)),
+              static_cast<int64_t>(q.stride(1)),
+              static_cast<int64_t>(k.stride(0)),
+              static_cast<int64_t>(k.stride(1)),
+              static_cast<int64_t>(v.stride(0)),
+              static_cast<int64_t>(v.stride(1)),
+              static_cast<int64_t>(q_out.stride(0)),
+              static_cast<int64_t>(q_out.stride(1)), static_cast<int64_t>(0),
+              static_cast<int64_t>(0), static_cast<int64_t>(k_cache.stride(0)),
+              static_cast<int64_t>(v_cache.stride(0)),
+              static_cast<int64_t>(indices.stride(0)), mrope_section_t,
+              mrope_section_h, mrope_section_w, is_interleaved, 0.0f);
+      return;
+    }
     if (gemma) {
       fused_qk_rmsnorm_mrope_generic_bf16_kernel<index_t, true, true>
           <<<batch * groups_per_token, threads, 0, stream>>>(
@@ -3392,8 +3441,8 @@ void sgl_musa_fused_qk_rmsnorm_mrope_cache(
     ffi::TensorView positions, ffi::TensorView cos_sin_cache,
     ffi::TensorView q_out, ffi::TensorView k_cache, ffi::TensorView v_cache,
     ffi::TensorView indices, bool is_neox, int mrope_section_t,
-    int mrope_section_h, int mrope_section_w, bool is_interleaved, double eps,
-    bool gemma) {
+    int mrope_section_h, int mrope_section_w, bool is_interleaved,
+    bool apply_rmsnorm, double eps, bool gemma) {
   check_fused_qk_mrope_cache_inputs(q, k, v, q_weight, k_weight, positions,
                                     cos_sin_cache, q_out, k_cache, v_cache,
                                     indices);
@@ -3406,12 +3455,12 @@ void sgl_musa_fused_qk_rmsnorm_mrope_cache(
     launch_fused_qk_rmsnorm_mrope_cache_bf16<int32_t>(
         q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out, k_cache,
         v_cache, indices, mrope_section_t, mrope_section_h, mrope_section_w,
-        is_interleaved, gemma, static_cast<float>(eps));
+        is_interleaved, gemma, apply_rmsnorm, static_cast<float>(eps));
   } else if (dtype_equal(indices.dtype(), dl_int64)) {
     launch_fused_qk_rmsnorm_mrope_cache_bf16<int64_t>(
         q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out, k_cache,
         v_cache, indices, mrope_section_t, mrope_section_h, mrope_section_w,
-        is_interleaved, gemma, static_cast<float>(eps));
+        is_interleaved, gemma, apply_rmsnorm, static_cast<float>(eps));
   } else {
     TVM_FFI_THROW(ValueError) << "indices must be int32 or int64";
   }
@@ -3429,7 +3478,7 @@ void launch_fused_qk_rmsnorm_mrope_cache_out_bf16(
     ffi::TensorView q_out, ffi::TensorView k_out, ffi::TensorView k_cache,
     ffi::TensorView v_cache, ffi::TensorView indices, int mrope_section_t,
     int mrope_section_h, int mrope_section_w, bool is_interleaved, bool gemma,
-    float eps) {
+    bool apply_rmsnorm, float eps) {
   const int batch = static_cast<int>(q.size(0));
   if (batch == 0) {
     return;
@@ -3440,11 +3489,13 @@ void launch_fused_qk_rmsnorm_mrope_cache_out_bf16(
   const int hidden = static_cast<int>(q.size(2));
   const int rot_dim = static_cast<int>(cos_sin_cache.size(1));
   const bool use_32q4kv_h128_mrope_specialization =
-      q_heads == 32 && k_heads == 4 && hidden == 128 && rot_dim == 128 &&
+      apply_rmsnorm && q_heads == 32 && k_heads == 4 && hidden == 128 &&
+      rot_dim == 128 &&
       mrope_section_t == 24 && mrope_section_h == 20 &&
       mrope_section_w == 20;
   const bool use_h256r64_mrope_specialization =
-      gemma && is_interleaved && hidden == 256 && rot_dim == 64 &&
+      apply_rmsnorm && gemma && is_interleaved && hidden == 256 &&
+      rot_dim == 64 &&
       mrope_section_t == 11 && mrope_section_h == 11 &&
       mrope_section_w == 10;
   if (use_h256r64_mrope_specialization) {
@@ -3510,7 +3561,8 @@ void launch_fused_qk_rmsnorm_mrope_cache_out_bf16(
     }
   }
   const bool use_h128_full_mrope_specialization =
-      is_interleaved && hidden == 128 && rot_dim == 128 && mrope_section_t == 24 &&
+      apply_rmsnorm && is_interleaved && hidden == 128 && rot_dim == 128 &&
+      mrope_section_t == 24 &&
       mrope_section_h == 20 && mrope_section_w == 20;
   if (use_h128_full_mrope_specialization) {
 #define LAUNCH_H128_MROPE_CACHE_OUT(QH, KH)                                   \
@@ -3556,7 +3608,8 @@ void launch_fused_qk_rmsnorm_mrope_cache_out_bf16(
 #undef LAUNCH_H128_MROPE_CACHE_OUT
   }
   const bool use_h128_full_rope_specialization =
-      hidden == 128 && rot_dim == 128 && mrope_section_t == 64 &&
+      apply_rmsnorm && hidden == 128 && rot_dim == 128 &&
+      mrope_section_t == 64 &&
       mrope_section_h == 0 && mrope_section_w == 0 && !is_interleaved;
   if (use_h128_full_rope_specialization) {
 #define LAUNCH_H128_ROPE_CACHE_OUT(QH, KH)                                    \
@@ -3597,7 +3650,8 @@ void launch_fused_qk_rmsnorm_mrope_cache_out_bf16(
 #undef LAUNCH_H128_ROPE_CACHE_OUT
   }
   const bool use_h128r64_rope_specialization =
-      hidden == 128 && rot_dim == 64 && mrope_section_t == 32 &&
+      apply_rmsnorm && hidden == 128 && rot_dim == 64 &&
+      mrope_section_t == 32 &&
       mrope_section_h == 0 && mrope_section_w == 0 && !is_interleaved;
   if (use_h128r64_rope_specialization) {
 #define LAUNCH_H128R64_ROPE_CACHE_OUT(QH, KH)                                 \
@@ -3639,6 +3693,39 @@ void launch_fused_qk_rmsnorm_mrope_cache_out_bf16(
   constexpr int heads_per_block = 8;
   const int groups_per_token =
       (q_heads + k_heads + heads_per_block - 1) / heads_per_block;
+  if (!apply_rmsnorm) {
+    fused_qk_rmsnorm_mrope_generic_bf16_kernel<index_t, true, false, false>
+        <<<batch * groups_per_token, threads, 0, stream>>>(
+            static_cast<const __mt_bfloat16 *>(q.data_ptr()),
+            static_cast<const __mt_bfloat16 *>(k.data_ptr()),
+            static_cast<const __mt_bfloat16 *>(v.data_ptr()),
+            static_cast<const __mt_bfloat16 *>(nullptr),
+            static_cast<const __mt_bfloat16 *>(nullptr),
+            static_cast<const int64_t *>(positions.data_ptr()),
+            static_cast<const __mt_bfloat16 *>(cos_sin_cache.data_ptr()),
+            static_cast<__mt_bfloat16 *>(q_out.data_ptr()),
+            static_cast<__mt_bfloat16 *>(k_out.data_ptr()),
+            static_cast<__mt_bfloat16 *>(k_cache.data_ptr()),
+            static_cast<__mt_bfloat16 *>(v_cache.data_ptr()),
+            static_cast<const index_t *>(indices.data_ptr()), batch, q_heads,
+            k_heads, hidden, rot_dim,
+            static_cast<int64_t>(positions.stride(0)),
+            static_cast<int64_t>(q.stride(0)),
+            static_cast<int64_t>(q.stride(1)),
+            static_cast<int64_t>(k.stride(0)),
+            static_cast<int64_t>(k.stride(1)),
+            static_cast<int64_t>(v.stride(0)),
+            static_cast<int64_t>(v.stride(1)),
+            static_cast<int64_t>(q_out.stride(0)),
+            static_cast<int64_t>(q_out.stride(1)),
+            static_cast<int64_t>(k_out.stride(0)),
+            static_cast<int64_t>(k_out.stride(1)),
+            static_cast<int64_t>(k_cache.stride(0)),
+            static_cast<int64_t>(v_cache.stride(0)),
+            static_cast<int64_t>(indices.stride(0)), mrope_section_t,
+            mrope_section_h, mrope_section_w, is_interleaved, 0.0f);
+    return;
+  }
   if (gemma) {
     fused_qk_rmsnorm_mrope_generic_bf16_kernel<index_t, true, true>
         <<<batch * groups_per_token, threads, 0, stream>>>(
@@ -3706,7 +3793,7 @@ void sgl_musa_fused_qk_rmsnorm_mrope_cache_out(
     ffi::TensorView q_out, ffi::TensorView k_out, ffi::TensorView k_cache,
     ffi::TensorView v_cache, ffi::TensorView indices, bool is_neox,
     int mrope_section_t, int mrope_section_h, int mrope_section_w,
-    bool is_interleaved, double eps, bool gemma) {
+    bool is_interleaved, bool apply_rmsnorm, double eps, bool gemma) {
   check_fused_qk_mrope_inputs(q, k, q_weight, k_weight, positions,
                               cos_sin_cache, q_out, k_out);
   check_fused_qk_mrope_cache_inputs(q, k, v, q_weight, k_weight, positions,
@@ -3721,12 +3808,14 @@ void sgl_musa_fused_qk_rmsnorm_mrope_cache_out(
     launch_fused_qk_rmsnorm_mrope_cache_out_bf16<int32_t>(
         q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out, k_out,
         k_cache, v_cache, indices, mrope_section_t, mrope_section_h,
-        mrope_section_w, is_interleaved, gemma, static_cast<float>(eps));
+        mrope_section_w, is_interleaved, gemma, apply_rmsnorm,
+        static_cast<float>(eps));
   } else if (dtype_equal(indices.dtype(), dl_int64)) {
     launch_fused_qk_rmsnorm_mrope_cache_out_bf16<int64_t>(
         q, k, v, q_weight, k_weight, positions, cos_sin_cache, q_out, k_out,
         k_cache, v_cache, indices, mrope_section_t, mrope_section_h,
-        mrope_section_w, is_interleaved, gemma, static_cast<float>(eps));
+        mrope_section_w, is_interleaved, gemma, apply_rmsnorm,
+        static_cast<float>(eps));
   } else {
     TVM_FFI_THROW(ValueError) << "indices must be int32 or int64";
   }
