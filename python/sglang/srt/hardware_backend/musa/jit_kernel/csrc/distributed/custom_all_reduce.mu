@@ -832,10 +832,9 @@ void sgl_musa_custom_ar_launch(
     int64_t world_size,
     int64_t shot) {
   CHECK_MUSA_CONTIGUOUS(out);
-  const bool rank_data_on_cpu = rank_data.device().device_type == kDLCPU;
-  const bool rank_data_on_musa =
-      rank_data.device().device_type == out.device().device_type;
-  TVM_FFI_ICHECK(rank_data_on_cpu || rank_data_on_musa);
+  TVM_FFI_ICHECK_EQ(
+      rank_data.device().device_type, out.device().device_type);
+  TVM_FFI_ICHECK_EQ(rank_data.device().device_id, out.device().device_id);
   TVM_FFI_ICHECK(rank_data.IsContiguous());
   TVM_FFI_ICHECK(dtype_equal(rank_data.dtype(), dl_int64));
   TVM_FFI_ICHECK_GE(rank_data.size(0), kMaxRanks);
@@ -851,16 +850,8 @@ void sgl_musa_custom_ar_launch(
     sg.signals[i] = reinterpret_cast<Signal*>(ptrs[i]);
   }
   RankData data{};
-  const RankData* device_data_ptr = nullptr;
-  if (rank_data_on_cpu) {
-    const auto* rank_ptrs = static_cast<const int64_t*>(rank_data.data_ptr());
-    for (int i = 0; i < kMaxRanks; ++i) {
-      data.ptrs[i] = reinterpret_cast<const void*>(rank_ptrs[i]);
-    }
-  } else {
-    TVM_FFI_ICHECK_EQ(rank_data.device().device_id, out.device().device_id);
-    device_data_ptr = reinterpret_cast<const RankData*>(rank_data.data_ptr());
-  }
+  const auto* device_data_ptr =
+      reinterpret_cast<const RankData*>(rank_data.data_ptr());
   auto* self_sg = reinterpret_cast<Signal*>(self_signal_ptr);
   auto stream = get_stream(out.device());
   const int64_t numel64 = tensor_numel(out);

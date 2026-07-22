@@ -367,7 +367,15 @@ class CustomAllreduce:
 class MusaJitCustomAllreduce:
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
     _MAX_CAR_SIZE = 512 * 1024 * 1024
+    _RANK_DATA_WIDTH = 8
+    _RANK_DATA_ELEMENT_SIZE = ctypes.sizeof(ctypes.c_int64)
     requires_graph_capture_registration_recapture = False
+
+    @classmethod
+    def _graph_rank_data_slot_capacity(cls, max_size: int) -> int:
+        # Match sgl-kernel's rank-data allocation: max_size bytes are divided
+        # into RankData records, each containing eight 64-bit rank pointers.
+        return max_size // (cls._RANK_DATA_WIDTH * cls._RANK_DATA_ELEMENT_SIZE)
 
     def __init__(
         self,
@@ -477,11 +485,19 @@ class MusaJitCustomAllreduce:
             self.buffer_ptrs + [0] * (8 - self.world_size), dtype=torch.int64
         )
         self.signal_ptrs_cpu = torch.tensor(self.meta_ptrs, dtype=torch.int64)
-        # Device slots match FlashInfer/sgl-kernel graph handling: the graph
-        # captures a stable RankData* and replay reads the registered pointers
-        # from the slot content filled after buffer registration.
+        # Match sgl-kernel's rank-data capacity. The graph captures a stable
+        # RankData* and replay reads the registered pointers from the slot
+        # content filled after buffer registration.
+        graph_rank_data_slot_capacity = self._graph_rank_data_slot_capacity(max_size)
+        if graph_rank_data_slot_capacity == 0:
+            raise ValueError(
+                "MUSA JIT custom allreduce max_size must fit at least one "
+                "rank-data slot (64 bytes)."
+            )
         self._graph_rank_data_slots = torch.empty(
-            (16384, 8), dtype=torch.int64, device=self.device
+            (graph_rank_data_slot_capacity, self._RANK_DATA_WIDTH),
+            dtype=torch.int64,
+            device=self.device,
         )
         self._graph_rank_data_slot_next = 0
         self._graph_capture_slot_base: Optional[int] = None
@@ -632,7 +648,6 @@ class MusaJitCustomAllreduce:
         self,
         inp: torch.Tensor,
         shot: Optional[int] = None,
-        prefer_device_slot: bool = False,
     ) -> Optional[torch.Tensor]:
         is_graph_launch = (
             self._IS_CAPTURING
@@ -650,18 +665,13 @@ class MusaJitCustomAllreduce:
                 if cached_signature == signature and self._rank_data_ptr_tuple(
                     rank_data
                 )[self.rank] == int(inp.data_ptr()):
-                    if prefer_device_slot:
-                        return rank_data_slot
-                    return rank_data
+                    return rank_data_slot
             if self._graph_registered_input_sequence:
                 self._graph_registered_miss = True
             return None
-        ptr_value = int(inp.data_ptr())
-        cached = self._rank_data_cache.get(ptr_value)
-        if cached is not None:
-            self._last_input_ptr = ptr_value
-            self._last_rank_data = cached
-        return cached
+        # Registered graph launchers always consume the stable device slot.
+        # Eager and SHOT_PUSH paths use their explicit-input launchers instead.
+        return None
 
     @staticmethod
     def _graph_input_signature(
@@ -837,13 +847,6 @@ class MusaJitCustomAllreduce:
         return self._fused_rmsnorm.fused_allreduce_rmsnorm(
             input_, residual_inp_, weight_, eps
         )
-
-    def fused_allreduce_residual(
-        self,
-        input_: torch.Tensor,
-        residual_inp_: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        return self._fused_rmsnorm.fused_allreduce_residual(input_, residual_inp_)
 
     def _launch_registered(
         self, rank_data: torch.Tensor, out: torch.Tensor, shot: int
@@ -1070,13 +1073,15 @@ class MusaJitCustomAllreduce:
             out = torch.empty_like(input)
             if is_graph_launch:
                 if self._graph_registered_input_enabled:
-                    rank_data = self._rank_data_for_registered_input(
-                        input, shot, prefer_device_slot=True
-                    )
+                    rank_data = self._rank_data_for_registered_input(input, shot)
                     if rank_data is not None:
                         self._launch_registered(rank_data, out, shot)
                     else:
-                        out.zero_()
+                        # A registration miss must not silently turn the
+                        # all-reduce into zeros.  Keep correctness during a
+                        # recapture mismatch by using the explicit-input
+                        # launcher; registered replay remains the fast path.
+                        self._launch_unregistered(input, out, shot)
                 else:
                     self._launch_unregistered(input, out, shot)
             else:

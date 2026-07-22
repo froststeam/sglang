@@ -4458,10 +4458,10 @@ void sgl_musa_custom_ar_fused_allreduce_residual_registered(
   CHECK_MUSA_CONTIGUOUS(residual_out);
   TVM_FFI_ICHECK_EQ(tensor_numel(residual_in), tensor_numel(residual_out));
   TVM_FFI_ICHECK(dtype_equal(residual_in.dtype(), residual_out.dtype()));
-  const bool rank_data_on_cpu = rank_data.device().device_type == kDLCPU;
-  const bool rank_data_on_musa =
-      rank_data.device().device_type == residual_in.device().device_type;
-  TVM_FFI_ICHECK(rank_data_on_cpu || rank_data_on_musa);
+  TVM_FFI_ICHECK_EQ(
+      rank_data.device().device_type, residual_in.device().device_type);
+  TVM_FFI_ICHECK_EQ(
+      rank_data.device().device_id, residual_in.device().device_id);
   TVM_FFI_ICHECK(rank_data.IsContiguous());
   TVM_FFI_ICHECK(dtype_equal(rank_data.dtype(), dl_int64));
   TVM_FFI_ICHECK_GE(rank_data.size(0), kMaxRanks);
@@ -4478,16 +4478,8 @@ void sgl_musa_custom_ar_fused_allreduce_residual_registered(
   }
 
   RankData data{};
-  const RankData* device_data_ptr = nullptr;
-  if (rank_data_on_cpu) {
-    const auto* rank_ptrs = static_cast<const int64_t*>(rank_data.data_ptr());
-    for (int i = 0; i < kMaxRanks; ++i) {
-      data.ptrs[i] = reinterpret_cast<const void*>(rank_ptrs[i]);
-    }
-  } else {
-    TVM_FFI_ICHECK_EQ(rank_data.device().device_id, residual_in.device().device_id);
-    device_data_ptr = reinterpret_cast<const RankData*>(rank_data.data_ptr());
-  }
+  const auto* device_data_ptr =
+      reinterpret_cast<const RankData*>(rank_data.data_ptr());
 
   auto* self_sg = reinterpret_cast<Signal*>(self_signal_ptr);
   auto stream = get_stream(residual_in.device());
@@ -4544,10 +4536,10 @@ void sgl_musa_custom_ar_fused_allreduce_rmsnorm_registered(
   TVM_FFI_ICHECK(dtype_equal(residual_in.dtype(), residual_out.dtype()));
   TVM_FFI_ICHECK(dtype_equal(residual_in.dtype(), norm_out.dtype()));
   TVM_FFI_ICHECK(dtype_equal(residual_in.dtype(), weight.dtype()));
-  const bool rank_data_on_cpu = rank_data.device().device_type == kDLCPU;
-  const bool rank_data_on_musa =
-      rank_data.device().device_type == residual_in.device().device_type;
-  TVM_FFI_ICHECK(rank_data_on_cpu || rank_data_on_musa);
+  TVM_FFI_ICHECK_EQ(
+      rank_data.device().device_type, residual_in.device().device_type);
+  TVM_FFI_ICHECK_EQ(
+      rank_data.device().device_id, residual_in.device().device_id);
   TVM_FFI_ICHECK(rank_data.IsContiguous());
   TVM_FFI_ICHECK(dtype_equal(rank_data.dtype(), dl_int64));
   TVM_FFI_ICHECK_GE(rank_data.size(0), kMaxRanks);
@@ -4564,16 +4556,8 @@ void sgl_musa_custom_ar_fused_allreduce_rmsnorm_registered(
   }
 
   RankData data{};
-  const RankData* device_data_ptr = nullptr;
-  if (rank_data_on_cpu) {
-    const auto* rank_ptrs = static_cast<const int64_t*>(rank_data.data_ptr());
-    for (int i = 0; i < kMaxRanks; ++i) {
-      data.ptrs[i] = reinterpret_cast<const void*>(rank_ptrs[i]);
-    }
-  } else {
-    TVM_FFI_ICHECK_EQ(rank_data.device().device_id, residual_in.device().device_id);
-    device_data_ptr = reinterpret_cast<const RankData*>(rank_data.data_ptr());
-  }
+  const auto* device_data_ptr =
+      reinterpret_cast<const RankData*>(rank_data.data_ptr());
 
   auto* self_sg = reinterpret_cast<Signal*>(self_signal_ptr);
   auto stream = get_stream(residual_in.device());
@@ -4609,75 +4593,6 @@ void sgl_musa_custom_ar_fused_allreduce_rmsnorm_registered(
   const musaError_t err = musaGetLastError();
   TVM_FFI_ICHECK_EQ(err, musaSuccess)
       << "MUSA custom AR fused RMSNorm registered kernel failed: "
-      << musaGetErrorString(err);
-}
-
-void sgl_musa_custom_ar_fused_allreduce_residual_sums_registered(
-    ffi::TensorView rank_data,
-    ffi::TensorView signal_ptrs_cpu,
-    ffi::TensorView residual_in,
-    ffi::TensorView residual_out,
-    ffi::TensorView row_sums,
-    int64_t self_signal_ptr,
-    int rank,
-    int world_size,
-    int hidden) {
-  CHECK_MUSA_CONTIGUOUS(residual_in);
-  CHECK_MUSA_CONTIGUOUS(residual_out);
-  CHECK_MUSA_CONTIGUOUS(row_sums);
-  TVM_FFI_ICHECK_EQ(residual_in.ndim(), 2);
-  TVM_FFI_ICHECK_EQ(residual_out.ndim(), 2);
-  TVM_FFI_ICHECK_EQ(row_sums.ndim(), 1);
-  TVM_FFI_ICHECK_EQ(residual_in.size(0), residual_out.size(0));
-  TVM_FFI_ICHECK_EQ(residual_in.size(1), residual_out.size(1));
-  TVM_FFI_ICHECK_EQ(residual_in.size(1), hidden);
-  TVM_FFI_ICHECK_EQ(row_sums.size(0), residual_in.size(0));
-  TVM_FFI_ICHECK(world_size == 4 || world_size == 8);
-  TVM_FFI_ICHECK(dtype_equal(residual_in.dtype(), residual_out.dtype()));
-  TVM_FFI_ICHECK(dtype_equal(row_sums.dtype(), dl_float32));
-  TVM_FFI_ICHECK_EQ(row_sums.device().device_id, residual_in.device().device_id);
-  TVM_FFI_ICHECK_EQ(rank_data.device().device_type, kDLCPU);
-  TVM_FFI_ICHECK(rank_data.IsContiguous());
-  TVM_FFI_ICHECK(dtype_equal(rank_data.dtype(), dl_int64));
-  TVM_FFI_ICHECK_GE(rank_data.size(0), kMaxRanks);
-  TVM_FFI_ICHECK_EQ(signal_ptrs_cpu.device().device_type, kDLCPU);
-  TVM_FFI_ICHECK(signal_ptrs_cpu.IsContiguous());
-  TVM_FFI_ICHECK(dtype_equal(signal_ptrs_cpu.dtype(), dl_int64));
-  TVM_FFI_ICHECK_GE(signal_ptrs_cpu.size(0), world_size);
-
-  RankData data{};
-  const auto* data_ptrs = static_cast<const int64_t*>(rank_data.data_ptr());
-  const auto* sig_ptrs = static_cast<const int64_t*>(signal_ptrs_cpu.data_ptr());
-  RankSignals sg{};
-  for (int i = 0; i < world_size; ++i) {
-    data.ptrs[i] = reinterpret_cast<const void*>(data_ptrs[i]);
-    sg.signals[i] = reinterpret_cast<Signal*>(sig_ptrs[i]);
-  }
-  auto* self_sg = reinterpret_cast<Signal*>(self_signal_ptr);
-  auto stream = get_stream(residual_in.device());
-  const int rows = static_cast<int>(residual_in.size(0));
-  bool launched = false;
-  if (dtype_equal(residual_in.dtype(), dl_float16)) {
-    launched = dispatch_residual_sums_world_size(
-        data, sg, self_sg, static_cast<const half*>(residual_in.data_ptr()),
-        static_cast<half*>(residual_out.data_ptr()),
-        static_cast<float*>(row_sums.data_ptr()), rank, world_size, rows,
-        hidden, stream);
-  } else if (dtype_equal(residual_in.dtype(), dl_bfloat16)) {
-    launched = dispatch_residual_sums_world_size(
-        data, sg, self_sg,
-        static_cast<const __mt_bfloat16*>(residual_in.data_ptr()),
-        static_cast<__mt_bfloat16*>(residual_out.data_ptr()),
-        static_cast<float*>(row_sums.data_ptr()), rank, world_size, rows,
-        hidden, stream);
-  } else {
-    TVM_FFI_THROW(ValueError) << "custom AR fused residual sums only supports fp16/bf16";
-  }
-  TVM_FFI_ICHECK(launched)
-      << "MUSA custom AR fused residual sums unsupported shape";
-  const musaError_t err = musaGetLastError();
-  TVM_FFI_ICHECK_EQ(err, musaSuccess)
-      << "MUSA custom AR fused residual sums registered kernel failed: "
       << musaGetErrorString(err);
 }
 
@@ -4823,10 +4738,10 @@ void sgl_musa_custom_ar_fused_allreduce_rmsnorm_row_registered(
   TVM_FFI_ICHECK(dtype_equal(residual_in.dtype(), weight.dtype()));
   TVM_FFI_ICHECK_EQ(norm_out.device().device_id, residual_in.device().device_id);
   TVM_FFI_ICHECK_EQ(weight.device().device_id, residual_in.device().device_id);
-  const bool rank_data_on_cpu = rank_data.device().device_type == kDLCPU;
-  const bool rank_data_on_musa =
-      rank_data.device().device_type == residual_in.device().device_type;
-  TVM_FFI_ICHECK(rank_data_on_cpu || rank_data_on_musa);
+  TVM_FFI_ICHECK_EQ(
+      rank_data.device().device_type, residual_in.device().device_type);
+  TVM_FFI_ICHECK_EQ(
+      rank_data.device().device_id, residual_in.device().device_id);
   TVM_FFI_ICHECK(rank_data.IsContiguous());
   TVM_FFI_ICHECK(dtype_equal(rank_data.dtype(), dl_int64));
   TVM_FFI_ICHECK_GE(rank_data.size(0), kMaxRanks);
@@ -4836,20 +4751,12 @@ void sgl_musa_custom_ar_fused_allreduce_rmsnorm_row_registered(
   TVM_FFI_ICHECK_GE(signal_ptrs_cpu.size(0), world_size);
 
   RankData data{};
-  const RankData* device_data_ptr = nullptr;
-  const auto* data_ptrs = static_cast<const int64_t*>(
-      rank_data_on_cpu ? rank_data.data_ptr() : nullptr);
+  const auto* device_data_ptr =
+      reinterpret_cast<const RankData*>(rank_data.data_ptr());
   const auto* sig_ptrs = static_cast<const int64_t*>(signal_ptrs_cpu.data_ptr());
   RankSignals sg{};
   for (int i = 0; i < world_size; ++i) {
-    if (rank_data_on_cpu) {
-      data.ptrs[i] = reinterpret_cast<const void*>(data_ptrs[i]);
-    }
     sg.signals[i] = reinterpret_cast<Signal*>(sig_ptrs[i]);
-  }
-  if (rank_data_on_musa) {
-    TVM_FFI_ICHECK_EQ(rank_data.device().device_id, residual_in.device().device_id);
-    device_data_ptr = reinterpret_cast<const RankData*>(rank_data.data_ptr());
   }
   auto* self_sg = reinterpret_cast<Signal*>(self_signal_ptr);
   auto stream = get_stream(residual_in.device());
@@ -4907,9 +4814,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(
     sgl_musa_custom_ar_fused_allreduce_rmsnorm_registered,
     sgl_musa_custom_ar_fused_allreduce_rmsnorm_registered);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(
-    sgl_musa_custom_ar_fused_allreduce_residual_sums_registered,
-    sgl_musa_custom_ar_fused_allreduce_residual_sums_registered);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(
     sgl_musa_custom_ar_fused_allreduce_rmsnorm_row_unregistered,
     sgl_musa_custom_ar_fused_allreduce_rmsnorm_row_unregistered);

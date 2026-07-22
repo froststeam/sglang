@@ -1082,44 +1082,6 @@ def launch_fused_allreduce_rmsnorm_registered_func(
     ).sgl_musa_custom_ar_fused_allreduce_rmsnorm_registered
 
 
-def launch_fused_allreduce_residual_unregistered_func(
-    world_size: int, hidden: int = 0, row_warp_inv_rms_override: int = -1
-):
-    return _custom_ar_fused_rmsnorm_module(
-        int(world_size),
-        row_hidden=int(hidden),
-        cache_policy=0,
-        push_polling=0,
-        lamport_push=0,
-        row_warp_inv_rms_override=int(row_warp_inv_rms_override),
-    ).sgl_musa_custom_ar_fused_allreduce_residual_unregistered
-
-
-def launch_fused_allreduce_residual_registered_func(
-    world_size: int, hidden: int = 0, row_warp_inv_rms_override: int = -1
-):
-    return _custom_ar_fused_rmsnorm_module(
-        int(world_size),
-        row_hidden=int(hidden),
-        cache_policy=0,
-        push_polling=0,
-        lamport_push=0,
-        row_warp_inv_rms_override=int(row_warp_inv_rms_override),
-    ).sgl_musa_custom_ar_fused_allreduce_residual_registered
-
-
-def launch_fused_allreduce_residual_sums_registered_func(
-    world_size: int, hidden: int = 0
-):
-    return _custom_ar_fused_rmsnorm_module(
-        int(world_size),
-        row_hidden=int(hidden),
-        cache_policy=0,
-        push_polling=0,
-        lamport_push=0,
-    ).sgl_musa_custom_ar_fused_allreduce_residual_sums_registered
-
-
 def launch_fused_allreduce_rmsnorm_row_registered_func(
     world_size: int,
     hidden: int = 0,
