@@ -302,10 +302,11 @@ def bench_graph_case(
             for inp, residual, weight, norm_out in zip(
                 inputs, residuals, weights, norm_outs
             ):
-                residual_out = comm.fused_allreduce_residual(inp, residual)
-                if residual_out is None:
+                allreduce_out = comm.custom_all_reduce(inp)
+                if allreduce_out is None:
                     outputs.append(None)
                     continue
+                residual_out = residual.add_(allreduce_out)
                 outputs.append(
                     (residual_out, rmsnorm(residual_out, weight, 1e-6, out=norm_out))
                 )

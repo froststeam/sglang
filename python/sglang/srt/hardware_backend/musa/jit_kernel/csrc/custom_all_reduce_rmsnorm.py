@@ -101,8 +101,6 @@ class MusaJitCustomAllreduceRMSNorm:
         self._comm = comm
         self._fused_rmsnorm_unregistered_launchers = {}
         self._fused_rmsnorm_registered_launchers = {}
-        self._fused_residual_unregistered_launchers = {}
-        self._fused_residual_registered_launchers = {}
         self._fused_rmsnorm_row_registered_launchers = {}
         self._fused_rmsnorm_row_unregistered_launchers = {}
 
@@ -304,9 +302,26 @@ class MusaJitCustomAllreduceRMSNorm:
                             sidecar_use_registered_rank_data,
                         )
                         if not launched:
-                            norm_out.zero_()
-                            residual_out.zero_()
-                            return norm_out, residual_out
+                            # A registered graph-input miss must preserve the
+                            # collective result. Fall back to the explicit-input
+                            # row launcher, matching the normal custom-AR path.
+                            launched = self._launch_fused_allreduce_rmsnorm_row(
+                                input_,
+                                residual_inp_,
+                                residual_out,
+                                norm_out,
+                                weight_,
+                                int(hidden),
+                                use_tuned_module,
+                                use_small_rows_module,
+                                use_row_skip_end_barrier,
+                                row_token_2stage_override,
+                                row_warp_inv_rms_override,
+                                float(eps),
+                                False,
+                            )
+                        if not launched:
+                            return None
                         return norm_out, residual_out
                     return None
                 except Exception:
@@ -374,9 +389,7 @@ class MusaJitCustomAllreduceRMSNorm:
         if use_registered_input:
             rank_data_ready = False
             try:
-                rank_data = self._rank_data_for_registered_input(
-                    input_, prefer_device_slot=is_graph_launch
-                )
+                rank_data = self._rank_data_for_registered_input(input_)
                 if rank_data is None:
                     raise RuntimeError("registered rank data is not ready")
                 rank_data_ready = True
@@ -420,10 +433,12 @@ class MusaJitCustomAllreduceRMSNorm:
                     and graph_registered_input_enabled
                     and not rank_data_ready
                 ):
-                    norm_out.zero_()
-                    residual_out.zero_()
-                    return norm_out, residual_out
-                raise
+                    # Registration can miss while the graph is being
+                    # recaptured. Continue into the explicit-input fused
+                    # launcher below instead of returning silent zeros.
+                    pass
+                else:
+                    raise
 
         if norm_out is None:
             norm_out = torch.empty_like(input_)
@@ -470,116 +485,6 @@ class MusaJitCustomAllreduceRMSNorm:
             int(reset_lamport),
         )
         return norm_out, residual_out
-
-    def fused_allreduce_residual(
-        self,
-        input_: torch.Tensor,
-        residual_inp_: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        if self.world_size not in (2, 4, 8):
-            return None
-        if self.world_size != 2 and not _fused_rmsnorm_multi_rank_enabled():
-            return None
-        if input_.dtype not in (torch.float16, torch.bfloat16):
-            return None
-        if input_.dim() != 2 or residual_inp_.shape != input_.shape:
-            return None
-        if residual_inp_.dtype != input_.dtype or residual_inp_.device != input_.device:
-            return None
-        if not input_.is_contiguous() or not residual_inp_.is_contiguous():
-            return None
-        if not self._should_fused_rmsnorm_custom_ar(input_):
-            return None
-        is_graph_launch = (
-            self._IS_CAPTURING
-            and torch.get_device_module().is_current_stream_capturing()
-        )
-        graph_registered_input_enabled = getattr(
-            self, "_graph_registered_input_enabled", False
-        )
-        residual_out = residual_inp_
-        self._launch_fused_allreduce_residual(
-            input_,
-            residual_inp_,
-            residual_out,
-            is_graph_launch,
-            graph_registered_input_enabled,
-        )
-        return residual_out
-
-    def _launch_fused_allreduce_residual(
-        self,
-        input_: torch.Tensor,
-        residual_inp_: torch.Tensor,
-        residual_out: torch.Tensor,
-        is_graph_launch: bool,
-        graph_registered_input_enabled: bool,
-    ) -> None:
-        # Eager/prefill must stage through the communicator workspace. Only a
-        # graph launch may consume the pre-registered activation pointer.
-        use_registered_input = is_graph_launch and graph_registered_input_enabled
-        rows = int(input_.shape[0])
-        hidden = int(input_.shape[-1])
-        row_warp_inv_rms_override = (
-            1 if self.world_size == 8 and rows == 256 and hidden == 1024 else -1
-        )
-        if use_registered_input:
-            rank_data_ready = False
-            try:
-                rank_data = self._rank_data_for_registered_input(
-                    input_, prefer_device_slot=is_graph_launch
-                )
-                if rank_data is None:
-                    raise RuntimeError("registered rank data is not ready")
-                rank_data_ready = True
-                launcher_key = (hidden, row_warp_inv_rms_override)
-                launcher = self._fused_residual_registered_launchers.get(launcher_key)
-                if launcher is None:
-                    launcher = (
-                        self._jit_ar.launch_fused_allreduce_residual_registered_func(
-                            self.world_size, hidden, row_warp_inv_rms_override
-                        )
-                    )
-                    self._fused_residual_registered_launchers[launcher_key] = launcher
-                launcher(
-                    rank_data,
-                    self.signal_ptrs_cpu,
-                    residual_inp_,
-                    residual_out,
-                    int(self.meta_ptrs[self.rank]),
-                    int(self.rank),
-                    int(self.world_size),
-                )
-                return
-            except Exception:
-                if (
-                    is_graph_launch
-                    and graph_registered_input_enabled
-                    and not rank_data_ready
-                ):
-                    residual_out.zero_()
-                    return
-                raise
-
-        launcher_key = (hidden, row_warp_inv_rms_override)
-        launcher = self._fused_residual_unregistered_launchers.get(launcher_key)
-        if launcher is None:
-            launcher = self._jit_ar.launch_fused_allreduce_residual_unregistered_func(
-                self.world_size, hidden, row_warp_inv_rms_override
-            )
-            self._fused_residual_unregistered_launchers[launcher_key] = launcher
-        launcher(
-            self.rank_data,
-            self.signal_ptrs_cpu,
-            input_,
-            residual_inp_,
-            residual_out,
-            int(self.meta_ptrs[self.rank]),
-            int(self.buffer_ptrs[self.rank]),
-            int(self.max_size),
-            int(self.rank),
-            int(self.world_size),
-        )
 
     def _launch_fused_allreduce_rmsnorm_row(
         self,
@@ -638,9 +543,7 @@ class MusaJitCustomAllreduceRMSNorm:
             )
             return True
 
-        rank_data = self._rank_data_for_registered_input(
-            input_, prefer_device_slot=True
-        )
+        rank_data = self._rank_data_for_registered_input(input_)
         if rank_data is None:
             return False
         launcher = self._fused_rmsnorm_row_registered_launchers.get(launcher_key)
