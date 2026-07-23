@@ -185,6 +185,7 @@ def _act_and_mul_masked_post_quant_impl(
     activation_type: int,
     swiglu_limit: float,
     swizzle: bool,
+    expected_m: int,
 ) -> None:
     _act_and_mul_post_quant_module().sgl_musa_act_and_mul_masked_post_quant(
         input,
@@ -194,6 +195,7 @@ def _act_and_mul_masked_post_quant_impl(
         int(activation_type),
         float(swiglu_limit),
         bool(swizzle),
+        int(expected_m),
     )
 
 
@@ -209,6 +211,7 @@ def _act_and_mul_masked_post_quant_custom(
     activation_type: int,
     swiglu_limit: float,
     swizzle: bool,
+    expected_m: int,
 ) -> None:
     _act_and_mul_masked_post_quant_impl(
         input,
@@ -218,6 +221,7 @@ def _act_and_mul_masked_post_quant_custom(
         activation_type,
         swiglu_limit,
         swizzle,
+        expected_m,
     )
 
 
@@ -229,6 +233,7 @@ def act_and_mul_masked_post_quant(
     activation: str = "silu",
     swiglu_limit: Optional[float] = None,
     swizzle: bool = False,
+    expected_m: int = 0,
 ) -> None:
     _act_and_mul_masked_post_quant_custom(
         input,
@@ -238,6 +243,7 @@ def act_and_mul_masked_post_quant(
         _activation_type_id(activation),
         0.0 if swiglu_limit is None else float(swiglu_limit),
         swizzle,
+        expected_m,
     )
 
 
@@ -251,6 +257,7 @@ def act_and_mul_masked_post_quant_fwd(
     activation: str = "silu",
     swiglu_limit: Optional[float] = None,
     swizzle: bool = False,
+    expected_m: int = 0,
 ) -> None:
     assert input.is_contiguous()
     assert output.dtype == torch.float8_e4m3fn
@@ -279,4 +286,5 @@ def act_and_mul_masked_post_quant_fwd(
         activation=activation,
         swiglu_limit=swiglu_limit,
         swizzle=swizzle,
+        expected_m=expected_m,
     )
