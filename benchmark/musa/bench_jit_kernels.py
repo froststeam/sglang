@@ -434,6 +434,36 @@ def bench_rope(num_tests: int) -> None:
     _print_row("rope_prefill T4096 H32 KV8", seconds, bytes_lb)
 
 
+def bench_rope_bf16(num_tests: int) -> None:
+    """bf16 neox rotary prefill (the bf16 path that uses rope_pair_fp32_bf16)."""
+    num_tokens, num_heads, num_kv_heads, head_size, rot_dim = 4096, 32, 8, 128, 128
+    query = torch.randn(
+        num_tokens, num_heads, head_size, device="musa", dtype=torch.bfloat16
+    )
+    key = torch.randn(
+        num_tokens, num_kv_heads, head_size, device="musa", dtype=torch.bfloat16
+    )
+    positions = torch.arange(num_tokens, device="musa", dtype=torch.long)
+    cache = torch.randn(num_tokens + 16, rot_dim, device="musa", dtype=torch.bfloat16)
+
+    def run_prefill() -> None:
+        rotary_embedding(positions, query, key, head_size, cache, True)
+
+    seconds = bench_kineto(
+        run_prefill,
+        "rotary_embedding_prefill_neox_bf16_h2_kernel",
+        num_tests=num_tests,
+        suppress_kineto_output=True,
+        flush_l2=True,
+    )
+    bytes_lb = (
+        num_tokens * (num_heads + num_kv_heads) * rot_dim * 2 * 2
+        + num_tokens * rot_dim * 2
+        + num_tokens * 8
+    )
+    _print_row("rope_prefill_bf16 T4096 H32 KV8", seconds, bytes_lb)
+
+
 def bench_topk(num_tests: int) -> None:
     for experts in (256, 512):
         num_tokens, topk = 4096, 8
@@ -472,6 +502,19 @@ def bench_topk(num_tests: int) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-tests", type=int, default=3)
+    parser.add_argument(
+        "--only",
+        choices=[
+            "causal_conv1d",
+            "gdn_qkvzba",
+            "rms_norm_gated",
+            "quant",
+            "rope",
+            "rope_bf16",
+            "topk",
+        ],
+        help="run only one bench section (default: all)",
+    )
     args = parser.parse_args()
 
     if not (hasattr(torch, "musa") and torch.musa.is_available()):
@@ -485,12 +528,20 @@ def main() -> None:
         f"MUSA JIT kernel cold-cache bench, num_tests={args.num_tests}, "
         f"arch={arch_list}"
     )
-    bench_causal_conv1d(args.num_tests)
-    bench_gdn_qkvzba(args.num_tests)
-    bench_rms_norm_gated(args.num_tests)
-    bench_quant(args.num_tests)
-    bench_rope(args.num_tests)
-    bench_topk(args.num_tests)
+    sections = {
+        "causal_conv1d": bench_causal_conv1d,
+        "gdn_qkvzba": bench_gdn_qkvzba,
+        "rms_norm_gated": bench_rms_norm_gated,
+        "quant": bench_quant,
+        "rope": bench_rope,
+        "rope_bf16": bench_rope_bf16,
+        "topk": bench_topk,
+    }
+    if args.only:
+        sections[args.only](args.num_tests)
+    else:
+        for fn in sections.values():
+            fn(args.num_tests)
 
 
 if __name__ == "__main__":
