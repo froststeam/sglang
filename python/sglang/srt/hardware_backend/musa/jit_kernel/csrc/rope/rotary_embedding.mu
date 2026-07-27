@@ -48,6 +48,27 @@ __device__ __forceinline__ void store_bfloat162(__mt_bfloat162 *ptr,
 #endif
 }
 
+// fp32 neox rotary for the bf16 half2 kernels: upcast both lanes to fp32,
+// rotate in fp32, round back to bf16 (bit-consistent with the scalar apply_one()
+// fp32 path). fp32 keeps the rotation shape-independent, so the EAGLE3 draft and
+// q>1 verify forwards agree and the temp>0 speculative accept ratio stays faithful.
+__device__ __forceinline__ void
+rope_pair_fp32_bf16(const __mt_bfloat162 c, const __mt_bfloat162 s,
+                    const __mt_bfloat162 x, const __mt_bfloat162 y,
+                    __mt_bfloat162 &out_x, __mt_bfloat162 &out_y) {
+  const float2 cf = __bfloat1622float2(c);
+  const float2 sf = __bfloat1622float2(s);
+  const float2 xf = __bfloat1622float2(x);
+  const float2 yf = __bfloat1622float2(y);
+  float2 oxf, oyf;
+  oxf.x = xf.x * cf.x - yf.x * sf.x;
+  oxf.y = xf.y * cf.y - yf.y * sf.y;
+  oyf.x = yf.x * cf.x + xf.x * sf.x;
+  oyf.y = yf.y * cf.y + xf.y * sf.y;
+  out_x = __float22bfloat162_rn(oxf);
+  out_y = __float22bfloat162_rn(oyf);
+}
+
 inline bool supported_h2_rot_dim(int rot_dim) {
   return rot_dim == 64 || rot_dim == 128;
 }
@@ -565,8 +586,8 @@ apply_neox_bf16_bfloat162(__mt_bfloat16 *__restrict__ data,
       *reinterpret_cast<const __mt_bfloat162 *>(data + head_base + rot);
   const __mt_bfloat162 y = *reinterpret_cast<const __mt_bfloat162 *>(
       data + head_base + HALF_ROT_DIM + rot);
-  const __mt_bfloat162 out_x = __hfma2(y, __hneg2(s), __hmul2(x, c));
-  const __mt_bfloat162 out_y = __hfma2(x, s, __hmul2(y, c));
+  __mt_bfloat162 out_x, out_y;
+  rope_pair_fp32_bf16(c, s, x, y, out_x, out_y);
   store_bfloat162(reinterpret_cast<__mt_bfloat162 *>(data + head_base + rot),
                   out_x);
   store_bfloat162(
@@ -591,8 +612,8 @@ apply_neox_bf16_bfloat162_hs128(__mt_bfloat16 *__restrict__ data,
       *reinterpret_cast<const __mt_bfloat162 *>(data + head_base + rot);
   const __mt_bfloat162 y = *reinterpret_cast<const __mt_bfloat162 *>(
       data + head_base + HALF_ROT_DIM + rot);
-  const __mt_bfloat162 out_x = __hfma2(y, __hneg2(s), __hmul2(x, c));
-  const __mt_bfloat162 out_y = __hfma2(x, s, __hmul2(y, c));
+  __mt_bfloat162 out_x, out_y;
+  rope_pair_fp32_bf16(c, s, x, y, out_x, out_y);
   store_bfloat162(reinterpret_cast<__mt_bfloat162 *>(data + head_base + rot),
                   out_x);
   store_bfloat162(
@@ -1436,8 +1457,8 @@ __global__ void rotary_embedding_cache_neox_bf16_h2_kernel(
           *reinterpret_cast<const __mt_bfloat162 *>(key + key_head_base + rot);
       const __mt_bfloat162 y = *reinterpret_cast<const __mt_bfloat162 *>(
           key + key_head_base + HALF_ROT_DIM + rot);
-      const __mt_bfloat162 out_x = __hfma2(y, __hneg2(s), __hmul2(x, c));
-      const __mt_bfloat162 out_y = __hfma2(x, s, __hmul2(y, c));
+      __mt_bfloat162 out_x, out_y;
+      rope_pair_fp32_bf16(c, s, x, y, out_x, out_y);
       store_bfloat162(
           reinterpret_cast<__mt_bfloat162 *>(key + key_head_base + rot), out_x);
       store_bfloat162(reinterpret_cast<__mt_bfloat162 *>(
@@ -1502,8 +1523,8 @@ __global__ void rotary_embedding_cache_qout_neox_bf16_h2_kernel(
           query + query_head_base + rot);
       const __mt_bfloat162 y = *reinterpret_cast<const __mt_bfloat162 *>(
           query + query_head_base + HALF_ROT_DIM + rot);
-      const __mt_bfloat162 out_x = __hfma2(y, __hneg2(s), __hmul2(x, c));
-      const __mt_bfloat162 out_y = __hfma2(x, s, __hmul2(y, c));
+      __mt_bfloat162 out_x, out_y;
+      rope_pair_fp32_bf16(c, s, x, y, out_x, out_y);
       store_bfloat162(
           reinterpret_cast<__mt_bfloat162 *>(q_out + q_out_head_base + rot),
           out_x);
@@ -1525,8 +1546,8 @@ __global__ void rotary_embedding_cache_qout_neox_bf16_h2_kernel(
           *reinterpret_cast<const __mt_bfloat162 *>(key + key_head_base + rot);
       const __mt_bfloat162 y = *reinterpret_cast<const __mt_bfloat162 *>(
           key + key_head_base + HALF_ROT_DIM + rot);
-      const __mt_bfloat162 out_x = __hfma2(y, __hneg2(s), __hmul2(x, c));
-      const __mt_bfloat162 out_y = __hfma2(x, s, __hmul2(y, c));
+      __mt_bfloat162 out_x, out_y;
+      rope_pair_fp32_bf16(c, s, x, y, out_x, out_y);
       store_bfloat162(
           reinterpret_cast<__mt_bfloat162 *>(key + key_head_base + rot), out_x);
       store_bfloat162(reinterpret_cast<__mt_bfloat162 *>(
