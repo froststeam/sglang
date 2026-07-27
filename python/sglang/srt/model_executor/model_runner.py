@@ -1249,6 +1249,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     )
 
             # Only initialize the distributed environment on the target model worker.
+            local_size = (self.tp_size * self.pp_size) // self.server_args.nnodes
+            os.environ.setdefault("LOCAL_SIZE", str(local_size))
+            os.environ.setdefault("LOCAL_WORLD_SIZE", str(local_size))
             init_distributed_environment(
                 backend=backend,
                 world_size=self.tp_size * self.pp_size,

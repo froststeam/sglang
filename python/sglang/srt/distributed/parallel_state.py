@@ -235,6 +235,7 @@ class GroupCoordinator:
     # communicators are only created for world size > 1
     pynccl_comm: Optional[Any]  # PyNccl communicator
     ca_comm: Optional[Any]  # Custom allreduce communicator
+    cag_comm: Optional[Any]  # Custom allgather communicator
     torch_symm_mem_comm: Optional[Any]  # Torch symm mem communicator
     mq_broadcaster: Optional[Any]  # shared memory broadcaster
 
@@ -338,6 +339,9 @@ class GroupCoordinator:
         self.use_message_queue_broadcaster = use_message_queue_broadcaster
 
         # Lazy import to avoid documentation build error
+        from sglang.srt.distributed.device_communicators.custom_all_gather import (
+            dispatch_custom_allgather,
+        )
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
             dispatch_custom_allreduce,
         )
@@ -382,6 +386,7 @@ class GroupCoordinator:
             )
 
         self.ca_comm: Optional[Any] = None
+        self.cag_comm: Optional[Any] = None
         self.qr_comm: Optional[QuickAllReduce] = None
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
@@ -411,6 +416,33 @@ class GroupCoordinator:
                     logger.warning(f"Failed to initialize QuickAllReduce: {e}")
         elif self.world_size > 1 and is_hip():
             logger.info("[AR] All-reduce call path: NCCL (custom AR disabled)")
+
+        if (
+            self.world_size > 1
+            and _is_musa
+            and envs.SGLANG_MUSA_USE_JIT_ALL_GATHER.get()
+        ):
+            if self.is_node_local_group:
+                try:
+                    CAGClass = dispatch_custom_allgather()
+                    if CAGClass is not None:
+                        self.cag_comm = CAGClass(
+                            group=self.cpu_group,
+                            device=self.device,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"Setup Custom allgather failed with {e}. "
+                        "Disable it by setting SGLANG_MUSA_USE_JIT_ALL_GATHER=0."
+                    )
+            else:
+                logger.info(
+                    "Skip MUSA custom allgather for non-node-local group "
+                    "%s ranks=%s local_size=%s.",
+                    self.unique_name,
+                    self.ranks,
+                    self.local_size,
+                )
 
         self.torch_symm_mem_comm: Optional[TorchSymmMemCommunicator] = None
         if self.use_torch_symm_mem_all_reduce and self.world_size > 1:
@@ -462,6 +494,24 @@ class GroupCoordinator:
         )
 
     @property
+    def is_node_local_group(self) -> bool:
+        """Return whether every rank in this group is on the same node.
+
+        MUSA custom all-gather uses runtime IPC handles, which are valid only
+        between processes on the same host. If the local process count cannot be
+        determined, stay conservative and do not enable the IPC-based path.
+        """
+        local_size = self.local_size
+        if local_size <= 0:
+            local_size = get_int_env_var("LOCAL_WORLD_SIZE", 0)
+        if local_size <= 0:
+            local_size = get_int_env_var("GPUS_PER_NODE", 0)
+        if local_size <= 0:
+            return False
+        node_ids = {rank // local_size for rank in self.ranks}
+        return len(node_ids) == 1
+
+    @property
     def first_rank(self):
         """Return the global rank of the first process in the group"""
         return self.ranks[0]
@@ -511,6 +561,8 @@ class GroupCoordinator:
         # is already collected in init() and we can capture the quick allreduce directly.
         ca_comm = self.ca_comm
         maybe_ca_context = nullcontext() if ca_comm is None else ca_comm.capture()
+        cag_comm = self.cag_comm
+        maybe_cag_context = nullcontext() if cag_comm is None else cag_comm.capture()
 
         # ensure all initialization operations complete before attempting to
         # capture the graph on another stream
@@ -518,7 +570,7 @@ class GroupCoordinator:
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
-        with self.device_module.stream(stream), maybe_ca_context:
+        with self.device_module.stream(stream), maybe_ca_context, maybe_cag_context:
             # In graph mode, we have to be very careful about the collective
             # operations. The current status is:
             #     allreduce \ Mode   |  Eager  |  Graph  |
@@ -814,6 +866,16 @@ class GroupCoordinator:
             return output
 
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        cag_comm = self.cag_comm
+        if (
+            cag_comm is not None
+            and not cag_comm.disabled
+            and cag_comm.should_custom_ag(output, input)
+        ):
+            out = cag_comm.custom_all_gather(output, input)
+            if out is not None:
+                return
+
         pynccl_comm = self.pynccl_comm
         if self._should_use_pynccl_tensor_collective():
             assert pynccl_comm is not None
@@ -1392,6 +1454,10 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
+        if self.cag_comm is not None:
+            if hasattr(self.cag_comm, "close"):
+                self.cag_comm.close()
+            self.cag_comm = None
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
