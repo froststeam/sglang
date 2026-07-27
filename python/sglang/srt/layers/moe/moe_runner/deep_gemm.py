@@ -1457,6 +1457,7 @@ def _varlen_deep_gemm_silu_mul_quant(
             activation=activation,
             swiglu_limit=swiglu_limit,
             swizzle=swizzle,
+            expected_m=expected_m if expected_m is not None else 0,
         )
     elif _MASKED_GEMM_FAST_ACT:
         assert not swizzle, (

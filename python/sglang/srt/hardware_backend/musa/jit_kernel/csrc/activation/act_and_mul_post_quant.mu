@@ -299,6 +299,72 @@ __global__ void act_and_mul_masked_post_quant_scale_blocked_kernel(
   }
 }
 
+template <int ACTIVATION_TYPE>
+// Decode-specialized layout: one 512-thread CTA covers 16 quant groups for
+// one expert. The z dimension partitions rows so small m does not serialize
+// all tokens behind a single CTA.
+__global__ void act_and_mul_masked_post_quant_compact_kernel(
+    const __mt_bfloat16* __restrict__ input,
+    __mt_fp8_e4m3* __restrict__ output,
+    float* __restrict__ output_scale,
+    const int32_t* __restrict__ masked_m,
+    int hidden_groups, int tokens_per_expert, float swiglu_limit, bool swizzle) {
+  const int subwarp_id = threadIdx.x / kThreadsPerGroup;
+  const int lane_id = threadIdx.x % kThreadsPerGroup;
+  const int hidden_group = blockIdx.y * 16 + subwarp_id;
+  const int expert = blockIdx.x;
+  const int valid_m = min(masked_m[expert], tokens_per_expert);
+  if (hidden_group >= hidden_groups) return;
+  const int hidden = hidden_groups * kGroupSize;
+  const int elem_offset = lane_id * kElemsPerThread;
+  const int swizzled_chunk_offset = (elem_offset / 8) * 16 + (elem_offset % 8);
+#pragma unroll 1
+  for (int token = blockIdx.z; token < valid_m; token += gridDim.z) {
+    const int64_t base =
+        (static_cast<int64_t>(expert) * tokens_per_expert + token) * hidden * 2 +
+        (swizzle ? hidden_group * kGroupSize * 2 : hidden_group * kGroupSize);
+    const int64_t gate_offset =
+        base + (swizzle ? swizzled_chunk_offset : elem_offset);
+    const int64_t up_offset =
+        base + (swizzle ? swizzled_chunk_offset + 8 : hidden + elem_offset);
+    const int64_t out_offset =
+        (static_cast<int64_t>(expert) * tokens_per_expert + token) * hidden +
+        hidden_group * kGroupSize + elem_offset;
+    uint64_t gate_u64 = *reinterpret_cast<const uint64_t*>(input + gate_offset);
+    uint64_t up_u64 = *reinterpret_cast<const uint64_t*>(input + up_offset);
+    auto gate_vec = reinterpret_cast<__mt_bfloat16*>(&gate_u64);
+    auto up_vec = reinterpret_cast<__mt_bfloat16*>(&up_u64);
+    float values[kElemsPerThread];
+    float local_absmax = kLocalAbsMaxMin;
+#pragma unroll
+    for (int i = 0; i < kElemsPerThread; ++i) {
+      const float gv =
+          clamp_gate_musa(__bfloat162float(gate_vec[i]), swiglu_limit);
+      const float uv =
+          clamp_up_musa(__bfloat162float(up_vec[i]), swiglu_limit);
+      __mt_bfloat16 g = __float2bfloat16_rn(
+          apply_activation_musa<ACTIVATION_TYPE>(gv));
+      __mt_bfloat16 u = __float2bfloat16_rn(uv);
+      const float v = __bfloat162float(g * u);
+      values[i] = v;
+      local_absmax = fmaxf(local_absmax, fabsf(v));
+    }
+    local_absmax = GroupReduceMax<kThreadsPerGroup>(local_absmax, lane_id);
+    const float scale_inv = local_absmax * (1.0f / kFp8E4M3Max);
+    const float scale = kFp8E4M3Max / local_absmax;
+    if (lane_id == 0) {
+      output_scale[(static_cast<int64_t>(expert) * tokens_per_expert + token) *
+                       hidden_groups +
+                   hidden_group] = scale_inv;
+    }
+    float4 out4 = {
+        values[0] * scale, values[1] * scale, values[2] * scale,
+        values[3] * scale};
+    *reinterpret_cast<uint32_t*>(output + out_offset) =
+        __musa_cvt_float4_to_fp8x4(out4, __MT_SATFINITE, __MT_E4M3);
+  }
+}
+
 template <int ACTIVATION_TYPE, int ROWS_PER_BLOCK>
 void launch_act_and_mul_masked_post_quant(
     ffi::TensorView input,
@@ -396,8 +462,23 @@ void dispatch_act_and_mul_masked_post_quant_rows(
     ffi::TensorView masked_m,
     float swiglu_limit,
     bool swizzle,
+    int64_t expected_m,
     musaStream_t stream) {
-  if (output.size(1) <= 4096) {
+  if (expected_m > 0 && expected_m <= 128 && output.size(2) % kGroupSize == 0) {
+    const int hidden_groups = static_cast<int>(output.size(2) / kGroupSize);
+    const int row_partitions = expected_m <= 32 ? 1 : (expected_m <= 64 ? 2 : 4);
+    dim3 grid(static_cast<unsigned int>(output.size(0)),
+              static_cast<unsigned int>((hidden_groups + 15) / 16),
+              static_cast<unsigned int>(row_partitions));
+    dim3 block(16 * kThreadsPerGroup);
+    act_and_mul_masked_post_quant_compact_kernel<ACTIVATION_TYPE>
+        <<<grid, block, 0, stream>>>(
+            static_cast<const __mt_bfloat16*>(input.data_ptr()),
+            static_cast<__mt_fp8_e4m3*>(output.data_ptr()),
+            static_cast<float*>(output_scale.data_ptr()),
+            static_cast<const int32_t*>(masked_m.data_ptr()), hidden_groups,
+            static_cast<int>(output.size(1)), swiglu_limit, swizzle);
+  } else if (output.size(1) <= 4096) {
     launch_act_and_mul_masked_post_quant<ACTIVATION_TYPE, 32>(
         input, output, output_scale, masked_m, swiglu_limit, swizzle, stream);
   } else {
@@ -413,7 +494,8 @@ void sgl_musa_act_and_mul_masked_post_quant(
     ffi::TensorView masked_m,
     int64_t activation_type,
     double swiglu_limit,
-    bool swizzle) {
+    bool swizzle,
+    int64_t expected_m) {
   CHECK_INPUT(input);
   CHECK_INPUT(output);
   CHECK_INPUT(output_scale);
@@ -440,13 +522,16 @@ void sgl_musa_act_and_mul_masked_post_quant(
   const float swiglu_limit_f = static_cast<float>(swiglu_limit);
   if (act == kGeluActivation) {
     dispatch_act_and_mul_masked_post_quant_rows<kGeluActivation>(
-        input, output, output_scale, masked_m, swiglu_limit_f, swizzle, stream);
+        input, output, output_scale, masked_m, swiglu_limit_f, swizzle,
+        expected_m, stream);
   } else if (act == kGeluTanhActivation) {
     dispatch_act_and_mul_masked_post_quant_rows<kGeluTanhActivation>(
-        input, output, output_scale, masked_m, swiglu_limit_f, swizzle, stream);
+        input, output, output_scale, masked_m, swiglu_limit_f, swizzle,
+        expected_m, stream);
   } else {
     dispatch_act_and_mul_masked_post_quant_rows<kSiluActivation>(
-        input, output, output_scale, masked_m, swiglu_limit_f, swizzle, stream);
+        input, output, output_scale, masked_m, swiglu_limit_f, swizzle,
+        expected_m, stream);
   }
 
   const musaError_t err = musaGetLastError();

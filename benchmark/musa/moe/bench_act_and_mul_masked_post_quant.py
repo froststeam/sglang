@@ -148,6 +148,23 @@ def main():
     )
     parser.add_argument("--hidden", type=int, default=7168)
     parser.add_argument("--experts", type=int, default=1)
+    parser.add_argument(
+        "--capacity",
+        type=int,
+        default=0,
+        help="Allocated rows per expert; defaults to the valid rows per expert.",
+    )
+    parser.add_argument(
+        "--expected-m",
+        type=int,
+        default=0,
+        help="Host-side expected rows/expert hint; <=128 selects compact decode variants.",
+    )
+    parser.add_argument(
+        "--check-baseline",
+        action="store_true",
+        help="Require byte-equal valid outputs versus the regular padded-grid kernel.",
+    )
     parser.add_argument("--group-size", type=int, default=128)
     parser.add_argument(
         "--activations", nargs="+", default=["silu", "gelu", "gelu_tanh"]
@@ -271,13 +288,18 @@ def main():
     for rows in args.rows:
         if rows % args.experts != 0:
             raise ValueError("rows must be divisible by experts")
-        m = rows // args.experts
+        valid_m = rows // args.experts
+        m = args.capacity or valid_m
+        if valid_m > m:
+            raise ValueError("valid rows per expert cannot exceed --capacity")
         input_tensor = torch.randn(
             (args.experts, m, args.hidden * 2),
             device="musa",
             dtype=torch.bfloat16,
         )
-        masked_m = torch.full((args.experts,), m, device="musa", dtype=torch.int32)
+        masked_m = torch.full(
+            (args.experts,), valid_m, device="musa", dtype=torch.int32
+        )
         output = torch.empty(
             (args.experts, m, args.hidden), device="musa", dtype=torch.float8_e4m3fn
         )
@@ -300,6 +322,7 @@ def main():
                     masked_m,
                     scale_ue8m0=False,
                     activation=activation,
+                    expected_m=args.expected_m,
                 )
 
             ms = (
@@ -308,6 +331,34 @@ def main():
                 else _mate_kineto_time_ms(run, args.repeat, args.kernel_name)
             )
             _sync()
+            if args.check_baseline:
+                baseline_output = torch.empty_like(output)
+                baseline_scale = torch.empty_like(output_scale)
+                act_and_mul_masked_post_quant_fwd(
+                    input_tensor,
+                    baseline_output,
+                    baseline_scale,
+                    args.group_size,
+                    masked_m,
+                    scale_ue8m0=False,
+                    activation=activation,
+                    expected_m=0,
+                )
+                _sync()
+                for expert in range(args.experts):
+                    valid = int(masked_m[expert].item())
+                    torch.testing.assert_close(
+                        output[expert, :valid].float(),
+                        baseline_output[expert, :valid].float(),
+                        rtol=0,
+                        atol=0,
+                    )
+                    torch.testing.assert_close(
+                        output_scale[expert, :valid],
+                        baseline_scale[expert, :valid],
+                        rtol=0,
+                        atol=0,
+                    )
             max_abs, max_rel, max_abs_scale, mismatch, checked = _ref(
                 input_tensor,
                 output,
