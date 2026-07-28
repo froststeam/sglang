@@ -29,6 +29,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info_v2 import (
     EagleDraftInputV2Mixin,
     EagleVerifyInputV2Mixin,
+    _can_use_musa_top_k_renorm,
 )
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
@@ -535,13 +536,19 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
             target_probs = F.softmax(
                 logits_output.next_token_logits / expanded_temperature, dim=-1
-            )  # (bs * draft_token_num, vocab_size)
-            target_probs = top_k_renorm_prob(
+            )
+            if _can_use_musa_top_k_renorm(batch, target_probs):
+                top_k_renorm_func = (
+                    torch.ops.sgl_kernel.musa_top_k_renorm_probs.default
+                )
+            else:
+                top_k_renorm_func = top_k_renorm_prob
+            target_probs = top_k_renorm_func(
                 target_probs,
                 torch.repeat_interleave(
                     sampling_info.top_ks, self.draft_token_num, dim=0
                 ),
-            )  # (bs * draft_token_num, vocab_size)
+            )
             if sampling_info.need_top_p_sampling:
                 target_probs = top_p_renorm_prob(
                     target_probs,
