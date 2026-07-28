@@ -75,11 +75,6 @@ template <>
 struct _dtype_trait<bf16_t, void> {
   static constexpr DLDataType value = DLDataType{DLDataTypeCode::kDLBfloat, 16, 1};
 };
-
-template <>
-struct _dtype_trait<bfloat16_t, void> {
-  static constexpr DLDataType value = DLDataType{DLDataTypeCode::kDLBfloat, 16, 1};
-};
 #endif
 
 template <>
