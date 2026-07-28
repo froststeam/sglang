@@ -27,7 +27,7 @@ void add_constant(tvm::ffi::TensorView dst, tvm::ffi::TensorView src) {
   using namespace host;
 
   // 1. Validate input tensors
-  SymbolicSize N = {"num_elements"};
+  SymbolicSize N{"num_elements"};
   SymbolicDevice device_;
   TensorMatcher({N})                  // 1D tensor, must be contiguous
       .with_dtype<int32_t>()          // must be int32

@@ -27,7 +27,7 @@ struct ClampPosition {
   static void run(tvm::ffi::TensorView dst, tvm::ffi::TensorView seq_lens) {
     using namespace host;
 
-    SymbolicSize N = {"num_elements"};
+    SymbolicSize N{"num_elements"};
     SymbolicDevice device_;
     device_.set_options<kDLCUDA, kDLROCM>();
 
