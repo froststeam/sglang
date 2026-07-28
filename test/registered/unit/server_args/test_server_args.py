@@ -97,21 +97,19 @@ class TestMusaBackendDefaults(unittest.TestCase):
         self.assertEqual(server_args.linear_attn_backend, "flashinfer")
         self.assertEqual(server_args.sampling_backend, "flashinfer")
         self.assertEqual(server_args.tokenizer_backend, "huggingface")
-        self.assertTrue(server_args.disable_overlap_schedule)
+        self.assertFalse(server_args.disable_overlap_schedule)
 
     @patch("sglang.srt.server_args.get_device_sm", return_value=31)
     @patch("sglang.srt.server_args.is_musa", return_value=True)
     def test_musa_backend_defaults_from_cli(self, _mock_is_musa, _mock_device_sm):
-        server_args = prepare_server_args(
-            ["--model-path", "dummy", "--device", "musa"]
-        )
+        server_args = prepare_server_args(["--model-path", "dummy", "--device", "musa"])
 
         self.assertEqual(server_args.attention_backend, "fa3")
         self.assertEqual(server_args.mm_attention_backend, "fa3")
         self.assertEqual(server_args.linear_attn_backend, "flashinfer")
         self.assertEqual(server_args.sampling_backend, "flashinfer")
         self.assertEqual(server_args.tokenizer_backend, "huggingface")
-        self.assertTrue(server_args.disable_overlap_schedule)
+        self.assertFalse(server_args.disable_overlap_schedule)
 
     @patch("sglang.srt.server_args.get_device_sm", return_value=31)
     @patch("sglang.srt.server_args.is_musa", return_value=True)
@@ -134,7 +132,7 @@ class TestMusaBackendDefaults(unittest.TestCase):
         self.assertEqual(server_args.linear_attn_backend, "triton")
         self.assertEqual(server_args.sampling_backend, "pytorch")
         self.assertEqual(server_args.tokenizer_backend, "huggingface")
-        self.assertTrue(server_args.disable_overlap_schedule)
+        self.assertFalse(server_args.disable_overlap_schedule)
 
     @patch("sglang.srt.server_args.get_device_sm", return_value=30)
     @patch("sglang.srt.server_args.is_musa", return_value=True)
@@ -148,7 +146,7 @@ class TestMusaBackendDefaults(unittest.TestCase):
         self.assertIsNone(server_args.sampling_backend)
         self.assertEqual(server_args.linear_attn_backend, "triton")
         self.assertEqual(server_args.tokenizer_backend, "huggingface")
-        self.assertTrue(server_args.disable_overlap_schedule)
+        self.assertFalse(server_args.disable_overlap_schedule)
 
     @patch("sglang.srt.server_args.get_device_sm", return_value=31)
     @patch("sglang.srt.server_args.is_musa", return_value=True)

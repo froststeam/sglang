@@ -328,8 +328,10 @@ def fused_dual_input_rmsnorm(
         output1 = x1
         output2 = x2
     else:
-        output1 = torch.empty_like(x1)
-        output2 = torch.empty_like(x2)
+        # Do not inherit a non-contiguous view layout from split/reshape
+        # inputs; downstream MUSA GEMV requires contiguous activations.
+        output1 = torch.empty_like(x1, memory_format=torch.contiguous_format)
+        output2 = torch.empty_like(x2, memory_format=torch.contiguous_format)
 
     bs, headdim_x1 = x1.shape
     _, headdim_x2 = x2.shape

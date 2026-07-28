@@ -27,6 +27,10 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.hardware_backend.musa.layers.gemv_auto_tune import (
+    maybe_apply_musa_gemv_activation,
+    register_musa_gemv_activation,
+)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -94,6 +98,7 @@ class Qwen2MLP(nn.Module):
                 "Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        register_musa_gemv_activation(self.gate_up_proj, self.act_fn)
 
     def forward(
         self,
@@ -103,8 +108,14 @@ class Qwen2MLP(nn.Module):
         if get_global_server_args().rl_on_policy_target is not None:
             x = x.bfloat16()
 
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        fused_gate_up = maybe_apply_musa_gemv_activation(
+            self.gate_up_proj, x, activation=self.act_fn
+        )
+        if fused_gate_up is None:
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
+        else:
+            x = fused_gate_up
         x, _ = self.down_proj(x, forward_batch=forward_batch)
         return x
 

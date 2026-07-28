@@ -16,14 +16,14 @@ import torch
 import torch_musa  # noqa: F401
 from mate.testing.utils import bench_kineto
 
-from sglang.srt.hardware_backend.musa.jit_kernel.csrc.gemm import (
-    musa_fused_moe_gemv as jit_moe_gemv,
+from sglang.srt.hardware_backend.musa.jit_kernel.csrc.gemv import (
+    musa_gemv as jit_linear_gemv,
 )
-from sglang.srt.hardware_backend.musa.jit_kernel.csrc.gemm import (
-    musa_linear_gemv as jit_linear_gemv,
+from sglang.srt.hardware_backend.musa.jit_kernel.csrc.gemv import (
+    musa_moe_gemv as jit_moe_gemv,
 )
 
-KERNEL_NAME = "musa_gemv_kernel"
+KERNEL_NAME = "gemv"
 
 
 def parse_csv_ints(value: str) -> list[int]:
@@ -152,8 +152,8 @@ def make_moe_case(
             for i in range(topk):
                 expert = int(topk_ids[t, i].item())
                 x = A[t].float() @ bref[expert].t()
-                gate = x[: n // 2] * topk_weights[t, i].float()
-                up = x[n // 2 :] * topk_weights[t, i].float()
+                gate = x[: n // 2]
+                up = x[n // 2 :]
                 per_token.append(gate * torch.sigmoid(gate) * up)
             rows.append(torch.stack(per_token))
         return torch.stack(rows)
@@ -167,7 +167,7 @@ def make_moe_case(
             B_scale,
             topk_weights,
             topk_ids,
-            True,
+            False,
             topk,
             False,
             True,
@@ -217,7 +217,10 @@ def run_one(
     sync()
     diff = 0.0
     if not args.skip_correctness:
-        diff = max_diff(get_output(), ref)
+        actual = get_output().float()
+        expected = ref.float()
+        diff = max_diff(actual, expected)
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=1.0)
 
     event = None
     kineto = None
@@ -274,7 +277,7 @@ def main() -> None:
     )
     parser.add_argument("--ops", default="linear,moe", help="linear,moe or both")
     parser.add_argument("--dtypes", default="fp8,bf16", help="fp8,bf16 or both")
-    parser.add_argument("--tokens", default="1,2,4,8,16")
+    parser.add_argument("--tokens", default="1,2,3,4,8,16,32")
     parser.add_argument("--n", type=int, default=512)
     parser.add_argument("--k", type=int, default=2048)
     parser.add_argument("--experts", type=int, default=257)

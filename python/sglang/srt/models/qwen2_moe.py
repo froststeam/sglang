@@ -45,6 +45,10 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.hardware_backend.musa.layers.gemv_auto_tune import (
+    maybe_apply_musa_gemv_activation,
+    register_musa_gemv_activation,
+)
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
@@ -204,6 +208,7 @@ class Qwen2MoeMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        register_musa_gemv_activation(self.gate_up_proj, self.act_fn)
 
     def forward(
         self,
@@ -211,8 +216,14 @@ class Qwen2MoeMLP(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        fused_gate_up = maybe_apply_musa_gemv_activation(
+            self.gate_up_proj, x, activation=self.act_fn
+        )
+        if fused_gate_up is None:
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
+        else:
+            x = fused_gate_up
         x, _ = self.down_proj(
             x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
         )
