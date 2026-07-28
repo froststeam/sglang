@@ -17,62 +17,38 @@
 
 #pragma once
 
-#include <musa_runtime.h>
-#include <cassert>
-#include <musa_bf16.h>
-#include <musa_fp16.h>
-#include <tvm/ffi/container/tensor.h>
-#include <tvm/ffi/dtype.h>
-#include <tvm/ffi/error.h>
-#include <tvm/ffi/extra/c_env_api.h>
-#include <tvm/ffi/extra/musa/device_guard.h>
-#include <tvm/ffi/function.h>
-
-#include "../common.h"
-#include "../device_utils.h"
-#include "../include/common.muh"
-#include "../include/dtype.muh"
-
-using namespace musa::dnn;
-
-#ifdef TORCH_CHECK
-#undef TORCH_CHECK
-#endif
-#define TORCH_CHECK(cond, ...) TVM_FFI_ICHECK(cond);
-
-static inline int tensor_element_size(DLDataType dtype) {
-    return dtype.bits / 8;
-}
+#include "../common.muh"
 
 #if defined(__MUSA_ARCH__) && __MUSA_ARCH__ == 310
-#define ThreadNumPerWarp 32
+#define MOE_GEMV_WARP_SIZE 32
 #else
-#define ThreadNumPerWarp 128
+#define MOE_GEMV_WARP_SIZE 128
 #endif
 
-#define SYNC_IF_NEEDED() \
-    if constexpr (BLOCK_N * BLOCK_K > ThreadNumPerWarp) { \
+#define MOE_GEMV_SYNC_IF_NEEDED() \
+    if constexpr (BLOCK_N * BLOCK_K > MOE_GEMV_WARP_SIZE) { \
         __SYNCTHREADS_LM; \
     }
 
-using GemvV16F32 = float __attribute__((vector_size(64)));
+using MoeGemvV16F32 = float __attribute__((vector_size(64)));
 
 template <typename AType, bool is_w4a16, bool fuse_castfp8>
-struct GemvAVecType {
+struct MoeGemvAVecType {
     using StorageType = std::conditional_t<std::is_same_v<AType, __mt_fp8_e4m3>, uint8_t, AType>;
     using type = typename VecType<StorageType, 128>::Ttype;
 };
 
 template <typename AType, bool fuse_castfp8>
-struct GemvAVecType<AType, true, fuse_castfp8> {
-    using type = GemvV16F32;
+struct MoeGemvAVecType<AType, true, fuse_castfp8> {
+    using type = MoeGemvV16F32;
 };
 
 template <typename AType, typename BType, typename CType, typename ScoreType, typename ScaleType,
-          int BLOCK_N, int BLOCK_K, int iobit, bool mul_routed_weight, bool is_swigelu, bool use_silu,
-          bool is_w4a16, bool is_per_group_scale, bool is_fp8, int scale_block, bool use_rms_norm,
-          bool check_bounds = false>
-__global__ void musa_gemv_kernel(
+          int BLOCK_N, int BLOCK_K, int iobit, bool mul_routed_weight, bool is_swigelu, bool,
+          bool is_w4a16, bool is_per_group_scale, bool is_fp8, int scale_block, bool,
+          bool check_bounds = false, bool token_first_grid = false,
+          bool route_interleaved_grid = false>
+__global__ void musa_moe_gemv_generic_kernel(
     CType *c_ptr,
     const AType *a_ptr,
     const BType *b_ptr,
@@ -86,10 +62,10 @@ __global__ void musa_gemv_kernel(
     int nr_expert,
     int half_n_idx,
     int scale_k_len,
-    bfloat16_t *gamma,
-    float* sum_out,
-    volatile int *count,
-    float eps) {
+    bfloat16_t*,
+    float*,
+    volatile int*,
+    float) {
 
     constexpr int bits_of_byte = 8;
     constexpr int half_blockn = BLOCK_N / 2;
@@ -99,16 +75,19 @@ __global__ void musa_gemv_kernel(
     constexpr int scale_k_load_cntdown_init = ceil_div(scale_block, (BLOCK_K * Vlen));
     constexpr bool fuse_castfp8 = (is_fp8 && !std::is_same_v<AType, __mt_fp8_e4m3>);
 
-    using AVec = typename GemvAVecType<AType, is_w4a16, false>::type;
+    using AVec = typename MoeGemvAVecType<AType, is_w4a16, false>::type;
     using BVec = typename VecType<std::conditional_t<is_fp8, uint8_t, BType>, b_vec_bits>::Ttype;
     using fp8x4_vec = unsigned char __attribute__((vector_size(4)));
 
-    int token_idx = blockIdx.z;
-    int expert_idx = blockIdx.y;
+    int token_idx = token_first_grid ? blockIdx.y : blockIdx.z;
+    int expert_idx = route_interleaved_grid
+        ? (blockIdx.x & 7)
+        : (token_first_grid ? blockIdx.z : blockIdx.y);
+    int n_block_idx = route_interleaved_grid ? (blockIdx.x >> 3) : blockIdx.x;
     int real_expert_idx = 0;
     int t_n_idx = threadIdx.x / BLOCK_K;
     int t_k_idx = threadIdx.x % BLOCK_K;
-    int n_idx = blockIdx.x * BLOCK_N + t_n_idx;
+    int n_idx = n_block_idx * BLOCK_N + t_n_idx;
 
     if (expert_idx_table != nullptr) {
         real_expert_idx = expert_idx_table[token_idx * topk + expert_idx];
@@ -150,9 +129,9 @@ __global__ void musa_gemv_kernel(
 
     if constexpr (is_swigelu) {
         if (t_n_idx < half_blockn) {
-            n_idx = blockIdx.x * half_blockn + t_n_idx;
+            n_idx = n_block_idx * half_blockn + t_n_idx;
         } else {
-            n_idx = blockIdx.x * half_blockn + t_n_idx - half_blockn + half_n_idx;
+            n_idx = n_block_idx * half_blockn + t_n_idx - half_blockn + half_n_idx;
         }
     }
 
@@ -216,7 +195,12 @@ __global__ void musa_gemv_kernel(
         } else {
             *(AVec *)(a_reg) = *(AVec *)(a_ptr + token_idx * k + t_k_idx * Vlen + k_idx);
         }
-        *(BVec *)(b_reg) = *(BVec *)(b_base_ptr + k_idx / w4a16_shift);
+        if constexpr (is_fp8) {
+            *reinterpret_cast<int4 *>(b_reg) = __lsu_ld_cache_hint(
+                reinterpret_cast<const int4 *>(b_base_ptr + k_idx), 4);
+        } else {
+            *(BVec *)(b_reg) = *(BVec *)(b_base_ptr + k_idx / w4a16_shift);
+        }
 
         if constexpr (is_w4a16 && !is_fp8) {
             float b_reg_float[Vlen];
@@ -298,7 +282,7 @@ __global__ void musa_gemv_kernel(
 
     if constexpr (BLOCK_K > 1) {
         shared_array[threadIdx.x] = rst;
-        SYNC_IF_NEEDED()
+        MOE_GEMV_SYNC_IF_NEEDED()
         if (threadIdx.x < BLOCK_N) {
             rst = 0;
             #pragma unroll
@@ -307,18 +291,18 @@ __global__ void musa_gemv_kernel(
             }
         }
         if constexpr (is_swigelu) {
-            SYNC_IF_NEEDED()
+            MOE_GEMV_SYNC_IF_NEEDED()
         }
     }
 
-    if constexpr (BLOCK_N > ThreadNumPerWarp) {
+    if constexpr (BLOCK_N > MOE_GEMV_WARP_SIZE) {
         return;
     }
 
     if (threadIdx.x < BLOCK_N) {
-        int dst_n_idx = blockIdx.x * BLOCK_N + threadIdx.x;
+        int dst_n_idx = n_block_idx * BLOCK_N + threadIdx.x;
         if constexpr (is_swigelu) {
-            dst_n_idx = blockIdx.x * half_blockn + threadIdx.x;
+            dst_n_idx = n_block_idx * half_blockn + threadIdx.x;
         }
         const bool valid_output_n_idx = !check_bounds || dst_n_idx < n;
 
@@ -334,42 +318,13 @@ __global__ void musa_gemv_kernel(
                 rst = rst * sigmoid(rst) * b;
                 c_ptr[token_idx * topk * n + expert_idx * n + dst_n_idx] = rst;
             }
-        } else if constexpr (use_silu) {
-            if (valid_output_n_idx) {
-                rst = rst * sigmoid(rst);
-                c_ptr[token_idx * topk * n + expert_idx * n + dst_n_idx] = rst;
-            }
-        } else if constexpr (use_rms_norm) {
-            float rms = rst * rst;
-            int count_val = 0;
-
-            for (int offset = 1; offset < BLOCK_N; offset *= 2) {
-                float peer = __shfl_xor_sync(BLOCK_N, rms, offset);
-                rms += peer;
-            }
-
-            if (threadIdx.x == 0) {
-                atomicAdd(sum_out, rms);
-                __threadfence_block();
-                atomicAdd((int*)(count), 1);
-            }
-
-            while (count_val < gridDim.x) {
-                count_val = count[0];
-            }
-
-            rms = sum_out[0];
-            if (valid_output_n_idx) {
-                rst = rst * rsqrtf(rms / n + eps) * float(gamma[dst_n_idx]);
-                c_ptr[token_idx * topk * n + expert_idx * n + dst_n_idx] = rst;
-            }
         } else if (valid_output_n_idx) {
             c_ptr[token_idx * topk * n + expert_idx * n + dst_n_idx] = rst;
         }
     }
 }
 
-struct GemvBlockConfig {
+struct MoeGemvBlockConfig {
     int block_n;
     int block_k;
     float score;

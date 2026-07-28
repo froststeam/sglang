@@ -1,0 +1,299 @@
+/*
+ * Copyright (c) 2020-2026, Moore Threads Technology Co., Ltd("Moore Threads").
+ * All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ */
+
+#pragma once
+
+#include "common.muh"
+
+#if defined(__MUSA_ARCH__) && __MUSA_ARCH__ == 310
+#define GEMV_WARP_SIZE 32
+#else
+#define GEMV_WARP_SIZE 128
+#endif
+
+#define GEMV_SYNC_IF_NEEDED() \
+    if constexpr (BLOCK_N * BLOCK_K > GEMV_WARP_SIZE) { \
+        __SYNCTHREADS_LM; \
+    }
+
+using GemvV16F32 = float __attribute__((vector_size(64)));
+
+template <typename AType, bool is_w4a16>
+struct GemvAVecType {
+    using StorageType =
+        std::conditional_t<std::is_same_v<AType, __mt_fp8_e4m3>, uint8_t, AType>;
+    using type = typename VecType<StorageType, 128>::Ttype;
+};
+
+template <typename AType>
+struct GemvAVecType<AType, true> {
+    using type = GemvV16F32;
+};
+
+// Dense-only fallback kernel. Routing, expert lookup, routed weights, and MoE
+// output layout are deliberately absent from this implementation.
+template <typename AType, typename BType, typename CType, typename ScaleType,
+          int BLOCK_N, int BLOCK_K, int iobit, bool is_swiglu,
+          bool is_w4a16, bool is_per_group_scale, bool is_fp8,
+          int scale_block, bool check_bounds = false>
+__global__ void musa_gemv_fallback_kernel(
+    CType* c_ptr,
+    const AType* a_ptr,
+    const BType* b_ptr,
+    ScaleType* scale_a,
+    ScaleType* scale_b,
+    const CType* bias_ptr,
+    int n,
+    int k,
+    int half_n_idx,
+    int scale_k_len,
+    bool fuse_silu) {
+    constexpr int bits_of_byte = 8;
+    constexpr int half_blockn = BLOCK_N / 2;
+    constexpr int b_vec_bits = 128;
+    constexpr int Vlen =
+        is_w4a16 ? b_vec_bits / 4 : b_vec_bits / (sizeof(BType) * bits_of_byte);
+    constexpr int w4a16_shift = is_w4a16 ? 2 : 1;
+    constexpr int scale_k_load_cntdown_init =
+        ceil_div(scale_block, (BLOCK_K * Vlen));
+    constexpr bool fuse_castfp8 =
+        is_fp8 && !std::is_same_v<AType, __mt_fp8_e4m3>;
+
+    using AVec = typename GemvAVecType<AType, is_w4a16>::type;
+    using BVec = typename VecType<
+        std::conditional_t<is_fp8, uint8_t, BType>, b_vec_bits>::Ttype;
+    using fp8x4_vec = unsigned char __attribute__((vector_size(4)));
+
+    const int token_idx = blockIdx.y;
+    const int n_block_idx = blockIdx.x;
+    const int t_n_idx = threadIdx.x / BLOCK_K;
+    const int t_k_idx = threadIdx.x % BLOCK_K;
+    int n_idx = n_block_idx * BLOCK_N + t_n_idx;
+
+    constexpr int thread_sum_len = is_fp8 ? Vlen / 4 : Vlen;
+    float cur_thread_sum[thread_sum_len];
+    int scale_k_load_cntdown = scale_k_load_cntdown_init;
+    extern __shared__ float shared_array[];
+
+    #pragma unroll
+    for (int i = 0; i < thread_sum_len; ++i) {
+        cur_thread_sum[i] = 0.0f;
+    }
+
+    float scale_a_val = 1.0f;
+    float scale_b_val = 1.0f;
+    int scale_a_offset = 0;
+    int scale_b_offset = 0;
+
+    if constexpr (is_swiglu) {
+        if (t_n_idx < half_blockn) {
+            n_idx = n_block_idx * half_blockn + t_n_idx;
+        } else {
+            n_idx = n_block_idx * half_blockn + t_n_idx - half_blockn + half_n_idx;
+        }
+    }
+
+    const int full_n = is_swiglu ? 2 * n : n;
+    const bool valid_input_n_idx = !check_bounds || n_idx < full_n;
+
+    if constexpr (is_w4a16) {
+        scale_b_offset = n_idx * scale_k_len + t_k_idx * Vlen / scale_block;
+        if (valid_input_n_idx) {
+            scale_b_val = scale_b[scale_b_offset];
+            --scale_k_load_cntdown;
+        }
+    } else if constexpr (is_fp8) {
+        if constexpr (is_per_group_scale) {
+            scale_a_offset = token_idx * scale_k_len + t_k_idx * Vlen / scale_block;
+            scale_b_offset =
+                (n_idx / scale_block) * scale_k_len + t_k_idx * Vlen / scale_block;
+        } else {
+            scale_b_offset = 0;
+            if constexpr (!fuse_castfp8) {
+                scale_a_offset = token_idx;
+            }
+        }
+        if constexpr (!fuse_castfp8) {
+            if (scale_a != nullptr) {
+                scale_a_val = scale_a[scale_a_offset];
+            }
+        }
+        if (valid_input_n_idx) {
+            scale_b_val = scale_b[scale_b_offset];
+            --scale_k_load_cntdown;
+        }
+    }
+
+    const BType* b_base_ptr = nullptr;
+    if (valid_input_n_idx) {
+        b_base_ptr = b_ptr + (static_cast<size_t>(n_idx) * k + t_k_idx * Vlen)
+            / w4a16_shift;
+    }
+
+    for (int k_idx = 0; k_idx < k; k_idx += Vlen * BLOCK_K) {
+        if (!valid_input_n_idx) {
+            continue;
+        }
+
+        AType a_reg[Vlen];
+        BType b_reg[Vlen / w4a16_shift];
+        if constexpr (fuse_castfp8) {
+            using ALoadVec = typename VecType<AType, 128>::Ttype;
+            constexpr int a_load_elems =
+                128 / (sizeof(AType) * bits_of_byte);
+            static_assert(Vlen % a_load_elems == 0);
+            #pragma unroll
+            for (int i = 0; i < Vlen; i += a_load_elems) {
+                *reinterpret_cast<ALoadVec*>(a_reg + i) =
+                    *reinterpret_cast<const ALoadVec*>(
+                        a_ptr + token_idx * k + t_k_idx * Vlen + k_idx + i);
+            }
+        } else {
+            *reinterpret_cast<AVec*>(a_reg) = *reinterpret_cast<const AVec*>(
+                a_ptr + token_idx * k + t_k_idx * Vlen + k_idx);
+        }
+        *reinterpret_cast<BVec*>(b_reg) = *reinterpret_cast<const BVec*>(
+            b_base_ptr + k_idx / w4a16_shift);
+
+        if constexpr (is_w4a16 && !is_fp8) {
+            float b_reg_float[Vlen];
+            #pragma unroll
+            for (int i = 0; i < Vlen / 2; ++i) {
+                if constexpr (is_per_group_scale) {
+                    const uint8_t read_u8 = b_reg[i];
+                    b_reg_float[i * 2] = scale_b_val * (float(read_u8 & 0xF) - 8.f);
+                    b_reg_float[i * 2 + 1] = scale_b_val * (float(read_u8 >> 4) - 8.f);
+                } else {
+                    const int8_t read_s8 = b_reg[i];
+                    b_reg_float[i * 2] = scale_b_val * float(int8_t(read_s8 << 4));
+                    b_reg_float[i * 2 + 1] =
+                        scale_b_val * float(int8_t(read_s8 & 0xF0));
+                }
+            }
+            if constexpr (is_per_group_scale) {
+                if (scale_k_load_cntdown == 0 &&
+                    (k_idx + Vlen * BLOCK_K) < k) {
+                    scale_b_offset += ceil_div(BLOCK_K * Vlen, scale_block);
+                    scale_b_val = scale_b[scale_b_offset];
+                    scale_k_load_cntdown = scale_k_load_cntdown_init;
+                }
+                --scale_k_load_cntdown;
+            }
+            #pragma unroll
+            for (int i = 0; i < thread_sum_len; ++i) {
+                cur_thread_sum[i] += b_reg_float[i] * float(a_reg[i]);
+            }
+        } else if constexpr (is_fp8) {
+            float scale_val = scale_a_val * scale_b_val;
+            if constexpr (is_per_group_scale) {
+                if (scale_k_load_cntdown == 0 &&
+                    (k_idx + Vlen * BLOCK_K) < k) {
+                    scale_a_offset += ceil_div(BLOCK_K * Vlen, scale_block);
+                    scale_b_offset += ceil_div(BLOCK_K * Vlen, scale_block);
+                    if constexpr (!fuse_castfp8) {
+                        if (scale_a != nullptr) {
+                            scale_a_val = scale_a[scale_a_offset];
+                        }
+                    }
+                    scale_b_val = scale_b[scale_b_offset];
+                    scale_k_load_cntdown = scale_k_load_cntdown_init;
+                }
+                --scale_k_load_cntdown;
+            }
+            using half_v4 = _Float16 __attribute__((ext_vector_type(4)));
+            #pragma unroll
+            for (int i = 0; i < thread_sum_len; ++i) {
+                const half_v4 b_halfv4 = __musa_e4m32f16_rn_bst4(
+                    reinterpret_cast<const fp8x4_vec*>(b_reg)[i]);
+                if constexpr (fuse_castfp8) {
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        cur_thread_sum[i] +=
+                            scale_val * float(a_reg[i * 4 + j]) * b_halfv4[j];
+                    }
+                } else {
+                    const half_v4 a_halfv4 = __musa_e4m32f16_rn_bst4(
+                        reinterpret_cast<const fp8x4_vec*>(a_reg)[i]);
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        cur_thread_sum[i] +=
+                            scale_val * a_halfv4[j] * b_halfv4[j];
+                    }
+                }
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < thread_sum_len; ++i) {
+                cur_thread_sum[i] += float(b_reg[i]) * float(a_reg[i]);
+            }
+        }
+    }
+
+    float result = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < thread_sum_len; ++i) {
+        result += cur_thread_sum[i];
+    }
+    if constexpr (is_w4a16 && !is_per_group_scale) {
+        result /= 16.f;
+    }
+
+    if constexpr (BLOCK_K > 1) {
+        shared_array[threadIdx.x] = result;
+        GEMV_SYNC_IF_NEEDED()
+        if (threadIdx.x < BLOCK_N) {
+            result = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < BLOCK_K; ++i) {
+                result += shared_array[threadIdx.x * BLOCK_K + i];
+            }
+        }
+        if constexpr (is_swiglu) {
+            GEMV_SYNC_IF_NEEDED()
+        }
+    }
+
+    if constexpr (BLOCK_N > GEMV_WARP_SIZE) {
+        return;
+    }
+
+    if (threadIdx.x < BLOCK_N) {
+        int dst_n_idx = n_block_idx * BLOCK_N + threadIdx.x;
+        if constexpr (is_swiglu) {
+            dst_n_idx = n_block_idx * half_blockn + threadIdx.x;
+        }
+        const bool valid_output_n_idx = !check_bounds || dst_n_idx < n;
+        if constexpr (is_swiglu) {
+            shared_array[threadIdx.x] = result;
+            if (threadIdx.x < half_blockn && valid_output_n_idx) {
+                const float up = shared_array[threadIdx.x + half_blockn];
+                c_ptr[token_idx * n + dst_n_idx] =
+                    result * sigmoid(result) * up;
+            }
+        } else if (valid_output_n_idx) {
+            if (bias_ptr != nullptr) {
+                result += float(bias_ptr[dst_n_idx]);
+            }
+            if (fuse_silu) {
+                c_ptr[token_idx * n + dst_n_idx] = result * sigmoid(result);
+            } else {
+                c_ptr[token_idx * n + dst_n_idx] = result;
+            }
+        }
+    }
+}
+
+struct GemvBlockConfig {
+    int block_n;
+    int block_k;
+    float score;
+    bool valid;
+};

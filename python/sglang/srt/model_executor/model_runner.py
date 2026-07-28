@@ -2484,14 +2484,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         Covers framework-level warmups and optional model-specific warmups.
         """
         if self.device == "musa":
-            from sglang.srt.hardware_backend.musa.layers.linear_auto_tune import (
-                maybe_autotune_musa_linear_gemv,
+            from sglang.srt.hardware_backend.musa.layers.gemv_auto_tune import (
+                maybe_autotune_musa_gemv,
             )
             from sglang.srt.hardware_backend.musa.layers.moe_auto_tune import (
                 maybe_autotune_musa_moe_deepgemm_threshold,
             )
 
-            maybe_autotune_musa_linear_gemv(
+            maybe_autotune_musa_gemv(
                 self.model,
                 rank=self.tp_rank,
                 reuse_only=self.is_draft_worker,

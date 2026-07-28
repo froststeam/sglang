@@ -103,5 +103,31 @@ def test_musa_moe_gemv_gate_honors_bucket_override(monkeypatch):
     assert _can_run_musa_moe_gemv_swiglu(hidden_states, quant_info, config)
 
 
+def test_musa_moe_fp8_gemv_requires_block128(monkeypatch):
+    from sglang.srt.layers.moe.moe_runner import triton
+
+    monkeypatch.setattr(triton, "_is_musa", True)
+    hidden_states = torch.empty((3, 128), dtype=torch.bfloat16)
+    quant_info = TritonMoeQuantInfo(
+        w13_weight=torch.empty((2, 256, 128), dtype=torch.float8_e4m3fn),
+        w2_weight=torch.empty((2, 128, 128), dtype=torch.float8_e4m3fn),
+        use_fp8_w8a8=True,
+        w13_scale=torch.empty((2, 2, 1), dtype=torch.float32),
+        w2_scale=torch.empty((2, 1, 1), dtype=torch.float32),
+        block_shape=[64, 64],
+    )
+    config = MoeRunnerConfig(
+        num_experts=2,
+        num_local_experts=2,
+        hidden_size=128,
+        intermediate_size_per_partition=128,
+        top_k=1,
+    )
+
+    assert not _can_run_musa_moe_gemv_swiglu(hidden_states, quant_info, config)
+    quant_info.block_shape = [128, 128]
+    assert _can_run_musa_moe_gemv_swiglu(hidden_states, quant_info, config)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

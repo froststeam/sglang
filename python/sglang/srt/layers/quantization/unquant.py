@@ -159,16 +159,22 @@ class UnquantizedLinearMethod(LinearMethodBase):
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
-        from sglang.srt.hardware_backend.musa.layers.linear_auto_tune import (
-            should_use_musa_linear_gemv,
+        from sglang.srt.hardware_backend.musa.layers.gemv_auto_tune import (
+            get_musa_gemv_config,
+            should_use_musa_gemv,
         )
 
-        if should_use_musa_linear_gemv(layer, x, quant_kind="bf16"):
-            from sglang.srt.hardware_backend.musa.jit_kernel.csrc.gemm import (
-                musa_linear_gemv,
+        if should_use_musa_gemv(layer, x, quant_kind="bf16"):
+            from sglang.srt.hardware_backend.musa.jit_kernel.csrc.gemv import (
+                musa_gemv,
             )
 
-            return musa_linear_gemv(x, layer.weight, bias=bias)
+            return musa_gemv(
+                x,
+                layer.weight,
+                bias=bias,
+                config_id=get_musa_gemv_config(layer, x, quant_kind="bf16"),
+            )
 
         return F.linear(x, layer.weight, bias)
 

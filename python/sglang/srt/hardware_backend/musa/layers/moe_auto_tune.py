@@ -40,7 +40,10 @@ _AUTOTUNE_MASKED_DEEPGEMM_MAX_BUFFER_GIB = float(
     os.getenv("SGLANG_MUSA_MOE_MASKED_DEEPGEMM_MAX_BUFFER_GIB", "0")
 )
 _MUSA_MOE_GEMV_SWIGLU_MAX_TOKENS = int(
-    os.getenv("SGLANG_MUSA_MOE_GEMV_SWIGLU_MAX_TOKENS", "16")
+    # Keep the M=1..32 decode window consistent with the Triton MoE runner.
+    # The autotuner still measures the exact token buckets; this is only the
+    # upper bound used when temporarily forcing the fused GEMV candidate.
+    os.getenv("SGLANG_MUSA_MOE_GEMV_SWIGLU_MAX_TOKENS", "32")
 )
 _AUTOTUNE_PROFILER_TOPK = int(os.getenv("SGLANG_MUSA_MOE_AUTOTUNE_PROFILER_TOPK", "0"))
 _DEEPGEMM_BLOCK_M_SMALL = 128
@@ -769,19 +772,36 @@ def _make_dispatch_output(
         dtype=target.dtype,
     )
     topk_ids = _make_synthetic_topk_ids(target, num_tokens)
-    topk_weights = torch.rand(
+    # Fused shared experts have fixed unit weight in the model contract.  Do
+    # not normalize them together with routed experts: that would benchmark a
+    # different workload from the actual dispatcher and understate shared
+    # expert cost.  Routed weights are normalized only within the routed set.
+    num_shared = max(0, min(target.num_fused_shared_experts, target.top_k))
+    routed_top_k = target.top_k - num_shared
+    topk_weights = torch.zeros(
         (num_tokens, target.top_k),
         device=target.device,
         dtype=torch.float32,
     )
-    valid_topk = topk_ids >= 0
-    topk_weights = torch.where(valid_topk, topk_weights, torch.zeros_like(topk_weights))
-    topk_weight_sum = topk_weights.sum(dim=-1, keepdim=True)
-    topk_weights = torch.where(
-        topk_weight_sum > 0,
-        topk_weights / topk_weight_sum.clamp_min(1e-20),
-        topk_weights,
-    )
+    if routed_top_k > 0:
+        routed_weights = torch.rand(
+            (num_tokens, routed_top_k), device=target.device, dtype=torch.float32
+        )
+        valid_routed = topk_ids[:, :routed_top_k] >= 0
+        routed_weights = torch.where(
+            valid_routed, routed_weights, torch.zeros_like(routed_weights)
+        )
+        routed_sum = routed_weights.sum(dim=-1, keepdim=True)
+        routed_weights = torch.where(
+            routed_sum > 0,
+            routed_weights / routed_sum.clamp_min(1e-20),
+            routed_weights,
+        )
+        topk_weights[:, :routed_top_k] = routed_weights
+    if num_shared > 0:
+        topk_weights[:, routed_top_k:] = (topk_ids[:, routed_top_k:] >= 0).to(
+            torch.float32
+        )
     router_logits = torch.empty(
         (num_tokens, target.num_experts),
         device=target.device,

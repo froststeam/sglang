@@ -21,7 +21,7 @@ from sglang.srt.utils import is_musa
 
 _is_musa = is_musa()
 _MUSA_MOE_GEMV_SWIGLU_MAX_TOKENS = int(
-    os.getenv("SGLANG_MUSA_MOE_GEMV_SWIGLU_MAX_TOKENS", "16")
+    os.getenv("SGLANG_MUSA_MOE_GEMV_SWIGLU_MAX_TOKENS", "32")
 )
 _MUSA_MOE_GEMV_BLOCK_KS: tuple[int, ...] = (4, 8, 16, 32)
 
@@ -91,8 +91,10 @@ def _run_musa_moe_gemv_swiglu(
         )
 
     from sglang.srt.hardware_backend.musa.jit_kernel import moe_sum_reduce
-    from sglang.srt.hardware_backend.musa.jit_kernel.csrc.gemm import (
-        musa_fused_moe_gemv,
+    from sglang.srt.hardware_backend.musa.jit_kernel.csrc.gemv import (
+        get_moe_gemv_config,
+        musa_moe_down_reduce,
+        musa_moe_gemv,
     )
 
     topk = topk_ids.shape[1]
@@ -108,13 +110,26 @@ def _run_musa_moe_gemv_swiglu(
     w2 = quant_info.w2_weight
     inter_size = w13.shape[1] // 2
     use_fp8 = quant_info.use_fp8_w8a8
+    shared_experts = runner_config.num_fused_shared_experts or 0
+    gemv_config = get_moe_gemv_config(
+        dtype="fp8" if use_fp8 else "bf16",
+        tokens=num_tokens,
+        hidden=hidden_states.shape[1],
+        intermediate=inter_size,
+        experts=w13.shape[0] - shared_experts,
+        routed_topk=topk - shared_experts,
+        shared_experts=shared_experts,
+    )
+    # The table is optional and exact-shape keyed.  A missing entry returns
+    # (-1, -1, -1), preserving the in-kernel dispatch and the regular
+    # down-GEMV + sum-reduce path.
 
     intermediate = torch.empty(
         (num_tokens, topk, inter_size),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    musa_fused_moe_gemv(
+    musa_moe_gemv(
         hidden_states,
         w13,
         intermediate,
@@ -126,7 +141,29 @@ def _run_musa_moe_gemv_swiglu(
         topk,
         False,
         True,
+        gemv_config.gate_config_id,
     )
+
+    routed_scaling_factor = runner_config.routed_scaling_factor
+    routed_scaling_factor = (
+        1.0 if routed_scaling_factor is None else routed_scaling_factor
+    )
+    out_hidden_states = (
+        hidden_states if runner_config.inplace else torch.empty_like(hidden_states)
+    )
+    if gemv_config.down_reduce_config_id >= 0:
+        musa_moe_down_reduce(
+            intermediate,
+            w2,
+            out_hidden_states,
+            quant_info.w2_scale if use_fp8 else None,
+            topk_weights,
+            topk_ids,
+            topk,
+            routed_scaling_factor,
+            gemv_config.down_reduce_config_id,
+        )
+        return out_hidden_states
 
     routed_output = torch.empty(
         (num_tokens, topk, w2.shape[1]),
@@ -134,7 +171,7 @@ def _run_musa_moe_gemv_swiglu(
         dtype=hidden_states.dtype,
     )
     flat_tokens = num_tokens * topk
-    musa_fused_moe_gemv(
+    musa_moe_gemv(
         intermediate.view(flat_tokens, inter_size),
         w2,
         routed_output.view(flat_tokens, 1, w2.shape[1]),
@@ -146,15 +183,9 @@ def _run_musa_moe_gemv_swiglu(
         1,
         False,
         False,
+        gemv_config.down_config_id,
     )
 
-    routed_scaling_factor = runner_config.routed_scaling_factor
-    routed_scaling_factor = (
-        1.0 if routed_scaling_factor is None else routed_scaling_factor
-    )
-    out_hidden_states = (
-        hidden_states if runner_config.inplace else torch.empty_like(hidden_states)
-    )
     if topk == 1 and routed_scaling_factor == 1.0:
         out_hidden_states.copy_(routed_output[:, 0])
     else:
@@ -192,8 +223,7 @@ def _can_run_musa_moe_gemv_swiglu_quant_info(
         and quant_info.w2_scale.is_contiguous()
         and quant_info.block_shape is not None
         and len(quant_info.block_shape) == 2
-        and quant_info.block_shape[0] in (64, 128)
-        and quant_info.block_shape[1] in (64, 128)
+        and tuple(quant_info.block_shape) == (128, 128)
     ):
         return False
 

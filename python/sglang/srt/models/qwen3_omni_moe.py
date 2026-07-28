@@ -31,8 +31,9 @@ from sglang.srt.configs.qwen3_omni import (
     Qwen3OmniMoeVisionEncoderConfig,
 )
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig
-from sglang.srt.hardware_backend.musa.layers.linear_auto_tune import (
-    maybe_apply_musa_linear_activation,
+from sglang.srt.hardware_backend.musa.layers.gemv_auto_tune import (
+    maybe_apply_musa_gemv_activation,
+    register_musa_gemv_activation,
 )
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -82,6 +83,7 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
             bias=True,
             prefix=f"{prefix}.fc1",
         )
+        register_musa_gemv_activation(self.fc1, self.activation_name)
         self.fc2 = RowParallelLinear(
             config.encoder_ffn_dim,
             self.embed_dim,
@@ -115,7 +117,7 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
         activated_hidden_states = (
-            maybe_apply_musa_linear_activation(
+            maybe_apply_musa_gemv_activation(
                 self.fc1,
                 hidden_states,
                 activation=self.activation_name,

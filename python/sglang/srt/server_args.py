@@ -1321,8 +1321,6 @@ class ServerArgs:
         if not is_musa():
             return
 
-        self.disable_overlap_schedule = envs.SGLANG_MUSA_DISABLE_OVERLAP_SCHEDULE.get()
-
         if get_device_sm() < 31:
             return
 
