@@ -31,8 +31,8 @@ struct ResolveFutureTokenIds {
   static void run(tvm::ffi::TensorView input_ids, tvm::ffi::TensorView future_map) {
     using namespace host;
 
-    SymbolicSize N = {"num_tokens"};
-    SymbolicSize M = {"map_size"};
+    SymbolicSize N{"num_tokens"};
+    SymbolicSize M{"map_size"};
     SymbolicDevice device_;
     device_.set_options<kDLCUDA, kDLROCM>();
 

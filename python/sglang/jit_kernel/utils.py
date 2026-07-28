@@ -115,6 +115,11 @@ def is_hip_runtime() -> bool:
     return bool(torch.version.hip)
 
 
+@cache_once
+def is_musa_runtime() -> bool:
+    return getattr(torch.version, "musa", None) is not None
+
+
 def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
     def _convert(arg: CPP_TEMPLATE_TYPE) -> str:
         if isinstance(arg, bool):
@@ -278,11 +283,11 @@ def _jit_compile_context():
 def _get_default_target_flags() -> List[str]:
     if is_hip_runtime():
         return ["-DUSE_ROCM", "-std=c++20", "-O3"]
-    else:
-        return [
-            "-std=c++17",
-            "-O3",
-        ]
+    flags = ["-std=c++17", "-O3"]
+    # Skip on MUSA: it has its own JIT arch path and does not use SGL_CUDA_ARCH.
+    if not is_musa_runtime():
+        flags.insert(0, get_jit_cuda_arch().jit_flag)
+    return flags
 
 
 @contextmanager
