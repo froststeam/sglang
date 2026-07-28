@@ -328,6 +328,11 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "float top_k_val, Tensor? maybe_top_p_arr, float top_p_val, bool deterministic, Generator? gen) -> ()");
   m.impl("musa_top_k_top_p_sampling_from_probs", torch::kMUSA, &musa_top_k_top_p_sampling_from_probs);
 
+  m.def(
+      "musa_top_k_renorm_probs(Tensor probs, Tensor top_ks) -> Tensor");
+  m.impl("musa_top_k_renorm_probs", torch::kMUSA,
+         &musa_top_k_renorm_probs);
+
   /*
    * From csrc/elementwise/hadamard.cpp
    */

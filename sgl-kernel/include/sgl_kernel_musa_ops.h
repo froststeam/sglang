@@ -54,6 +54,10 @@ void musa_top_k_top_p_sampling_from_probs(
     bool deterministic,
     std::optional<at::Generator> gen);
 
+torch::Tensor musa_top_k_renorm_probs(
+    torch::Tensor probs,
+    torch::Tensor top_ks);
+
 void min_p_sampling_from_probs(
     at::Tensor probs,
     at::Tensor output,

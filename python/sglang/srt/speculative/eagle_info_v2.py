@@ -57,6 +57,18 @@ if is_cuda() or is_musa():
     )
 
 
+def _can_use_musa_top_k_renorm(batch, probs: torch.Tensor) -> bool:
+    return (
+        _is_musa
+        and probs.dtype == torch.float32
+        and batch.spec_algorithm is not None
+        and batch.spec_algorithm.is_eagle()
+        and not batch.spec_algorithm.is_eagle3()
+        and batch.reqs is not None
+        and all(1 <= req.sampling_params.top_k <= 256 for req in batch.reqs)
+    )
+
+
 @triton.jit
 def assign_draft_cache_locs_page_size_1(
     req_pool_indices,
@@ -415,14 +427,20 @@ class EagleVerifyInputV2Mixin:
 
             target_probs = F.softmax(
                 next_token_logits / expanded_temperature, dim=-1
-            )  # (bs * num_draft_tokens, vocab_size)
+            )
             if sampling_info.need_top_k_sampling:
-                target_probs = top_k_renorm_prob(
+                if _can_use_musa_top_k_renorm(batch, target_probs):
+                    top_k_renorm_func = (
+                        torch.ops.sgl_kernel.musa_top_k_renorm_probs.default
+                    )
+                else:
+                    top_k_renorm_func = top_k_renorm_prob
+                target_probs = top_k_renorm_func(
                     target_probs,
                     torch.repeat_interleave(
                         sampling_info.top_ks, self.draft_token_num, dim=0
                     ),
-                )  # (bs * num_draft_tokens, vocab_size)
+                )
             if sampling_info.need_top_p_sampling:
                 target_probs = top_p_renorm_prob(
                     target_probs,

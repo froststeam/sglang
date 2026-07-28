@@ -117,6 +117,7 @@ sources = [
     "csrc/musa/pos_encoding_contiguous.mu",
     "csrc/musa/ternary.mu",
     "csrc/musa/top_k_top_p_sampling.mu",
+    "csrc/musa/top_k_renorm.mu",
 ]
 
 cxx_flags = ["force_mcc"]
