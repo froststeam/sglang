@@ -762,6 +762,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             swiglu_limit=swiglu_limit_arg,
             swizzle=self.use_swizzle,
             activation=self.config.activation,
+            expected_m=expected_m,
         )
         del gateup_output
 
@@ -1418,6 +1419,7 @@ def _varlen_deep_gemm_silu_mul_quant(
     swiglu_limit: Optional[float] = None,
     swizzle: bool = False,
     activation: str = "silu",
+    expected_m: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd
     from sglang.srt.layers.quantization.fp8_kernel import (
