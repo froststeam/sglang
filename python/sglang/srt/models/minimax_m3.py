@@ -86,24 +86,52 @@ def _msa_runtime_enabled() -> bool:
     attention is identical to the validated Phase-1 full-attention path (the index
     branch is neither built, loaded, nor used).
 
-    Enable by EITHER:
-      * env ``SGLANG_MUSA_M3_MSA=1`` (works when the model process inherits it), OR
-      * a marker file at ``/tmp/sglang_musa_m3_msa.on`` (override path via
-        ``SGLANG_MUSA_M3_MSA_FILE``). The marker file is the reliable switch on the
-        MUSA stack, where sglang **scheduler workers do not inherit shell env vars**,
-        so an env-only gate would silently stay off in the model process.
+    Enable via the env var ``SGLANG_MUSA_M3_MSA=1``.
 
-    The MSA path uses the mate kernels (tilelang indexer + torch block-sparse attention).
+    The MSA path uses the in-sglang Triton MSA kernels (mate-independent); the
+    mate-msa arm is deferred in this build (see ``_msa_backends``).
     """
     import os
 
-    if os.environ.get("SGLANG_MUSA_M3_MSA", "0").lower() not in ("0", "", "false", "no"):
-        return True
-    marker = os.environ.get("SGLANG_MUSA_M3_MSA_FILE", "/tmp/sglang_musa_m3_msa.on")
-    try:
-        return os.path.exists(marker)
-    except Exception:  # noqa: BLE001
-        return False
+    return os.environ.get("SGLANG_MUSA_M3_MSA", "0").lower() not in (
+        "0",
+        "",
+        "false",
+        "no",
+    )
+
+
+def _msa_backends() -> tuple:
+    """(indexer_backend, attn_backend) for the MSA path, read from env vars:
+      * ``SGLANG_MUSA_M3_MSA_BACKEND``         (umbrella, both idx+attn)
+      * ``SGLANG_MUSA_M3_MSA_INDEXER_BACKEND`` (indexer only)
+      * ``SGLANG_MUSA_M3_MSA_ATTN_BACKEND``    (attention only)
+    Default = ``triton`` (the in-sglang Triton MSA).
+
+    The mate-msa arm is DEFERRED in this build: a mate-family selection (``mate`` /
+    ``tilelang``) is parsed but falls back to ``triton`` here with a one-time warning, so
+    the live mate call sites were removed without losing the selector seam that mate-msa
+    re-plugs into later. ``torch`` is NOT mate — it selects the in-sglang Triton module's
+    own dense fp32 reference path and stays as-is. The dense (MSA-off) path is selected
+    by disabling MSA entirely (see ``_msa_runtime_enabled``)."""
+    import os
+
+    umb = os.environ.get("SGLANG_MUSA_M3_MSA_BACKEND")
+    idx_be = os.environ.get("SGLANG_MUSA_M3_MSA_INDEXER_BACKEND") or umb or "triton"
+    attn_be = os.environ.get("SGLANG_MUSA_M3_MSA_ATTN_BACKEND") or umb or "triton"
+
+    # mate-msa is deferred — collapse any mate-family selection to triton. ("torch" is the
+    # in-sglang Triton module's dense fp32 reference path, NOT mate, so it passes through.)
+    _mate_family = ("mate", "tilelang")
+    if idx_be in _mate_family or attn_be in _mate_family:
+        logger.warning(
+            "[MSA] mate MSA backend requested (idx=%s, attn=%s) but mate-msa is "
+            "deferred in this build; falling back to triton.",
+            idx_be, attn_be,
+        )
+        idx_be = "triton" if idx_be in _mate_family else idx_be
+        attn_be = "triton" if attn_be in _mate_family else attn_be
+    return idx_be, attn_be
 
 
 def _msa_single_seq_prefill(forward_batch: "ForwardBatch", num_tokens: int) -> bool:
@@ -562,16 +590,10 @@ class MiniMaxM3Attention(nn.Module):
 
         idx_q_local = self._select_local_index_heads(idx_q)  # [T, num_kv_heads, idx_head_dim]
 
-        # Separate indexer / attention backends, each selected by
-        # SGLANG_MUSA_M3_MSA_{INDEXER,ATTN}_BACKEND (umbrella SGLANG_MUSA_M3_MSA_BACKEND).
-        # Default = "triton" (the in-sglang Triton MSA): mate v0.2.2 ships no MSA kernels
-        # and sglang workers don't inherit shell env, so the default (not an env) must
-        # select the available path. Set =torch for the dense fp32 reference, =tilelang
-        # for the mate tilelang kernels.
-        import os as _os
-        _umbrella = _os.environ.get("SGLANG_MUSA_M3_MSA_BACKEND")
-        _idx_be = _os.environ.get("SGLANG_MUSA_M3_MSA_INDEXER_BACKEND", _umbrella or "triton")
-        _attn_be = _os.environ.get("SGLANG_MUSA_M3_MSA_ATTN_BACKEND", _umbrella or "triton")
+        # MSA backend selection (env vars; see _msa_backends). The only live backend in
+        # this build is the in-sglang Triton MSA (mate-msa is deferred — a mate selection
+        # already fell back to triton there), so import it unconditionally here.
+        _idx_be, _attn_be = _msa_backends()
 
         if is_decode:
             out = self._msa_decode(q, idx_q_local, forward_batch)
@@ -585,19 +607,10 @@ class MiniMaxM3Attention(nn.Module):
         # tensors. The same per-slice MSA core runs each request independently (correct
         # because there is no cross-request attention and no prefix to gather).
         try:
-            # backend="triton" sources the kernels from the in-sglang Triton MSA module
-            # (mate-independent); else the mate (torch/tilelang) path. Indexer + attention
-            # backends are independent (SGLANG_MUSA_M3_MSA_{INDEXER,ATTN}_BACKEND).
-            if _idx_be == "triton":
-                from sglang.srt.layers.attention.msa_triton import msa_block_topk_indices
-            else:
-                from mate.msa_indexer import msa_block_topk_indices
-            if _attn_be == "triton":
-                from sglang.srt.layers.attention.msa_triton import (
-                    msa_block_sparse_attention,
-                )
-            else:
-                from mate.msa_attention import msa_block_sparse_attention
+            from sglang.srt.layers.attention.msa_triton import (
+                msa_block_topk_indices,
+                msa_block_sparse_attention,
+            )
         except Exception:  # noqa: BLE001 — MSA kernels unavailable -> full attn
             return None
 
@@ -733,11 +746,7 @@ class MiniMaxM3Attention(nn.Module):
         """Decode MSA: per request, gather cached K/V/idx_k for the full seq and run the
         q=1 block-sparse decode kernel. Returns [bs, num_heads*head_dim] or None on
         kernel-import failure. q is [bs, q_size]; idx_q_local is [bs, num_kv_heads, D]."""
-        import os as _os
-        _attn_be = _os.environ.get(
-            "SGLANG_MUSA_M3_MSA_ATTN_BACKEND",
-            _os.environ.get("SGLANG_MUSA_M3_MSA_BACKEND") or "triton",
-        )
+        _attn_be = _msa_backends()[1]
         if self._idx_k_buffer is None:  # no idx_k history yet -> full-attn fallback
             return None
         bs = forward_batch.batch_size
@@ -755,7 +764,9 @@ class MiniMaxM3Attention(nn.Module):
         #    is never hit under a captured graph.
         #  - eager (cuda-graph disabled, or a batch size not captured): the paged fn is heavy
         #    run LIVE (an NB-wide block-score grid + a topk-iteration selection, x57 sparse
-        #    layers per token) -> use the lightweight per-request loop. mate/torch path too.
+        #    layers per token) -> use the lightweight per-request loop.
+        # Only the Triton decode backends are wired here (mate-msa is deferred; a mate selection
+        # already fell back to triton in _msa_backends).
         _capturing = False
         if _attn_be == "triton":
             try:
@@ -785,10 +796,7 @@ class MiniMaxM3Attention(nn.Module):
         # NOT cuda-graph-capturable — which is fine: it never runs under a captured/replayed
         # graph (capture takes the paged branch; replay skips Python entirely).
         try:
-            if _attn_be == "triton":
-                from sglang.srt.layers.attention.msa_triton import msa_decode_attention
-            else:
-                from mate.msa_attention import msa_decode_attention
+            from sglang.srt.layers.attention.msa_triton import msa_decode_attention
         except Exception:  # noqa: BLE001
             return None
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
