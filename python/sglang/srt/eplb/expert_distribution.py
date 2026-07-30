@@ -731,13 +731,6 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             self.window_sizes = [10, 100, 1000]
             self._history = _DequeCollection(maxlens=self.window_sizes)
             self._rank = torch.distributed.get_rank()
-            from sglang.srt.distributed import get_moe_ep_group
-
-            self._metrics_reduce_group = get_moe_ep_group()
-            self._metrics_reduce_root = self._metrics_reduce_group.ranks[0]
-            self._is_metrics_reduce_root = (
-                self._metrics_reduce_group.rank_in_group == 0
-            )
             self._expert_dispatch_collector = ExpertDispatchCollector(
                 self._expert_location_metadata.ep_size
             )
