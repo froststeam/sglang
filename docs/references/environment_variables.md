@@ -47,6 +47,8 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH` | Enable NCCL for gathering when preparing mlp sync batch under overlap scheduler (without this flag gloo is used for gathering) | `false` |
 | `SGLANG_SYMM_MEM_PREALLOC_GB_SIZE` | Size of preallocated GPU buffer (in GB) for NCCL symmetric memory pool to limit memory fragmentation. Only have an effect when server arg `--enable-symm-mem` is set. | `-1` |
 | `SGLANG_CUSTOM_ALLREDUCE_ALGO` | The algorithm of custom all-reduce. Set to `oneshot` or `1stage` to force use one-shot. Set to `twoshot` or `2stage` to force use two-shot. | `` |
+| `SGLANG_MUSA_USE_JIT_ALL_GATHER` | Enable the node-local MUSA JIT custom all-gather path. | `false` |
+| `SGLANG_MUSA_USE_JIT_REDUCE_SCATTER` | Enable the node-local MUSA JIT custom reduce-scatter d3 path for the attention TP group. This gate is independent of custom all-gather. | `false` |
 | `SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR` | Skip-softmax threshold scale factor for TRT-LLM prefill attention in flashinfer. `None` means standard attention. See https://arxiv.org/abs/2512.12087 | `None` |
 | `SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR` | Skip-softmax threshold scale factor for TRT-LLM decode attention in flashinfer. `None` means standard attention. See https://arxiv.org/abs/2512.12087 | `None` |
 | `SGLANG_USE_SGL_FA3_KERNEL`               | Use sgl-kernel implementation for FlashAttention v3 | `true` |

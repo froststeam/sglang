@@ -236,6 +236,7 @@ class GroupCoordinator:
     pynccl_comm: Optional[Any]  # PyNccl communicator
     ca_comm: Optional[Any]  # Custom allreduce communicator
     cag_comm: Optional[Any]  # Custom allgather communicator
+    crs_comm: Optional[Any]  # Custom reduce-scatter communicator
     torch_symm_mem_comm: Optional[Any]  # Torch symm mem communicator
     mq_broadcaster: Optional[Any]  # shared memory broadcaster
 
@@ -345,6 +346,9 @@ class GroupCoordinator:
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
             dispatch_custom_allreduce,
         )
+        from sglang.srt.distributed.device_communicators.custom_reduce_scatter import (
+            dispatch_custom_reduce_scatter,
+        )
         from sglang.srt.distributed.device_communicators.pymscclpp import (
             PyMscclppCommunicator,
         )
@@ -387,6 +391,7 @@ class GroupCoordinator:
 
         self.ca_comm: Optional[Any] = None
         self.cag_comm: Optional[Any] = None
+        self.crs_comm: Optional[Any] = None
         self.qr_comm: Optional[QuickAllReduce] = None
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
@@ -438,6 +443,35 @@ class GroupCoordinator:
             else:
                 logger.info(
                     "Skip MUSA custom allgather for non-node-local group "
+                    "%s ranks=%s local_size=%s.",
+                    self.unique_name,
+                    self.ranks,
+                    self.local_size,
+                )
+
+        if (
+            self.world_size > 1
+            and _is_musa
+            and self.group_name == "attention_tp"
+            and envs.SGLANG_MUSA_USE_JIT_REDUCE_SCATTER.get()
+        ):
+            if self.is_node_local_group:
+                try:
+                    CRSClass = dispatch_custom_reduce_scatter()
+                    if CRSClass is not None:
+                        self.crs_comm = CRSClass(
+                            group=self.cpu_group,
+                            device=self.device,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"Setup custom reduce-scatter d3 failed with {e}. "
+                        "Disable it by setting "
+                        "SGLANG_MUSA_USE_JIT_REDUCE_SCATTER=0."
+                    )
+            else:
+                logger.info(
+                    "Skip MUSA custom reduce-scatter for non-node-local group "
                     "%s ranks=%s local_size=%s.",
                     self.unique_name,
                     self.ranks,
@@ -563,6 +597,8 @@ class GroupCoordinator:
         maybe_ca_context = nullcontext() if ca_comm is None else ca_comm.capture()
         cag_comm = self.cag_comm
         maybe_cag_context = nullcontext() if cag_comm is None else cag_comm.capture()
+        crs_comm = self.crs_comm
+        maybe_crs_context = nullcontext() if crs_comm is None else crs_comm.capture()
 
         # ensure all initialization operations complete before attempting to
         # capture the graph on another stream
@@ -570,7 +606,12 @@ class GroupCoordinator:
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
-        with self.device_module.stream(stream), maybe_ca_context, maybe_cag_context:
+        with (
+            self.device_module.stream(stream),
+            maybe_ca_context,
+            maybe_cag_context,
+            maybe_crs_context,
+        ):
             # In graph mode, we have to be very careful about the collective
             # operations. The current status is:
             #     allreduce \ Mode   |  Eager  |  Graph  |
@@ -864,6 +905,18 @@ class GroupCoordinator:
         output: torch.Tensor,
         input: torch.Tensor,
     ) -> torch.Tensor:
+        if _should_skip_musa_empty_tensor_collective(input):
+            return output
+
+        crs_comm = self.crs_comm
+        if (
+            crs_comm is not None
+            and not crs_comm.disabled
+            and crs_comm.should_custom_rs(output, input)
+        ):
+            out = crs_comm.custom_reduce_scatter(output, input)
+            if out is not None:
+                return output
         pynccl_comm = self.pynccl_comm
         if self._should_use_pynccl_tensor_collective():
             assert pynccl_comm is not None
@@ -1515,6 +1568,10 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
+        if self.crs_comm is not None:
+            if hasattr(self.crs_comm, "close"):
+                self.crs_comm.close()
+            self.crs_comm = None
         if self.cag_comm is not None:
             if hasattr(self.cag_comm, "close"):
                 self.cag_comm.close()
