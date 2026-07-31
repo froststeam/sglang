@@ -62,6 +62,70 @@ def _rope_module(arch_tag: str, store_hint: str):
     )
 
 
+@cache_once
+def _vision_rope_cache_module():
+    return load_musa_jit(
+        "sglang_musa_qwen3vl_vision_rope_cache",
+        ("rope/vision_rope_cache.mu",),
+    )
+
+
+def qwen3vl_vision_rope_cache(
+    pos_ids: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cos_sin_cache = torch.empty(
+        (pos_ids.size(0), cos.size(1) * 4),
+        device=cos.device,
+        dtype=cos.dtype,
+    )
+    positions = torch.empty(pos_ids.size(0), device=pos_ids.device, dtype=torch.int64)
+    _vision_rope_cache_module().sgl_qwen3vl_vision_rope_cache(
+        pos_ids,
+        cos,
+        sin,
+        cos_sin_cache,
+        positions,
+    )
+    return cos_sin_cache, positions
+
+
+def vision_qkv_unpack_rope(
+    qkv: torch.Tensor,
+    pos_ids: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    q = torch.empty(
+        (pos_ids.size(0), num_heads, head_size),
+        device=qkv.device,
+        dtype=qkv.dtype,
+    )
+    k = torch.empty(
+        (pos_ids.size(0), num_kv_heads, head_size),
+        device=qkv.device,
+        dtype=qkv.dtype,
+    )
+    v = torch.empty_like(k)
+    _vision_rope_cache_module().sgl_vision_qkv_unpack_rope(
+        qkv,
+        pos_ids,
+        cos,
+        sin,
+        q,
+        k,
+        v,
+    )
+    return q, k, v
+
+
+qwen3vl_qkv_unpack_rope = vision_qkv_unpack_rope
+
+
 def _rotary_embedding_kernel(
     positions: torch.Tensor,
     query: torch.Tensor,

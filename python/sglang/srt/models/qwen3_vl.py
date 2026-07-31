@@ -79,6 +79,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
+    get_bool_env_var,
     is_cpu,
     is_musa,
     is_npu,
@@ -88,6 +89,10 @@ from sglang.srt.utils.hf_transformers_utils import get_processor
 
 _is_musa = is_musa()
 _is_npu = is_npu()
+_fuse_musa_vision_rope_cache = get_bool_env_var("SGLANG_MUSA_FUSE_VISION_ROPE_CACHE")
+_fuse_musa_vision_qkv_rope = _is_musa and get_bool_env_var(
+    "SGLANG_MUSA_FUSE_VISION_QKV_ROPE", default="true"
+)
 graph_runners_dict = defaultdict(lambda: ViTCudaGraphRunner)
 if _is_npu:
     from sglang.srt.hardware_backend.npu.graph_runner.vit_npu_graph_runner import (
@@ -241,6 +246,7 @@ class Qwen3_VisionBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         rotary_pos_emb_cos: Optional[torch.Tensor],
         rotary_pos_emb_sin: Optional[torch.Tensor],
+        rotary_pos_emb_pos_ids: Optional[torch.Tensor] = None,
         rotary_pos_emb_cache: Optional[torch.Tensor] = None,
         rotary_pos_emb_positions: Optional[torch.Tensor] = None,
         output_ws: Optional[torch.Tensor] = None,
@@ -254,6 +260,7 @@ class Qwen3_VisionBlock(nn.Module):
             cu_seqlens=cu_seqlens,
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
+            rotary_pos_emb_pos_ids=rotary_pos_emb_pos_ids,
             rotary_pos_emb_cache=rotary_pos_emb_cache,
             rotary_pos_emb_positions=rotary_pos_emb_positions,
             output_ws=output_ws,
@@ -455,7 +462,10 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         return self.patch_embed.proj.weight.device
 
     def rot_pos_emb(
-        self, grid_thw: list[list[int]], return_musa_cache: bool = False
+        self,
+        grid_thw: list[list[int]],
+        return_musa_cache: bool = False,
+        return_musa_qkv_rope: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         pos_ids = []
         for t, h, w in grid_thw:
@@ -467,6 +477,16 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         # Use pre-computed cos_sin_cache from RotaryEmbedding
         cos, sin = self.rotary_pos_emb.get_cos_sin(max_grid_size)
+
+        if return_musa_qkv_rope and _is_musa and _fuse_musa_vision_qkv_rope:
+            return pos_ids, cos, sin
+
+        if return_musa_cache and _is_musa and _fuse_musa_vision_rope_cache:
+            from sglang.srt.hardware_backend.musa.jit_kernel.csrc.rope import (
+                qwen3vl_vision_rope_cache,
+            )
+
+            return qwen3vl_vision_rope_cache(pos_ids, cos, sin)
 
         cos_combined = cos[pos_ids].flatten(1)
         sin_combined = sin[pos_ids].flatten(1)
@@ -803,11 +823,19 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         rotary_pos_emb_cache = None
         rotary_pos_emb_positions = None
+        rotary_pos_emb_pos_ids = None
         if _is_musa and getattr(self, "use_musa_vision_rope", False):
-            rotary_pos_emb_cos, rotary_pos_emb_sin = None, None
-            rotary_pos_emb_cache, rotary_pos_emb_positions = self.rot_pos_emb(
-                grid_thw_list, return_musa_cache=True
-            )
+            if _fuse_musa_vision_qkv_rope:
+                (
+                    rotary_pos_emb_pos_ids,
+                    rotary_pos_emb_cos,
+                    rotary_pos_emb_sin,
+                ) = self.rot_pos_emb(grid_thw_list, return_musa_qkv_rope=True)
+            else:
+                rotary_pos_emb_cos, rotary_pos_emb_sin = None, None
+                rotary_pos_emb_cache, rotary_pos_emb_positions = self.rot_pos_emb(
+                    grid_thw_list, return_musa_cache=True
+                )
         else:
             rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
 
@@ -880,6 +908,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 cu_seqlens=cu_seqlens,
                 rotary_pos_emb_cos=rotary_pos_emb_cos,
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
+                rotary_pos_emb_pos_ids=rotary_pos_emb_pos_ids,
                 rotary_pos_emb_cache=rotary_pos_emb_cache,
                 rotary_pos_emb_positions=rotary_pos_emb_positions,
                 max_seqlen=max_seqlen,
@@ -906,6 +935,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         (
             x,
             cu_seqlens,
+            _,
             rotary_pos_emb_cos,
             rotary_pos_emb_sin,
         ) = self._prepare_graph_inputs(x, grid_thw)
@@ -927,6 +957,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         (
             x,
             cu_seqlens,
+            rotary_pos_emb_pos_ids,
             rotary_pos_emb_cos,
             rotary_pos_emb_sin,
         ) = self._prepare_graph_inputs(x, grid_thw)
@@ -941,6 +972,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             position_embeddings=None,
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
+            rotary_pos_emb_pos_ids=rotary_pos_emb_pos_ids,
             cu_seqlens=cu_seqlens,
             cu_window_seqlens=None,
             output_indices=None,
@@ -976,6 +1008,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
     def _prepare_graph_inputs(self, x: torch.Tensor, grid_thw: torch.Tensor) -> tuple[
         torch.Tensor,
         torch.Tensor,
+        Optional[torch.Tensor],
         torch.Tensor,
         torch.Tensor,
     ]:
@@ -993,11 +1026,23 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         x += pos_embeds
 
         # rotary embedding -> (cos, sin)
-        rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
+        rotary_pos_emb_pos_ids = None
+        if (
+            _is_musa
+            and getattr(self, "use_musa_vision_rope", False)
+            and _fuse_musa_vision_qkv_rope
+        ):
+            (
+                rotary_pos_emb_pos_ids,
+                rotary_pos_emb_cos,
+                rotary_pos_emb_sin,
+            ) = self.rot_pos_emb(grid_thw_list, return_musa_qkv_rope=True)
+        else:
+            rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
 
         # compute cu_seqlens
         cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
-        return x, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin
+        return x, cu_seqlens, rotary_pos_emb_pos_ids, rotary_pos_emb_cos, rotary_pos_emb_sin
 
 
 cached_get_processor = lru_cache(get_processor)
@@ -1147,6 +1192,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             prefix=add_prefix("model.visual", prefix),
             use_data_parallel=self.use_data_parallel,
         )
+        if _is_musa:
+            self.visual.use_musa_vision_rope = True
 
         # TODO: make it more elegant
         if language_model_cls is Qwen3LLMModel:
