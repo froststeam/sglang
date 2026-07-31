@@ -63,6 +63,8 @@ class ViTCudaGraphRunner:
 
         # rotary position buffers shared across graphs
         self.sin_cos_ws: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self.raw_sin_cos_ws: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self.rotary_pos_ids_ws: Dict[Hashable, torch.Tensor] = {}
         self.max_context_len = getattr(vit, "max_context_len", None)
 
         # Qwen2.5-VL specific viarable.
@@ -112,6 +114,26 @@ class ViTCudaGraphRunner:
                 )
                 self.sin_cos_ws = (cos_ws, sin_ws)
 
+    def _ensure_raw_sin_cos_ws(self, cache_len: int, head_dim: int):
+        if self.raw_sin_cos_ws is None:
+            cos_ws = torch.empty(
+                cache_len, head_dim, dtype=self.dtype, device=self.device
+            )
+            sin_ws = torch.empty(
+                cache_len, head_dim, dtype=self.dtype, device=self.device
+            )
+            self.raw_sin_cos_ws = (cos_ws, sin_ws)
+        else:
+            if self.raw_sin_cos_ws[0].size(0) < cache_len:
+                max_shape = max(self.raw_sin_cos_ws[0].size(0) * 2, cache_len)
+                cos_ws = torch.empty(
+                    max_shape, head_dim, dtype=self.dtype, device=self.device
+                )
+                sin_ws = torch.empty(
+                    max_shape, head_dim, dtype=self.dtype, device=self.device
+                )
+                self.raw_sin_cos_ws = (cos_ws, sin_ws)
+
     def _get_graph_key(self, x_3d: torch.Tensor) -> int:
         # x_3d: [S, B, H], B=1, S as graph_key
         return x_3d.shape[0]
@@ -124,6 +146,7 @@ class ViTCudaGraphRunner:
         ] = None,  # (cos, sin), [S, D]
         rotary_pos_emb_cos: Optional[torch.Tensor] = None,
         rotary_pos_emb_sin: Optional[torch.Tensor] = None,
+        rotary_pos_emb_pos_ids: Optional[torch.Tensor] = None,
     ):
 
         graph = torch.cuda.CUDAGraph()
@@ -194,6 +217,7 @@ class ViTCudaGraphRunner:
                             cu_seqlens=cu_seq_len_ws,
                             rotary_pos_emb_cos=rotary_pos_emb_cos,
                             rotary_pos_emb_sin=rotary_pos_emb_sin,
+                            rotary_pos_emb_pos_ids=rotary_pos_emb_pos_ids,
                             output_ws=self.block_ws[graph_key],
                         )
                     else:
@@ -202,6 +226,7 @@ class ViTCudaGraphRunner:
                             cu_seqlens=cu_seq_len_ws,
                             rotary_pos_emb_cos=rotary_pos_emb_cos,
                             rotary_pos_emb_sin=rotary_pos_emb_sin,
+                            rotary_pos_emb_pos_ids=rotary_pos_emb_pos_ids,
                             output_ws=self.block_ws[graph_key],
                         )
 
@@ -241,6 +266,7 @@ class ViTCudaGraphRunner:
         ],  # (cos, sin), [S, D]
         rotary_pos_emb_cos: Optional[torch.Tensor] = None,
         rotary_pos_emb_sin: Optional[torch.Tensor] = None,
+        rotary_pos_emb_pos_ids: Optional[torch.Tensor] = None,
     ) -> int:
         vit = self.vit
         graph_key = self._get_graph_key(x_3d)
@@ -296,19 +322,39 @@ class ViTCudaGraphRunner:
                 graph_key=graph_key, position_embeddings=persist_position_embeddings
             )
         elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
-            # make sure rotary workspace
-            head_dim = rotary_pos_emb_cos.shape[1]
-            self._ensure_sin_cos_ws(graph_key, head_dim)
+            used_pos_ids_ws = None
+            if rotary_pos_emb_pos_ids is not None:
+                head_dim = rotary_pos_emb_cos.shape[1]
+                self._ensure_raw_sin_cos_ws(rotary_pos_emb_cos.shape[0], head_dim)
+                used_cos_ws = self.raw_sin_cos_ws[0]
+                used_sin_ws = self.raw_sin_cos_ws[1]
+                used_cos_ws[: rotary_pos_emb_cos.shape[0], :].copy_(
+                    rotary_pos_emb_cos
+                )
+                used_sin_ws[: rotary_pos_emb_sin.shape[0], :].copy_(
+                    rotary_pos_emb_sin
+                )
+                if graph_key not in self.rotary_pos_ids_ws:
+                    self.rotary_pos_ids_ws[graph_key] = torch.empty_like(
+                        rotary_pos_emb_pos_ids, device=self.device
+                    )
+                used_pos_ids_ws = self.rotary_pos_ids_ws[graph_key]
+                used_pos_ids_ws.copy_(rotary_pos_emb_pos_ids)
+            else:
+                # make sure rotary workspace
+                head_dim = rotary_pos_emb_cos.shape[1]
+                self._ensure_sin_cos_ws(graph_key, head_dim)
 
-            used_cos_ws = self.sin_cos_ws[0][:graph_key, :]
-            used_sin_ws = self.sin_cos_ws[1][:graph_key, :]
-            used_cos_ws.copy_(rotary_pos_emb_cos)
-            used_sin_ws.copy_(rotary_pos_emb_sin)
+                used_cos_ws = self.sin_cos_ws[0][:graph_key, :]
+                used_sin_ws = self.sin_cos_ws[1][:graph_key, :]
+                used_cos_ws.copy_(rotary_pos_emb_cos)
+                used_sin_ws.copy_(rotary_pos_emb_sin)
             self._create_graph(
                 graph_key=graph_key,
                 position_embeddings=None,
                 rotary_pos_emb_cos=used_cos_ws,
                 rotary_pos_emb_sin=used_sin_ws,
+                rotary_pos_emb_pos_ids=used_pos_ids_ws,
             )
 
         return graph_key
@@ -320,6 +366,7 @@ class ViTCudaGraphRunner:
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         rotary_pos_emb_cos: Optional[torch.Tensor] = None,
         rotary_pos_emb_sin: Optional[torch.Tensor] = None,
+        rotary_pos_emb_pos_ids: Optional[torch.Tensor] = None,
         output_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
@@ -332,13 +379,24 @@ class ViTCudaGraphRunner:
             used_cos_ws.copy_(position_embeddings[0])
             used_sin_ws.copy_(position_embeddings[1])
         elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
-            # update rotary workspace content
-            head_dim = rotary_pos_emb_cos.shape[1]
-            self._ensure_sin_cos_ws(graph_key, head_dim)
-            used_cos_ws = self.sin_cos_ws[0][:graph_key, :]
-            used_sin_ws = self.sin_cos_ws[1][:graph_key, :]
-            used_cos_ws.copy_(rotary_pos_emb_cos)
-            used_sin_ws.copy_(rotary_pos_emb_sin)
+            if rotary_pos_emb_pos_ids is not None:
+                head_dim = rotary_pos_emb_cos.shape[1]
+                self._ensure_raw_sin_cos_ws(rotary_pos_emb_cos.shape[0], head_dim)
+                self.raw_sin_cos_ws[0][: rotary_pos_emb_cos.shape[0], :].copy_(
+                    rotary_pos_emb_cos
+                )
+                self.raw_sin_cos_ws[1][: rotary_pos_emb_sin.shape[0], :].copy_(
+                    rotary_pos_emb_sin
+                )
+                self.rotary_pos_ids_ws[graph_key].copy_(rotary_pos_emb_pos_ids)
+            else:
+                # update rotary workspace content
+                head_dim = rotary_pos_emb_cos.shape[1]
+                self._ensure_sin_cos_ws(graph_key, head_dim)
+                used_cos_ws = self.sin_cos_ws[0][:graph_key, :]
+                used_sin_ws = self.sin_cos_ws[1][:graph_key, :]
+                used_cos_ws.copy_(rotary_pos_emb_cos)
+                used_sin_ws.copy_(rotary_pos_emb_sin)
 
         # copy input
         self.block_input[graph_key].copy_(x_3d)
@@ -362,6 +420,7 @@ class ViTCudaGraphRunner:
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
         rotary_pos_emb_cos: Optional[torch.Tensor] = None,
         rotary_pos_emb_sin: Optional[torch.Tensor] = None,
+        rotary_pos_emb_pos_ids: Optional[torch.Tensor] = None,
         output_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # x: [seq_len, hidden] -> [S, B=1, H]
@@ -376,6 +435,7 @@ class ViTCudaGraphRunner:
                 cu_window_seqlens=cu_window_seqlens,
                 rotary_pos_emb_cos=rotary_pos_emb_cos,
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
+                rotary_pos_emb_pos_ids=rotary_pos_emb_pos_ids,
             )
 
         return self.replay(
@@ -384,5 +444,6 @@ class ViTCudaGraphRunner:
             position_embeddings=position_embeddings,
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
+            rotary_pos_emb_pos_ids=rotary_pos_emb_pos_ids,
             output_indices=output_indices,
         )

@@ -48,6 +48,9 @@ if _is_cuda:
 if _is_musa:
     from flash_attn_interface import flash_attn_varlen_func
     from sgl_kernel import musa_rotary_embedding_contiguous
+    from sglang.srt.hardware_backend.musa.jit_kernel.csrc.rope import (
+        vision_qkv_unpack_rope,
+    )
 
     def flash_attn_func(*args, ver: int = 3, **kwargs):
         return flash_attn_varlen_func(*args, **kwargs)
@@ -1034,6 +1037,7 @@ class VisionAttention(nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         rotary_pos_emb_cos: Optional[torch.Tensor] = None,
         rotary_pos_emb_sin: Optional[torch.Tensor] = None,
+        rotary_pos_emb_pos_ids: Optional[torch.Tensor] = None,
         rotary_pos_emb_cache: Optional[torch.Tensor] = None,
         rotary_pos_emb_positions: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -1069,17 +1073,38 @@ class VisionAttention(nn.Module):
         sequence_lengths = (
             kwargs["sequence_lengths"] if "sequence_lengths" in kwargs else None
         )
+        fused_qkv_rope_applied = False
         if self.use_qkv_parallel:
             # [b, s, embed_dim] --> [b, s, embed_dim]
             qkv, _ = self.qkv_proj(x)
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            use_fused_qkv_rope = (
+                _is_musa
+                and rotary_pos_emb_pos_ids is not None
+                and rotary_pos_emb_cos is not None
+                and rotary_pos_emb_sin is not None
+                and not self.qk_normalization
+                and not self.qk_normalization_by_head_size
+            )
+            if use_fused_qkv_rope:
+                q, k, v = vision_qkv_unpack_rope(
+                    qkv,
+                    rotary_pos_emb_pos_ids,
+                    rotary_pos_emb_cos,
+                    rotary_pos_emb_sin,
+                    head,
+                    kv_head,
+                    self.head_size,
+                )
+                fused_qkv_rope_applied = True
+            else:
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-            # [b, s, embed_dim] --> [b * s, head, head_size]
-            q = q.reshape(bsz * s, head, -1).contiguous()
-            k = k.reshape(bsz * s, kv_head, -1).contiguous()
-            v = v.reshape(bsz * s, kv_head, -1).contiguous()
-            if self.qk_normalization_by_head_size:
-                q, k = self._apply_qk_norm_head_size(q, k)
+                # [b, s, embed_dim] --> [b * s, head, head_size]
+                q = q.reshape(bsz * s, head, -1).contiguous()
+                k = k.reshape(bsz * s, kv_head, -1).contiguous()
+                v = v.reshape(bsz * s, kv_head, -1).contiguous()
+                if self.qk_normalization_by_head_size:
+                    q, k = self._apply_qk_norm_head_size(q, k)
         else:
             # [b, s, embed_dim] --> [s, b, embed_dim]
             x = rearrange(x, "b s ... -> s b ...")
@@ -1118,7 +1143,7 @@ class VisionAttention(nn.Module):
             cos = rotary_pos_emb_cos
             sin = rotary_pos_emb_sin
 
-        if cos is not None and sin is not None:
+        if cos is not None and sin is not None and not fused_qkv_rope_applied:
             original_q_shape = q.shape
             original_k_shape = k.shape
 
