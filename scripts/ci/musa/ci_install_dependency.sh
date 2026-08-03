@@ -504,7 +504,7 @@ if [ "${SGLANG_CI_INSTALL_DEPS}" != "1" ]; then
   SGLANG_INSTALL_ARGS+=(--no-deps)
 fi
 (cd "${REPO_ROOT}" && "${PIP_INSTALL[@]}" "${SGLANG_INSTALL_ARGS[@]}")
-install_checkout_sglang_extra fastokens "fastokens>=0.1.1,<0.2.0"
+install_checkout_sglang_extra fastokens "fastokens==0.2.0"
 install_lmms_eval
 
 if [ -n "${SGLANG_CI_TEST_PACKAGES}" ]; then
