@@ -178,27 +178,32 @@ class MusaJitCustomAllGather:
             finally:
                 self._graph_inputs.clear()
 
-    def should_custom_ag(self, output: torch.Tensor, inp: torch.Tensor) -> bool:
+    def custom_ag_reason(self, output: torch.Tensor, inp: torch.Tensor) -> str:
         if self.disabled:
-            return False
+            return "communicator_disabled"
         if inp.numel() == 0:
-            return False
+            return "empty_input"
         if inp.device.type != "musa" or output.device.type != "musa":
-            return False
+            return "non_musa_tensor"
         if inp.device != output.device or inp.device != self.device:
-            return False
+            return "device_mismatch"
         if inp.dtype != output.dtype:
-            return False
+            return "dtype_mismatch"
         if output.numel() != inp.numel() * self.world_size:
-            return False
+            return "shape_mismatch"
         if not _is_weak_contiguous(inp) or not output.is_contiguous():
-            return False
+            return "noncontiguous_tensor"
         inp_size = inp.numel() * inp.element_size()
-        if inp_size % 16 != 0 or inp_size > self.max_size:
-            return False
+        if inp_size % 16 != 0:
+            return "unaligned_size"
+        if inp_size > self.max_size:
+            return "size_exceeds_max"
         if int(inp.data_ptr()) % 16 != 0 or int(output.data_ptr()) % 16 != 0:
-            return False
-        return True
+            return "unaligned_pointer"
+        return "eligible"
+
+    def should_custom_ag(self, output: torch.Tensor, inp: torch.Tensor) -> bool:
+        return self.custom_ag_reason(output, inp) == "eligible"
 
     def _get_base_ptr_and_offset(self, inp: torch.Tensor) -> tuple[int, int]:
         ptr_value = int(inp.data_ptr())

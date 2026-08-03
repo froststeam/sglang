@@ -44,6 +44,9 @@ from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.srt.distributed.device_communicators import (
+    musa_collective_observability as collective_observability,
+)
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
@@ -435,10 +438,43 @@ class GroupCoordinator:
                             group=self.cpu_group,
                             device=self.device,
                         )
-                except Exception as e:
-                    logger.warning(
-                        f"Setup Custom allgather failed with {e}. "
-                        "Disable it by setting SGLANG_MUSA_USE_JIT_ALL_GATHER=0."
+                        collective_observability.startup_event(
+                            "cag_setup",
+                            self,
+                            result=(
+                                "initialized"
+                                if not self.cag_comm.disabled
+                                else "communicator_disabled"
+                            ),
+                            device=str(self.device),
+                            local_size=self.local_size,
+                            node_local=True,
+                        )
+                    else:
+                        collective_observability.startup_event(
+                            "cag_setup",
+                            self,
+                            result="no_implementation",
+                            device=str(self.device),
+                            local_size=self.local_size,
+                            node_local=True,
+                        )
+                except Exception:
+                    logger.exception(
+                        "Setup Custom allgather failed for group=%s ranks=%s "
+                        "local_size=%s device=%s.",
+                        self.unique_name,
+                        self.ranks,
+                        self.local_size,
+                        self.device,
+                    )
+                    collective_observability.startup_event(
+                        "cag_setup",
+                        self,
+                        result="failed",
+                        device=str(self.device),
+                        local_size=self.local_size,
+                        node_local=True,
                     )
             else:
                 logger.info(
@@ -447,6 +483,14 @@ class GroupCoordinator:
                     self.unique_name,
                     self.ranks,
                     self.local_size,
+                )
+                collective_observability.startup_event(
+                    "cag_setup",
+                    self,
+                    result="non_node_local",
+                    device=str(self.device),
+                    local_size=self.local_size,
+                    node_local=False,
                 )
 
         if (
@@ -463,11 +507,43 @@ class GroupCoordinator:
                             group=self.cpu_group,
                             device=self.device,
                         )
-                except Exception as e:
-                    logger.warning(
-                        f"Setup custom reduce-scatter d3 failed with {e}. "
-                        "Disable it by setting "
-                        "SGLANG_MUSA_USE_JIT_REDUCE_SCATTER=0."
+                        collective_observability.startup_event(
+                            "crs_setup",
+                            self,
+                            result=(
+                                "initialized"
+                                if not self.crs_comm.disabled
+                                else "communicator_disabled"
+                            ),
+                            device=str(self.device),
+                            local_size=self.local_size,
+                            node_local=True,
+                        )
+                    else:
+                        collective_observability.startup_event(
+                            "crs_setup",
+                            self,
+                            result="no_implementation",
+                            device=str(self.device),
+                            local_size=self.local_size,
+                            node_local=True,
+                        )
+                except Exception:
+                    logger.exception(
+                        "Setup custom reduce-scatter d3 failed for group=%s "
+                        "ranks=%s local_size=%s device=%s.",
+                        self.unique_name,
+                        self.ranks,
+                        self.local_size,
+                        self.device,
+                    )
+                    collective_observability.startup_event(
+                        "crs_setup",
+                        self,
+                        result="failed",
+                        device=str(self.device),
+                        local_size=self.local_size,
+                        node_local=True,
                     )
             else:
                 logger.info(
@@ -477,6 +553,23 @@ class GroupCoordinator:
                     self.ranks,
                     self.local_size,
                 )
+                collective_observability.startup_event(
+                    "crs_setup",
+                    self,
+                    result="non_node_local",
+                    device=str(self.device),
+                    local_size=self.local_size,
+                    node_local=False,
+                )
+
+        collective_observability.startup_event(
+            "collective_setup",
+            self,
+            device=str(self.device),
+            custom_allreduce_available=self.ca_comm is not None,
+            custom_allgather_available=self.cag_comm is not None,
+            custom_reduce_scatter_available=self.crs_comm is not None,
+        )
 
         self.torch_symm_mem_comm: Optional[TorchSymmMemCommunicator] = None
         if self.use_torch_symm_mem_all_reduce and self.world_size > 1:
@@ -892,6 +985,24 @@ class GroupCoordinator:
     def _should_use_musa_attn_tp_pynccl_collective(self) -> bool:
         return _is_musa_attn_tp_pynccl and self.group_name == "attention_tp"
 
+    def _should_use_musa_custom_reduce_scatter(self) -> bool:
+        crs_comm = self.crs_comm
+        return (
+            _is_musa
+            and self.group_name == "attention_tp"
+            and crs_comm is not None
+            and not crs_comm.disabled
+        )
+
+    def _should_use_musa_custom_all_gather(self) -> bool:
+        cag_comm = self.cag_comm
+        return (
+            _is_musa
+            and self.group_name == "attention_tp"
+            and cag_comm is not None
+            and not cag_comm.disabled
+        )
+
     def _should_use_pynccl_tensor_collective(self) -> bool:
         pynccl_comm = self.pynccl_comm
         return pynccl_comm is not None and (
@@ -906,17 +1017,44 @@ class GroupCoordinator:
         input: torch.Tensor,
     ) -> torch.Tensor:
         if _should_skip_musa_empty_tensor_collective(input):
+            collective_observability.record_route(
+                op="reduce_scatter",
+                route="empty_tensor_skip",
+                reason="empty_input",
+                group=self,
+                output=output,
+                input=input,
+            )
             return output
 
         crs_comm = self.crs_comm
-        if (
-            crs_comm is not None
-            and not crs_comm.disabled
-            and crs_comm.should_custom_rs(output, input)
-        ):
-            out = crs_comm.custom_reduce_scatter(output, input)
-            if out is not None:
-                return output
+        crs_reason = "crs_comm_unavailable"
+        if crs_comm is not None:
+            if crs_comm.disabled:
+                crs_reason = "communicator_disabled"
+            else:
+                reason_fn = getattr(crs_comm, "custom_rs_reason", None)
+                if collective_observability.enabled() and reason_fn is not None:
+                    crs_reason = reason_fn(output, input)
+                else:
+                    crs_reason = (
+                        "eligible"
+                        if crs_comm.should_custom_rs(output, input)
+                        else "custom_predicate_rejected"
+                    )
+                if crs_reason == "eligible":
+                    out = crs_comm.custom_reduce_scatter(output, input)
+                    if out is not None:
+                        collective_observability.record_route(
+                            op="reduce_scatter",
+                            route="jit_reduce_scatter_d3",
+                            reason="eligible",
+                            group=self,
+                            output=output,
+                            input=input,
+                        )
+                        return output
+                    crs_reason = "custom_launcher_declined"
         pynccl_comm = self.pynccl_comm
         if self._should_use_pynccl_tensor_collective():
             assert pynccl_comm is not None
@@ -925,14 +1063,28 @@ class GroupCoordinator:
             )
             with pynccl_comm.change_state(enable=True):
                 pynccl_comm.reduce_scatter(output, input)
+            route = "pynccl_mccl"
         else:
             torch.distributed.reduce_scatter_tensor(
                 output, input, group=self.device_group
             )
+            route = "torch_distributed"
+        collective_observability.record_route(
+            op="reduce_scatter",
+            route=route,
+            reason=crs_reason,
+            group=self,
+            output=output,
+            input=input,
+        )
         return output
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or self._should_use_musa_attn_tp_pynccl_collective():
+        if (
+            _is_npu
+            or self._should_use_musa_attn_tp_pynccl_collective()
+            or self._should_use_musa_custom_reduce_scatter()
+        ):
             self._reduce_scatter_tensor(output, input)
         else:
             reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
@@ -980,15 +1132,44 @@ class GroupCoordinator:
             return output
 
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        if _should_skip_musa_empty_tensor_collective(input):
+            collective_observability.record_route(
+                op="all_gather",
+                route="empty_tensor_skip",
+                reason="empty_input",
+                group=self,
+                output=output,
+                input=input,
+            )
+            return
         cag_comm = self.cag_comm
-        if (
-            cag_comm is not None
-            and not cag_comm.disabled
-            and cag_comm.should_custom_ag(output, input)
-        ):
-            out = cag_comm.custom_all_gather(output, input)
-            if out is not None:
-                return
+        cag_reason = "cag_comm_unavailable"
+        if cag_comm is not None:
+            if cag_comm.disabled:
+                cag_reason = "communicator_disabled"
+            else:
+                reason_fn = getattr(cag_comm, "custom_ag_reason", None)
+                if collective_observability.enabled() and reason_fn is not None:
+                    cag_reason = reason_fn(output, input)
+                else:
+                    cag_reason = (
+                        "eligible"
+                        if cag_comm.should_custom_ag(output, input)
+                        else "custom_predicate_rejected"
+                    )
+                if cag_reason == "eligible":
+                    out = cag_comm.custom_all_gather(output, input)
+                    if out is not None:
+                        collective_observability.record_route(
+                            op="all_gather",
+                            route="jit_all_gather",
+                            reason="eligible",
+                            group=self,
+                            output=output,
+                            input=input,
+                        )
+                        return
+                    cag_reason = "custom_launcher_declined"
 
         pynccl_comm = self.pynccl_comm
         if self._should_use_pynccl_tensor_collective():
@@ -998,13 +1179,28 @@ class GroupCoordinator:
             )
             with pynccl_comm.change_state(enable=True):
                 pynccl_comm.all_gather(output, input)
+            route = "pynccl_mccl"
         else:
             torch.distributed.all_gather_into_tensor(
                 output, input, group=self.device_group
             )
+            route = "torch_distributed"
+        collective_observability.record_route(
+            op="all_gather",
+            route=route,
+            reason=cag_reason,
+            group=self,
+            output=output,
+            input=input,
+        )
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or _is_xpu or self._should_use_musa_attn_tp_pynccl_collective():
+        if (
+            _is_npu
+            or _is_xpu
+            or self._should_use_musa_attn_tp_pynccl_collective()
+            or self._should_use_musa_custom_all_gather()
+        ):
             self._all_gather_into_tensor(output, input)
         else:
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)

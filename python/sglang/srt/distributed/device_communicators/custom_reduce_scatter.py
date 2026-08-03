@@ -121,38 +121,47 @@ class MusaJitCustomReduceScatter:
     def _shares_storage(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
         return lhs.untyped_storage().data_ptr() == rhs.untyped_storage().data_ptr()
 
-    def should_custom_rs(self, output: torch.Tensor, inp: torch.Tensor) -> bool:
-        if self.disabled or output.numel() == 0 or inp.numel() == 0:
-            return False
+    def custom_rs_reason(self, output: torch.Tensor, inp: torch.Tensor) -> str:
+        if self.disabled:
+            return "communicator_disabled"
+        if output.numel() == 0 or inp.numel() == 0:
+            return "empty_tensor"
         if output.layout != torch.strided or inp.layout != torch.strided:
-            return False
+            return "non_strided_layout"
         if output.device != self.device or inp.device != self.device:
-            return False
-        if output.dtype != inp.dtype or output.dtype not in (
+            return "device_mismatch"
+        if output.dtype != inp.dtype:
+            return "dtype_mismatch"
+        if output.dtype not in (
             torch.float16,
             torch.bfloat16,
             torch.float32,
         ):
-            return False
+            return "unsupported_dtype"
         if not output.is_contiguous() or not inp.is_contiguous():
-            return False
+            return "noncontiguous_tensor"
         if output.ndim == 0 or inp.ndim != output.ndim:
-            return False
+            return "invalid_dimensions"
         expected_shape = (output.shape[0] * self.world_size, *output.shape[1:])
         if tuple(inp.shape) != expected_shape:
-            return False
+            return "shape_mismatch"
 
         output_bytes = output.numel() * output.element_size()
         input_bytes = inp.numel() * inp.element_size()
-        if output_bytes % 16 != 0 or input_bytes > self.max_size:
-            return False
+        if output_bytes % 16 != 0:
+            return "unaligned_output_size"
+        if input_bytes > self.max_size:
+            return "size_exceeds_max"
         if int(output.data_ptr()) % 16 != 0:
-            return False
+            return "unaligned_pointer"
         if self._shares_storage(output, inp):
             shard_offset = self.rank * output_bytes
             if output.data_ptr() != inp.data_ptr() + shard_offset:
-                return False
-        return True
+                return "invalid_storage_alias"
+        return "eligible"
+
+    def should_custom_rs(self, output: torch.Tensor, inp: torch.Tensor) -> bool:
+        return self.custom_rs_reason(output, inp) == "eligible"
 
     def custom_reduce_scatter(
         self, output: torch.Tensor, inp: torch.Tensor

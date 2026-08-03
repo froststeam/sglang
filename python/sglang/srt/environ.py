@@ -361,6 +361,8 @@ class Envs:
     # Opt-in full DiT graph replay on MUSA.
     SGLANG_MUSA_ENABLE_DIT_GRAPH = EnvBool(False)
     SGLANG_MUSA_USE_JIT_REDUCE_SCATTER = EnvBool(False)
+    SGLANG_MUSA_COLLECTIVE_OBSERVABILITY = EnvBool(False)
+    SGLANG_MUSA_COLLECTIVE_OBSERVABILITY_MAX_EVENTS = EnvInt(200)
     # Force attention TP tensor all-gather and reduce-scatter through PyNccl.
     SGLANG_MUSA_ENABLE_ATTN_TP_PYNCCL = EnvBool(False)
     # Round-robin disaggregation IB devices across GPUs by logical GPU ID

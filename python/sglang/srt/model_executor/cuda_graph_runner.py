@@ -34,6 +34,9 @@ from torch.profiler import ProfilerActivity, profile
 from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.distributed.device_communicators import (
+    musa_collective_observability as collective_observability,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
@@ -612,6 +615,8 @@ class CudaGraphRunner:
         self.device_module = torch.get_device_module(self.device)
         self.graphs = {}
         self.output_buffers = {}
+        self.collective_manifests: dict[object, dict[str, object]] = {}
+        self._last_collective_manifest: Optional[dict[str, object]] = None
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
@@ -948,6 +953,12 @@ class CudaGraphRunner:
                         key = _default_make_graph_key(bs, stream_idx, variant_label)
                         self.graphs[key] = graph
                         self.output_buffers[key] = output_buffers
+                        manifest = getattr(self, "_last_collective_manifest", None)
+                        if manifest is not None:
+                            manifests = getattr(self, "collective_manifests", None)
+                            if manifests is None:
+                                manifests = self.collective_manifests = {}
+                            manifests[key] = manifest
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -1318,7 +1329,16 @@ class CudaGraphRunner:
             for attempt in range(max_graph_register_recaptures + 1):
                 graph = self._create_device_graph()
                 self._prepare_custom_allreduce_graph_capture()
-                out = self._capture_graph(graph, graph_pool, stream, run_once)
+                with collective_observability.graph_capture_scope(
+                    runner=type(self).__name__,
+                    forward_mode=self.capture_forward_mode.name.lower(),
+                    phase=self.capture_forward_mode.name.lower(),
+                    batch_size=bs,
+                    stream_idx=stream_idx,
+                    attempt=attempt,
+                ) as capture_record:
+                    out = self._capture_graph(graph, graph_pool, stream, run_once)
+                self._last_collective_manifest = capture_record.manifest
                 registered = self._register_custom_allreduce_graph_buffers()
                 if registered == 0:
                     break
@@ -1501,6 +1521,12 @@ class CudaGraphRunner:
         )
         with ctx:
             self._prepare_custom_allreduce_graph_replay()
+            collective_observability.record_graph_replay(
+                self.collective_manifests.get(graph_key),
+                runner=type(self).__name__,
+                graph_key=str(graph_key),
+                phase=collective_observability.current_phase(),
+            )
             self.graphs[graph_key].replay()
 
         output = self.output_buffers[graph_key]

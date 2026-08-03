@@ -18,6 +18,9 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.distributed.device_communicators import (
+    musa_collective_observability as collective_observability,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
@@ -409,9 +412,12 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             forward_batch.req_to_token_pool = self.draft_runner_list[
                 step
             ].req_to_token_pool
-            output: ModelRunnerOutput = self.draft_runner_list[step].forward(
-                forward_batch
-            )
+            with collective_observability.phase_scope(
+                f"draft_extend_prefill_step_{step}"
+            ):
+                output: ModelRunnerOutput = self.draft_runner_list[step].forward(
+                    forward_batch
+                )
             maybe_detect_nan(
                 output.logits_output.next_token_logits,
                 f"draft_extend_for_prefill step {step}",
@@ -503,11 +509,14 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         for step in range(self.speculative_num_steps):
             # log_info_on_rank0(logger, f"step: {step}, forward_batch.input_ids: {forward_batch.input_ids}")
             if can_cuda_graph:
-                draft_logits_output = (
-                    self.cuda_graph_runner_for_draft_extend.get_runner(step).replay(
-                        forward_batch, init_state=(step == 0)
+                with collective_observability.phase_scope(
+                    f"draft_extend_decode_step_{step}"
+                ):
+                    draft_logits_output = (
+                        self.cuda_graph_runner_for_draft_extend.get_runner(step).replay(
+                            forward_batch, init_state=(step == 0)
+                        )
                     )
-                )
                 ret_topk_p, ret_topk_index = (
                     draft_logits_output.topk_p,
                     draft_logits_output.topk_index,
@@ -516,9 +525,12 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                 forward_batch.req_to_token_pool = self.draft_runner_list[
                     step
                 ].req_to_token_pool
-                draft_logits_output = self.draft_runner_list[step].forward(
-                    forward_batch, skip_attn_backend_init=True
-                )
+                with collective_observability.phase_scope(
+                    f"draft_extend_decode_step_{step}"
+                ):
+                    draft_logits_output = self.draft_runner_list[step].forward(
+                        forward_batch, skip_attn_backend_init=True
+                    )
                 probs = torch.softmax(
                     draft_logits_output.logits_output.next_token_logits[select_index],
                     dim=-1,
@@ -700,7 +712,10 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=capture_mode,
                 )
             draft_input: EagleDraftInput = model_worker_batch.spec_info
-            verify_input: EagleVerifyInput = self.draft_worker.draft(model_worker_batch)
+            with collective_observability.phase_scope("draft_proposal"):
+                verify_input: EagleVerifyInput = self.draft_worker.draft(
+                    model_worker_batch
+                )
             assert verify_input.is_verify_input()
             # Record a CUDA event after draft() GPU work is dispatched.
             if self.plan_stream:
@@ -759,12 +774,13 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 ),
             )
         # Run target verify batch in the main compute stream
-        forward_batch_output = self.target_worker.forward_batch_generation(
-            model_worker_batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
-            skip_attn_backend_init=True,
-        )
+        with collective_observability.phase_scope("target_verify"):
+            forward_batch_output = self.target_worker.forward_batch_generation(
+                model_worker_batch=None,
+                forward_batch=verify_forward_batch,
+                is_verify=True,
+                skip_attn_backend_init=True,
+            )
         logits_output = forward_batch_output.logits_output
 
         # Sample

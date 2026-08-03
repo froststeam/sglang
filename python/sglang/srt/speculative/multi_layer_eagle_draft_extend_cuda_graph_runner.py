@@ -22,6 +22,9 @@ from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
 
+from sglang.srt.distributed.device_communicators import (
+    musa_collective_observability as collective_observability,
+)
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -94,6 +97,8 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
 
         self.graphs = {}
         self.output_buffers = {}
+        self.collective_manifests: dict[object, dict[str, object]] = {}
+        self._last_collective_manifest: Optional[dict[str, object]] = None
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
@@ -506,9 +511,17 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
 
         self._capture_init(run_once)
 
-        out = self._capture_graph(
-            graph, get_global_graph_memory_pool(), stream, run_once
-        )
+        with collective_observability.graph_capture_scope(
+            runner=type(self).__name__,
+            forward_mode=self.forward_mode.name.lower(),
+            phase=f"draft_extend_decode_step_{self.step}",
+            batch_size=bs,
+            mtp_step=self.step,
+        ) as capture_record:
+            out = self._capture_graph(
+                graph, get_global_graph_memory_pool(), stream, run_once
+            )
+        self._last_collective_manifest = capture_record.manifest
 
         set_global_graph_memory_pool(graph.pool())
         return graph, out
@@ -599,6 +612,13 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         # Replay
         self.raw_bs = raw_bs
         self.bs = bs
+        collective_observability.record_graph_replay(
+            self.collective_manifests.get(bs),
+            runner=type(self).__name__,
+            graph_key=str(bs),
+            mtp_step=self.step,
+            phase=collective_observability.current_phase(),
+        )
         self._replay(forward_batch)
         out = self.output_buffers[bs]
 
