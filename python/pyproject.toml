@@ -27,7 +27,7 @@ dependencies = [
   "datasets",
   "einops",
   "fastapi",
-  "fastokens>=0.1.1,<0.2.0",
+  "fastokens==0.2.0",
   "flashinfer_python==0.6.11.post1", # keep it aligned with jit-cache version in Dockerfile
   "flashinfer_cubin==0.6.11.post1",
   "gguf",
@@ -130,7 +130,7 @@ http2 = [
 ]
 
 fastokens = [
-  "fastokens>=0.1.1,<0.2.0",
+  "fastokens==0.2.0",
 ]
 
 test = [
