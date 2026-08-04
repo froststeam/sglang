@@ -33,11 +33,15 @@ The d3 path is selected only when all of these conditions hold:
 - the group world size is 2, 4, 6, or 8;
 - input and output are contiguous fp16, bf16, or fp32 tensors on the same device;
 - the input shape is the output shape multiplied by the world size on dimension 0;
-- the output shard is 16-byte aligned and the input fits the IPC staging buffer.
+- input and output pointers are 16-byte aligned and the input fits the IPC
+  staging buffer.
 
 Unsupported calls fall back to the existing PyNccl or torch.distributed path.
-The direct kernel uses fixed IPC staging and signal buffers, so the same path
-can be captured and replayed in a MUSA graph without dynamic input registration.
+Eager execution and the first graph-capture attempt use the fixed IPC staging
+buffer. During graph capture, SGLang registers the stable input addresses and
+recaptures the graph; replay then uses the registered d3 kernel to read peer
+inputs directly and avoids the full-input staging copy. If graph input
+registration is disabled, the staging path remains the graph-safe fallback.
 
 ## Tuning
 
@@ -51,6 +55,11 @@ path:
 | `SGLANG_CUSTOM_RS_BLOCKS` | `80` for world size 4/8, otherwise `56` | Default kernel block limit. |
 | `SGLANG_CUSTOM_RS_MAX_BLOCKS` | at least `120` | Signal metadata and launch upper bound. |
 | `SGLANG_CUSTOM_RS_DYNAMIC_BLOCKS` | `1` | Enable the size-dependent block cap. |
+| `SGLANG_MUSA_CUSTOM_RS_GRAPH_REGISTERED_INPUT` | `1` | Use registered peer input addresses for graph-captured d3 reduce-scatter. Set to `0` to retain the staging path. |
+
+For compatibility with the implementation where reduce-scatter lived inside
+the custom all-reduce communicator, `SGLANG_MUSA_CUSTOM_AR_GRAPH_REGISTERED_INPUT`
+is also honored when the RS-specific variable is unset.
 
 ## Test
 

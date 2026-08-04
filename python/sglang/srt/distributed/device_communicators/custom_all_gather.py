@@ -97,6 +97,7 @@ class MusaJitCustomAllGather:
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
     _MAX_CAG_SIZE = 512 * 1024 * 1024
     _MULTI_RANK_FAST_SIZE = 2 * 1024 * 1024
+    requires_graph_capture_registration_recapture = True
 
     def __init__(
         self,
@@ -114,7 +115,15 @@ class MusaJitCustomAllGather:
         self._opened_ipc_ptrs: dict[bytes, int] = {}
         self._last_input_ptr: Optional[int] = None
         self._last_rank_data: Optional[torch.Tensor] = None
-        self._graph_inputs: dict[int, torch.Tensor] = {}
+        self._graph_inputs: list[torch.Tensor] = []
+        self._graph_registered_input_sequence: list[
+            tuple[tuple[object, ...], int, torch.Tensor]
+        ] = []
+        self._graph_registered_sequence_signature: tuple[
+            tuple[tuple[object, ...], tuple[int, ...]], ...
+        ] = ()
+        self._graph_registered_cursor = 0
+        self._graph_registered_miss = False
         self._registered_launcher = None
         self._unregistered_launcher = None
 
@@ -168,6 +177,10 @@ class MusaJitCustomAllGather:
     def capture(self):
         try:
             self._graph_inputs.clear()
+            self._graph_registered_input_sequence.clear()
+            self._graph_registered_sequence_signature = ()
+            self._graph_registered_cursor = 0
+            self._graph_registered_miss = False
             self._IS_CAPTURING = True
             yield
         finally:
@@ -289,14 +302,160 @@ class MusaJitCustomAllGather:
         self._last_rank_data = rank_data
         return rank_data
 
-    def _record_graph_input(self, inp: torch.Tensor) -> None:
-        self._graph_inputs.setdefault(int(inp.data_ptr()), inp)
+    def _local_ipc_record_for_input(self, inp: torch.Tensor) -> tuple[int, bytes, int]:
+        ptr_value = int(inp.data_ptr())
+        base_value, offset = self._get_base_ptr_and_offset(inp)
+        handle = CudaRTLibrary().cudaIpcGetMemHandle(ctypes.c_void_p(base_value))
+        return ptr_value, bytes(handle), offset
 
-    def register_graph_buffers(self) -> None:
-        # Do not call should_custom_ag here because output is not available after
-        # capture exits. The runtime path validates before recording inputs.
-        for inp in tuple(self._graph_inputs.values()):
-            self._rank_data_for_input(inp)
+    def _rank_data_from_ipc_records(
+        self, ptr_value: int, records: list[tuple[int, bytes, int]]
+    ) -> torch.Tensor:
+        lib = CudaRTLibrary()
+        ptrs: List[int] = []
+        for index, (_, handle, offset) in enumerate(records):
+            if index == self.rank:
+                ptrs.append(ptr_value)
+                continue
+            opened_base = self._opened_ipc_ptrs.get(handle)
+            if opened_base is None:
+                ipc_handle = cudaIpcMemHandle_t.from_buffer_copy(handle)
+                opened_base = lib.cudaIpcOpenMemHandle(ipc_handle).value
+                self._opened_ipc_ptrs[handle] = opened_base
+            ptrs.append(opened_base + int(offset))
+        ptrs += [0] * (8 - self.world_size)
+        return torch.tensor(ptrs, dtype=torch.int64, device="cpu")
+
+    @staticmethod
+    def _rank_data_ptr_tuple(rank_data: torch.Tensor) -> tuple[int, ...]:
+        return tuple(int(value) for value in rank_data.tolist())
+
+    @staticmethod
+    def _graph_input_signature(inp: torch.Tensor) -> tuple[object, ...]:
+        return (
+            tuple(int(dim) for dim in inp.shape),
+            str(inp.dtype),
+            int(inp.numel()),
+            int(inp.element_size()),
+        )
+
+    def _record_graph_input(self, inp: torch.Tensor) -> None:
+        # Preserve collective invocation order, including duplicate pointers.
+        self._graph_inputs.append(inp)
+
+    def _rank_data_for_registered_graph_input(
+        self, inp: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        self._record_graph_input(inp)
+        signature = self._graph_input_signature(inp)
+        ptr_value = int(inp.data_ptr())
+        cursor = self._graph_registered_cursor
+        self._graph_registered_cursor += 1
+        if cursor < len(self._graph_registered_input_sequence):
+            cached_signature, cached_ptr, rank_data = (
+                self._graph_registered_input_sequence[cursor]
+            )
+            if cached_signature == signature and cached_ptr == ptr_value:
+                return rank_data
+        self._graph_registered_miss = True
+        return None
+
+    def register_graph_buffers(self) -> int:
+        entries = []
+        try:
+            for inp in tuple(self._graph_inputs):
+                signature = self._graph_input_signature(inp)
+                ptr_value, handle, offset = self._local_ipc_record_for_input(inp)
+                entries.append((ptr_value, handle, offset, signature))
+
+            # Exchange one complete ordered entry list per rank. Do not use
+            # all_gather_object here: it is incompatible with Gloo under
+            # inference mode (https://github.com/pytorch/pytorch/issues/126032).
+            all_entries = [None for _ in range(self.world_size)]
+            all_entries[self.rank] = entries
+            ranks = dist.get_process_group_ranks(group=self.group)
+            for index, rank in enumerate(ranks):
+                holder = [all_entries[index]]
+                dist.broadcast_object_list(
+                    holder,
+                    src=rank,
+                    group=self.group,
+                    device="cpu",
+                )
+                all_entries[index] = holder[0]
+            entry_counts = [len(rank_entries or ()) for rank_entries in all_entries]
+            if len(set(entry_counts)) != 1:
+                raise RuntimeError(
+                    "MUSA JIT custom all-gather graph input registration "
+                    f"mismatch: rank entry counts are {entry_counts}."
+                )
+
+            new_sequence = []
+            new_sequence_signature = []
+            for index, (ptr_value, _, _, signature) in enumerate(entries):
+                rank_records = []
+                rank_signatures = []
+                for rank_entries in all_entries:
+                    peer_ptr, peer_handle, peer_offset, peer_signature = rank_entries[
+                        index
+                    ]
+                    rank_records.append((peer_ptr, peer_handle, peer_offset))
+                    rank_signatures.append(peer_signature)
+
+                if any(
+                    peer_signature != signature for peer_signature in rank_signatures
+                ):
+                    raise RuntimeError(
+                        "MUSA JIT custom all-gather graph input registration "
+                        f"order mismatch at entry {index}: {rank_signatures}."
+                    )
+
+                rank_data = self._rank_data_from_ipc_records(ptr_value, rank_records)
+                new_sequence.append((signature, ptr_value, rank_data))
+                new_sequence_signature.append(
+                    (signature, self._rank_data_ptr_tuple(rank_data))
+                )
+                self._rank_data_cache[ptr_value] = rank_data
+                self._rank_data_refs[ptr_value] = weakref.ref(self._graph_inputs[index])
+                self._last_input_ptr = ptr_value
+                self._last_rank_data = rank_data
+
+            new_sequence_signature_tuple = tuple(new_sequence_signature)
+            registered = int(
+                self._graph_registered_sequence_signature
+                != new_sequence_signature_tuple
+                or self._graph_registered_miss
+            )
+            self._graph_registered_input_sequence = new_sequence
+            self._graph_registered_sequence_signature = (
+                new_sequence_signature_tuple
+            )
+            self._graph_registered_cursor = 0
+            self._graph_registered_miss = False
+            return registered
+        finally:
+            self._graph_inputs.clear()
+
+    def begin_graph_capture_registration(self) -> None:
+        self._graph_inputs.clear()
+        self._graph_registered_input_sequence.clear()
+        self._graph_registered_sequence_signature = ()
+        self._graph_registered_cursor = 0
+        self._graph_registered_miss = False
+
+    def end_graph_capture_registration(self) -> None:
+        self._graph_inputs.clear()
+        self._graph_registered_input_sequence.clear()
+        self._graph_registered_sequence_signature = ()
+        self._graph_registered_cursor = 0
+        self._graph_registered_miss = False
+
+    def prepare_graph_capture(self) -> None:
+        self._graph_registered_cursor = 0
+        self._graph_registered_miss = False
+
+    def prepare_graph_replay(self) -> None:
+        self._graph_registered_cursor = 0
 
     def _launch_registered(
         self, rank_data: torch.Tensor, output: torch.Tensor, inp: torch.Tensor
@@ -371,15 +530,13 @@ class MusaJitCustomAllGather:
             and torch.get_device_module().is_current_stream_capturing()
         )
         if self._IS_CAPTURING:
-            self._record_graph_input(inp)
             if is_graph_launch:
-                rank_data = self._cached_rank_data_for_input(inp)
+                rank_data = self._rank_data_for_registered_graph_input(inp)
                 if rank_data is not None:
                     self._launch_registered(rank_data, output, inp)
                 else:
                     self._launch_unregistered(output, inp)
             else:
-                self._rank_data_for_input(inp)
                 self._launch_unregistered(output, inp)
         else:
             # Normal eager currently uses the unregistered path. Registered
@@ -397,6 +554,10 @@ class MusaJitCustomAllGather:
             self._rank_data_cache.clear()
             self._rank_data_refs.clear()
             self._graph_inputs.clear()
+            self._graph_registered_input_sequence.clear()
+            self._graph_registered_sequence_signature = ()
+            self._graph_registered_cursor = 0
+            self._graph_registered_miss = False
             _free_shared_buffer(self.buffer_ptrs, group=self.group)
             _free_shared_buffer(self.meta_ptrs, group=self.group)
         self.disabled = True

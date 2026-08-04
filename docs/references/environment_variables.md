@@ -49,6 +49,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_CUSTOM_ALLREDUCE_ALGO` | The algorithm of custom all-reduce. Set to `oneshot` or `1stage` to force use one-shot. Set to `twoshot` or `2stage` to force use two-shot. | `` |
 | `SGLANG_MUSA_USE_JIT_ALL_GATHER` | Enable the node-local MUSA JIT custom all-gather path. | `false` |
 | `SGLANG_MUSA_USE_JIT_REDUCE_SCATTER` | Enable the node-local MUSA JIT custom reduce-scatter d3 path for the attention TP group. This gate is independent of custom all-gather. | `false` |
+| `SGLANG_MUSA_CUSTOM_RS_GRAPH_REGISTERED_INPUT` | Use registered peer input addresses for graph-captured MUSA d3 reduce-scatter. Disable it to retain the IPC staging path. | `true` |
 | `SGLANG_MUSA_COLLECTIVE_OBSERVABILITY` | Log the selected MUSA all-gather and reduce-scatter routes, including CUDA graph capture and replay phases. | `false` |
 | `SGLANG_MUSA_COLLECTIVE_OBSERVABILITY_MAX_EVENTS` | Maximum number of detailed MUSA collective route events to log per process. | `200` |
 | `SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR` | Skip-softmax threshold scale factor for TRT-LLM prefill attention in flashinfer. `None` means standard attention. See https://arxiv.org/abs/2512.12087 | `None` |

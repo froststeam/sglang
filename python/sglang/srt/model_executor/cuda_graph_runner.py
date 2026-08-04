@@ -1023,7 +1023,7 @@ class CudaGraphRunner:
             return BreakableCUDAGraph()
         return torch.cuda.CUDAGraph()
 
-    def _custom_allreduce_graph_groups(self) -> List[GroupCoordinator]:
+    def _graph_capture_groups(self) -> List[GroupCoordinator]:
         groups = [self.model_runner.tp_group]
         for get_group in (get_moe_ep_group, get_moe_tp_group, get_attn_tp_group):
             try:
@@ -1032,24 +1032,56 @@ class CudaGraphRunner:
                 pass
 
         unique_groups = []
-        seen_comms = set()
+        seen_groups = set()
         for group in groups:
-            ca_comm = getattr(group, "ca_comm", None)
-            if ca_comm is None or id(ca_comm) in seen_comms:
+            if group is None or id(group) in seen_groups:
                 continue
-            if not getattr(
-                ca_comm, "requires_graph_capture_registration_recapture", False
-            ):
-                continue
-            seen_comms.add(id(ca_comm))
+            seen_groups.add(id(group))
             unique_groups.append(group)
         return unique_groups
 
-    def _register_one_custom_allreduce_graph_buffers(
-        self, group: GroupCoordinator
+    def _graph_capture_comms(
+        self, *, require_registration_recapture: bool = False
+    ) -> List[tuple[GroupCoordinator, object]]:
+        """Return the unique custom collective communicators for graph capture.
+
+        ``attention_tp`` can expose separate communicators for all-reduce,
+        all-gather, and reduce-scatter.  Keep the graph lifecycle generic so
+        that each communicator can opt into registration/recapture without
+        coupling the runner to one particular collective implementation.
+        """
+        unique_pairs = []
+        seen_comms = set()
+        lifecycle_methods = (
+            "prepare_graph_capture",
+            "prepare_graph_replay",
+            "begin_graph_capture_registration",
+            "end_graph_capture_registration",
+        )
+
+        for group in self._graph_capture_groups():
+            for attr_name in ("ca_comm", "cag_comm", "crs_comm"):
+                comm = getattr(group, attr_name, None)
+                if comm is None or id(comm) in seen_comms:
+                    continue
+                if require_registration_recapture:
+                    if not getattr(
+                        comm, "requires_graph_capture_registration_recapture", False
+                    ):
+                        continue
+                elif not any(
+                    getattr(comm, method_name, None) is not None
+                    for method_name in lifecycle_methods
+                ):
+                    continue
+                seen_comms.add(id(comm))
+                unique_pairs.append((group, comm))
+        return unique_pairs
+
+    def _register_one_custom_collective_graph_buffers(
+        self, group: GroupCoordinator, comm: object
     ) -> int:
-        ca_comm = group.ca_comm
-        count = ca_comm.register_graph_buffers()
+        count = comm.register_graph_buffers()
         local_count = count if isinstance(count, int) else 0
         if dist.is_initialized():
             count_tensor = torch.tensor([local_count], dtype=torch.int64)
@@ -1057,45 +1089,75 @@ class CudaGraphRunner:
             dist.all_reduce(
                 count_tensor,
                 op=dist.ReduceOp.MAX,
-                group=sync_group or ca_comm.group,
+                group=sync_group or getattr(comm, "group", None),
             )
             return int(count_tensor.item())
         return local_count
 
     def _register_custom_allreduce_graph_buffers(self) -> int:
         registered = 0
-        for group in self._custom_allreduce_graph_groups():
-            registered += self._register_one_custom_allreduce_graph_buffers(group)
-        return registered
+        for group, comm in self._graph_capture_comms(
+            require_registration_recapture=True
+        ):
+            registered += self._register_one_custom_collective_graph_buffers(
+                group, comm
+            )
+        return self._sync_custom_collective_registration_count(registered)
+
+    def _sync_custom_collective_registration_count(self, registered: int) -> int:
+        """Synchronize the recapture decision across the complete TP group.
+
+        Individual custom communicators already synchronize their registration
+        count within their own subgroup.  Attention-TP communicators can,
+        however, partition a full TP group into multiple subgroups, so a
+        subgroup-local miss must force every TP rank to recapture.  Use the TP
+        coordinator's CPU process group for this final MAX reduction.
+        """
+        if not dist.is_initialized():
+            return registered
+
+        tp_group = getattr(self.model_runner, "tp_group", None)
+        sync_group = getattr(tp_group, "cpu_group", None)
+        if sync_group is None:
+            # Keep lightweight fake/coordinator implementations usable while
+            # preferring the real CPU group whenever it is available.
+            sync_group = getattr(tp_group, "group", None)
+        if sync_group is None:
+            raise RuntimeError(
+                "Cannot synchronize custom collective graph registration: "
+                "the TP group has no CPU synchronization process group."
+            )
+
+        count_tensor = torch.tensor(
+            [registered], dtype=torch.int64, device="cpu"
+        )
+        dist.all_reduce(count_tensor, op=dist.ReduceOp.MAX, group=sync_group)
+        return int(count_tensor.item())
 
     def _prepare_custom_allreduce_graph_replay(self) -> None:
-        for group in self._custom_allreduce_graph_groups():
-            ca_comm = getattr(group, "ca_comm", None)
-            prepare_graph_replay = getattr(ca_comm, "prepare_graph_replay", None)
+        for _, comm in self._graph_capture_comms():
+            prepare_graph_replay = getattr(comm, "prepare_graph_replay", None)
             if prepare_graph_replay is not None:
                 prepare_graph_replay()
 
     def _prepare_custom_allreduce_graph_capture(self) -> None:
-        for group in self._custom_allreduce_graph_groups():
-            ca_comm = getattr(group, "ca_comm", None)
-            prepare_graph_capture = getattr(ca_comm, "prepare_graph_capture", None)
+        for _, comm in self._graph_capture_comms():
+            prepare_graph_capture = getattr(comm, "prepare_graph_capture", None)
             if prepare_graph_capture is not None:
                 prepare_graph_capture()
 
     def _begin_custom_allreduce_graph_capture_registration(self) -> None:
-        for group in self._custom_allreduce_graph_groups():
-            ca_comm = getattr(group, "ca_comm", None)
+        for _, comm in self._graph_capture_comms():
             begin_graph_capture_registration = getattr(
-                ca_comm, "begin_graph_capture_registration", None
+                comm, "begin_graph_capture_registration", None
             )
             if begin_graph_capture_registration is not None:
                 begin_graph_capture_registration()
 
     def _end_custom_allreduce_graph_capture_registration(self) -> None:
-        for group in self._custom_allreduce_graph_groups():
-            ca_comm = getattr(group, "ca_comm", None)
+        for _, comm in self._graph_capture_comms():
             end_graph_capture_registration = getattr(
-                ca_comm, "end_graph_capture_registration", None
+                comm, "end_graph_capture_registration", None
             )
             if end_graph_capture_registration is not None:
                 end_graph_capture_registration()
@@ -1344,7 +1406,7 @@ class CudaGraphRunner:
                     break
                 if attempt == max_graph_register_recaptures:
                     raise RuntimeError(
-                        "MUSA JIT custom allreduce registered "
+                        "MUSA JIT custom collective registered "
                         f"{registered} graph buffers after "
                         f"{max_graph_register_recaptures + 1} capture attempts. "
                         "Refusing to keep a graph that may contain placeholder outputs."
@@ -1352,7 +1414,7 @@ class CudaGraphRunner:
                 log_info_on_rank0(
                     logger,
                     "Registered "
-                    f"{registered} MUSA JIT custom allreduce graph buffers; "
+                    f"{registered} MUSA JIT custom collective graph buffers; "
                     "recapturing CUDA graph to use the registered path.",
                 )
                 graph = None

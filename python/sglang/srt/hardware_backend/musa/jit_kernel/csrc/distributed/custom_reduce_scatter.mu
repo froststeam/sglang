@@ -300,12 +300,16 @@ __device__ __forceinline__ P packed_reduce_scatter_mccl_compatible(const P* ptrs
 template <typename T, int nranks, bool mccl_compatible>
 __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) cross_device_reduce_scatter(
     RankData data,
+    const RankData* data_ptr,
     RankSignals sg,
     Signal* self_sg,
     T* __restrict__ out,
     int rank,
     int shard_size,
     int mode) {
+  if (data_ptr != nullptr) {
+    data = *data_ptr;
+  }
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
   const int pack = packed_t<T>::P::size;
@@ -348,6 +352,7 @@ int select_block_limit(int packed_shard_size) {
 template <typename T, int nranks, bool mccl_compatible>
 void launch_rs(
     RankData data,
+    const RankData* data_ptr,
     RankSignals sg,
     Signal* self_sg,
     T* out,
@@ -364,12 +369,13 @@ void launch_rs(
     return;
   }
   cross_device_reduce_scatter<T, nranks, mccl_compatible><<<blocks, kDefaultThreads, 0, stream>>>(
-      data, sg, self_sg, out, rank, shard_size, mode);
+      data, data_ptr, sg, self_sg, out, rank, shard_size, mode);
 }
 
 template <typename T>
 void dispatch_world_size(
     RankData data,
+    const RankData* data_ptr,
     RankSignals sg,
     Signal* self_sg,
     T* out,
@@ -382,30 +388,30 @@ void dispatch_world_size(
   switch (world_size) {
     case 2:
       if (mccl_compatible) {
-        launch_rs<T, 2, true>(data, sg, self_sg, out, rank, shard_size, mode, stream);
+        launch_rs<T, 2, true>(data, data_ptr, sg, self_sg, out, rank, shard_size, mode, stream);
       } else {
-        launch_rs<T, 2, false>(data, sg, self_sg, out, rank, shard_size, mode, stream);
+        launch_rs<T, 2, false>(data, data_ptr, sg, self_sg, out, rank, shard_size, mode, stream);
       }
       break;
     case 4:
       if (mccl_compatible) {
-        launch_rs<T, 4, true>(data, sg, self_sg, out, rank, shard_size, mode, stream);
+        launch_rs<T, 4, true>(data, data_ptr, sg, self_sg, out, rank, shard_size, mode, stream);
       } else {
-        launch_rs<T, 4, false>(data, sg, self_sg, out, rank, shard_size, mode, stream);
+        launch_rs<T, 4, false>(data, data_ptr, sg, self_sg, out, rank, shard_size, mode, stream);
       }
       break;
     case 6:
       if (mccl_compatible) {
-        launch_rs<T, 6, true>(data, sg, self_sg, out, rank, shard_size, mode, stream);
+        launch_rs<T, 6, true>(data, data_ptr, sg, self_sg, out, rank, shard_size, mode, stream);
       } else {
-        launch_rs<T, 6, false>(data, sg, self_sg, out, rank, shard_size, mode, stream);
+        launch_rs<T, 6, false>(data, data_ptr, sg, self_sg, out, rank, shard_size, mode, stream);
       }
       break;
     case 8:
       if (mccl_compatible) {
-        launch_rs<T, 8, true>(data, sg, self_sg, out, rank, shard_size, mode, stream);
+        launch_rs<T, 8, true>(data, data_ptr, sg, self_sg, out, rank, shard_size, mode, stream);
       } else {
-        launch_rs<T, 8, false>(data, sg, self_sg, out, rank, shard_size, mode, stream);
+        launch_rs<T, 8, false>(data, data_ptr, sg, self_sg, out, rank, shard_size, mode, stream);
       }
       break;
     default:
@@ -472,16 +478,120 @@ void sgl_musa_custom_rs_launch_unregistered_impl(
   const int shard_size = static_cast<int>(shard_numel64);
 
   if (dtype_equal(out.dtype(), dl_float16)) {
-    dispatch_world_size(data, sg, self_sg, static_cast<half*>(out.data_ptr()), static_cast<int>(rank), static_cast<int>(world_size), shard_size, mccl_compatible, mode, stream);
+    dispatch_world_size(data, nullptr, sg, self_sg, static_cast<half*>(out.data_ptr()), static_cast<int>(rank), static_cast<int>(world_size), shard_size, mccl_compatible, mode, stream);
   } else if (dtype_equal(out.dtype(), dl_bfloat16)) {
-    dispatch_world_size(data, sg, self_sg, static_cast<__mt_bfloat16*>(out.data_ptr()), static_cast<int>(rank), static_cast<int>(world_size), shard_size, mccl_compatible, mode, stream);
+    dispatch_world_size(data, nullptr, sg, self_sg, static_cast<__mt_bfloat16*>(out.data_ptr()), static_cast<int>(rank), static_cast<int>(world_size), shard_size, mccl_compatible, mode, stream);
   } else if (dtype_equal(out.dtype(), dl_float32)) {
-    dispatch_world_size(data, sg, self_sg, static_cast<float*>(out.data_ptr()), static_cast<int>(rank), static_cast<int>(world_size), shard_size, mccl_compatible, mode, stream);
+    dispatch_world_size(data, nullptr, sg, self_sg, static_cast<float*>(out.data_ptr()), static_cast<int>(rank), static_cast<int>(world_size), shard_size, mccl_compatible, mode, stream);
   } else {
     TVM_FFI_THROW(ValueError) << "custom rs only supports fp16/bf16/fp32";
   }
   const musaError_t err = musaGetLastError();
   TVM_FFI_ICHECK_EQ(err, musaSuccess) << "MUSA custom RS kernel failed: " << musaGetErrorString(err);
+}
+
+void sgl_musa_custom_rs_launch_registered_impl(
+    ffi::TensorView rank_data,
+    ffi::TensorView signal_ptrs_cpu,
+    ffi::TensorView out,
+    int64_t self_signal_ptr,
+    int64_t rank,
+    int64_t world_size,
+    bool mccl_compatible,
+    int mode) {
+  CHECK_MUSA_CONTIGUOUS(out);
+  TVM_FFI_ICHECK_EQ(
+      rank_data.device().device_type, out.device().device_type);
+  TVM_FFI_ICHECK_EQ(rank_data.device().device_id, out.device().device_id);
+  TVM_FFI_ICHECK(rank_data.IsContiguous());
+  TVM_FFI_ICHECK(dtype_equal(rank_data.dtype(), dl_int64));
+  TVM_FFI_ICHECK_GE(rank_data.size(0), kMaxRanks);
+  TVM_FFI_ICHECK_EQ(signal_ptrs_cpu.device().device_type, kDLCPU);
+  TVM_FFI_ICHECK(signal_ptrs_cpu.IsContiguous());
+  TVM_FFI_ICHECK(dtype_equal(signal_ptrs_cpu.dtype(), dl_int64));
+  TVM_FFI_ICHECK_GE(signal_ptrs_cpu.size(0), world_size);
+  TVM_FFI_ICHECK(rank >= 0 && rank < world_size);
+
+  RankSignals sg{};
+  const auto* sig_ptrs = static_cast<const int64_t*>(signal_ptrs_cpu.data_ptr());
+  for (int i = 0; i < world_size; ++i) {
+    sg.signals[i] = reinterpret_cast<Signal*>(sig_ptrs[i]);
+  }
+  RankData data{};
+  const auto* device_data_ptr =
+      reinterpret_cast<const RankData*>(rank_data.data_ptr());
+  auto* self_sg = reinterpret_cast<Signal*>(self_signal_ptr);
+  auto stream = get_stream(out.device());
+  const int64_t shard_numel64 = tensor_numel(out);
+  TVM_FFI_ICHECK_LE(shard_numel64, static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
+  const int shard_size = static_cast<int>(shard_numel64);
+
+  if (dtype_equal(out.dtype(), dl_float16)) {
+    dispatch_world_size(data, device_data_ptr, sg, self_sg, static_cast<half*>(out.data_ptr()), static_cast<int>(rank), static_cast<int>(world_size), shard_size, mccl_compatible, mode, stream);
+  } else if (dtype_equal(out.dtype(), dl_bfloat16)) {
+    dispatch_world_size(data, device_data_ptr, sg, self_sg, static_cast<__mt_bfloat16*>(out.data_ptr()), static_cast<int>(rank), static_cast<int>(world_size), shard_size, mccl_compatible, mode, stream);
+  } else if (dtype_equal(out.dtype(), dl_float32)) {
+    dispatch_world_size(data, device_data_ptr, sg, self_sg, static_cast<float*>(out.data_ptr()), static_cast<int>(rank), static_cast<int>(world_size), shard_size, mccl_compatible, mode, stream);
+  } else {
+    TVM_FFI_THROW(ValueError) << "custom rs only supports fp16/bf16/fp32";
+  }
+  const musaError_t err = musaGetLastError();
+  TVM_FFI_ICHECK_EQ(err, musaSuccess) << "MUSA registered custom RS kernel failed: " << musaGetErrorString(err);
+}
+
+void sgl_musa_custom_rs_launch_registered(
+    ffi::TensorView rank_data,
+    ffi::TensorView signal_ptrs_cpu,
+    ffi::TensorView out,
+    int64_t self_signal_ptr,
+    int64_t rank,
+    int64_t world_size) {
+  sgl_musa_custom_rs_launch_registered_impl(
+      rank_data, signal_ptrs_cpu, out, self_signal_ptr, rank, world_size, false, 0);
+}
+
+void sgl_musa_custom_rs_launch_registered_mccl_compatible(
+    ffi::TensorView rank_data,
+    ffi::TensorView signal_ptrs_cpu,
+    ffi::TensorView out,
+    int64_t self_signal_ptr,
+    int64_t rank,
+    int64_t world_size) {
+  sgl_musa_custom_rs_launch_registered_impl(
+      rank_data, signal_ptrs_cpu, out, self_signal_ptr, rank, world_size, true, 1);
+}
+
+void sgl_musa_custom_rs_launch_registered_empirical(
+    ffi::TensorView rank_data,
+    ffi::TensorView signal_ptrs_cpu,
+    ffi::TensorView out,
+    int64_t self_signal_ptr,
+    int64_t rank,
+    int64_t world_size) {
+  sgl_musa_custom_rs_launch_registered_impl(
+      rank_data, signal_ptrs_cpu, out, self_signal_ptr, rank, world_size, true, 2);
+}
+
+void sgl_musa_custom_rs_launch_registered_rotated(
+    ffi::TensorView rank_data,
+    ffi::TensorView signal_ptrs_cpu,
+    ffi::TensorView out,
+    int64_t self_signal_ptr,
+    int64_t rank,
+    int64_t world_size) {
+  sgl_musa_custom_rs_launch_registered_impl(
+      rank_data, signal_ptrs_cpu, out, self_signal_ptr, rank, world_size, true, 3);
+}
+
+void sgl_musa_custom_rs_launch_registered_chunked(
+    ffi::TensorView rank_data,
+    ffi::TensorView signal_ptrs_cpu,
+    ffi::TensorView out,
+    int64_t self_signal_ptr,
+    int64_t rank,
+    int64_t world_size) {
+  sgl_musa_custom_rs_launch_registered_impl(
+      rank_data, signal_ptrs_cpu, out, self_signal_ptr, rank, world_size, true, 4);
 }
 
 void sgl_musa_custom_rs_launch_unregistered(
@@ -555,6 +665,19 @@ void sgl_musa_custom_rs_launch_unregistered_chunked(
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sgl_musa_custom_rs_meta_size, sgl_musa_custom_rs_meta_size);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(sgl_musa_custom_rs_launch_registered, sgl_musa_custom_rs_launch_registered);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(
+    sgl_musa_custom_rs_launch_registered_mccl_compatible,
+    sgl_musa_custom_rs_launch_registered_mccl_compatible);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(
+    sgl_musa_custom_rs_launch_registered_empirical,
+    sgl_musa_custom_rs_launch_registered_empirical);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(
+    sgl_musa_custom_rs_launch_registered_rotated,
+    sgl_musa_custom_rs_launch_registered_rotated);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(
+    sgl_musa_custom_rs_launch_registered_chunked,
+    sgl_musa_custom_rs_launch_registered_chunked);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sgl_musa_custom_rs_launch_unregistered, sgl_musa_custom_rs_launch_unregistered);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(
     sgl_musa_custom_rs_launch_unregistered_mccl_compatible,

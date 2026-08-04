@@ -43,7 +43,7 @@ def _compile_config(world_size: int) -> CompileConfig:
 
 def _compile_name(config: CompileConfig) -> str:
     return (
-        "sglang_musa_custom_reduce_scatter_v7"
+        "sglang_musa_custom_reduce_scatter_v8"
         f"_t{config.threads}_b{config.blocks}"
         f"_mb{config.max_blocks}_db{config.dynamic_blocks}"
     )
@@ -109,3 +109,9 @@ def launch_d3_func(world_size: int):
     return _custom_rs_module(
         int(world_size)
     ).sgl_musa_custom_rs_launch_unregistered_chunked
+
+
+def launch_registered_d3_func(world_size: int):
+    return _custom_rs_module(
+        int(world_size)
+    ).sgl_musa_custom_rs_launch_registered_chunked

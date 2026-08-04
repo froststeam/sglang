@@ -49,6 +49,7 @@ from sglang.srt.speculative.multi_layer_eagle_utils import assign_new_state_trit
 from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
@@ -300,6 +301,43 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
     def capture(self):
         CudaGraphRunner.capture(self)
 
+    # This runner intentionally does not inherit CudaGraphRunner, but shares
+    # its custom collective graph-registration lifecycle.  Delegate the
+    # generic helpers explicitly so AG/AR/RS communicators are handled during
+    # draft graph capture and replay as well.
+    def _graph_capture_groups(self):
+        return CudaGraphRunner._graph_capture_groups(self)
+
+    def _graph_capture_comms(self, *, require_registration_recapture: bool = False):
+        return CudaGraphRunner._graph_capture_comms(
+            self, require_registration_recapture=require_registration_recapture
+        )
+
+    def _register_one_custom_collective_graph_buffers(self, group, comm) -> int:
+        return CudaGraphRunner._register_one_custom_collective_graph_buffers(
+            self, group, comm
+        )
+
+    def _register_custom_allreduce_graph_buffers(self) -> int:
+        return CudaGraphRunner._register_custom_allreduce_graph_buffers(self)
+
+    def _sync_custom_collective_registration_count(self, registered: int) -> int:
+        return CudaGraphRunner._sync_custom_collective_registration_count(
+            self, registered
+        )
+
+    def _prepare_custom_allreduce_graph_replay(self) -> None:
+        CudaGraphRunner._prepare_custom_allreduce_graph_replay(self)
+
+    def _prepare_custom_allreduce_graph_capture(self) -> None:
+        CudaGraphRunner._prepare_custom_allreduce_graph_capture(self)
+
+    def _begin_custom_allreduce_graph_capture_registration(self) -> None:
+        CudaGraphRunner._begin_custom_allreduce_graph_capture_registration(self)
+
+    def _end_custom_allreduce_graph_capture_registration(self) -> None:
+        CudaGraphRunner._end_custom_allreduce_graph_capture_registration(self)
+
     def get_forward_batch(self, bs: int) -> ForwardBatch:
         buffers = self.buffers
         num_tokens = bs * self.num_tokens_per_bs
@@ -407,7 +445,6 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
 
     def capture_one_batch_size(self, bs: int, forward: Callable, stream_idx: int = 0):
         buffers = self.buffers
-        graph = self._create_graph()
         stream = self.stream
 
         self.deepep_adapter.capture(is_extend_in_batch=True)
@@ -511,17 +548,51 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
 
         self._capture_init(run_once)
 
-        with collective_observability.graph_capture_scope(
-            runner=type(self).__name__,
-            forward_mode=self.forward_mode.name.lower(),
-            phase=f"draft_extend_decode_step_{self.step}",
-            batch_size=bs,
-            mtp_step=self.step,
-        ) as capture_record:
-            out = self._capture_graph(
-                graph, get_global_graph_memory_pool(), stream, run_once
-            )
-        self._last_collective_manifest = capture_record.manifest
+        max_graph_register_recaptures = 2
+        graph = None
+        out = None
+        self._begin_custom_allreduce_graph_capture_registration()
+        try:
+            for attempt in range(max_graph_register_recaptures + 1):
+                graph = self._create_graph()
+                self._prepare_custom_allreduce_graph_capture()
+                with collective_observability.graph_capture_scope(
+                    runner=type(self).__name__,
+                    forward_mode=self.forward_mode.name.lower(),
+                    phase=f"draft_extend_decode_step_{self.step}",
+                    batch_size=bs,
+                    mtp_step=self.step,
+                    attempt=attempt,
+                ) as capture_record:
+                    out = self._capture_graph(
+                        graph, get_global_graph_memory_pool(), stream, run_once
+                    )
+                self._last_collective_manifest = capture_record.manifest
+                registered = self._register_custom_allreduce_graph_buffers()
+                if registered == 0:
+                    break
+                if attempt == max_graph_register_recaptures:
+                    raise RuntimeError(
+                        "MUSA JIT custom collective registered "
+                        f"{registered} graph buffers after "
+                        f"{max_graph_register_recaptures + 1} capture attempts. "
+                        "Refusing to keep a graph that may contain placeholder outputs."
+                    )
+                log_info_on_rank0(
+                    logger,
+                    "Registered "
+                    f"{registered} MUSA JIT custom collective graph buffers; "
+                    "recapturing CUDA graph to use the registered path.",
+                )
+                graph = None
+                out = None
+                torch.get_device_module(self.model_runner.device).synchronize()
+                self.model_runner.tp_group.barrier()
+        finally:
+            self._end_custom_allreduce_graph_capture_registration()
+
+        if graph is None or out is None:
+            raise RuntimeError("Failed to capture CUDA graph")
 
         set_global_graph_memory_pool(graph.pool())
         return graph, out
@@ -612,6 +683,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         # Replay
         self.raw_bs = raw_bs
         self.bs = bs
+        self._prepare_custom_allreduce_graph_replay()
         collective_observability.record_graph_replay(
             self.collective_manifests.get(bs),
             runner=type(self).__name__,
