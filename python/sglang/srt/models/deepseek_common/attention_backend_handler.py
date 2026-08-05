@@ -3,7 +3,7 @@ from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
 )
-from sglang.srt.models.deepseek_common.utils import _is_hip
+from sglang.srt.models.deepseek_common.utils import _is_hip, _is_musa
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import use_intel_amx_backend
 
@@ -101,11 +101,16 @@ def handle_attention_flashinfer(attn, forward_batch):
 
 
 def handle_attention_fa3(attn, forward_batch):
-    # when deterministic inference is enabled, use MLA
     if get_global_server_args().enable_deterministic_inference:
+        if _is_musa and forward_batch.forward_mode.is_extend_without_speculative():
+            # MUSA deterministic DeepSeek FA3 serializes requests in ServerArgs.
+            # Ignore the normal prefix threshold so cached and uncached prefills
+            # use the same MHA formulation whenever one-shot capacity allows it.
+            if _support_mha_one_shot(attn, forward_batch, "fa3"):
+                return AttnForwardMethod.MHA_ONE_SHOT
+            return AttnForwardMethod.MHA_CHUNKED_KV
         return _dispatch_mla_subtype(attn, forward_batch)
-    else:
-        return _handle_attention_backend(attn, forward_batch, "fa3")
+    return _handle_attention_backend(attn, forward_batch, "fa3")
 
 
 def handle_attention_flashmla(attn, forward_batch):

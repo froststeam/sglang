@@ -731,10 +731,12 @@ def make_layers_non_pp(
 def get_dispatch_device_backend():
     if is_cuda_alike():
         dispatch_key = "CUDA"
+    elif is_musa():
+        dispatch_key = "PrivateUse1"
     elif is_xpu():
         dispatch_key = "XPU"
     else:
-        raise RuntimeError("No supported accelerator (CUDA/XPU) available")
+        raise RuntimeError("No supported accelerator (CUDA/MUSA/XPU) available")
     return dispatch_key
 
 

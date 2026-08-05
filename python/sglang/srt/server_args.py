@@ -42,6 +42,7 @@ from sglang.srt.utils.common import (
     get_device_memory_capacity,
     get_device_name,
     get_device_sm,
+    get_int_env_var,
     get_nvidia_driver_version,
     get_quantization_config,
     has_fp8_weights_in_checkpoint,
@@ -174,6 +175,56 @@ ATTENTION_BACKEND_CHOICES = [
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
+
+DETERMINISTIC_PREFILL_TRUNCATION_ALIGN_CONFIG = {
+    "flashinfer": ("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096),
+    "triton": ("SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE", 4096),
+}
+
+
+def get_deterministic_prefill_truncation_align_size(attention_backend):
+    config = DETERMINISTIC_PREFILL_TRUNCATION_ALIGN_CONFIG.get(attention_backend)
+    if config is None:
+        return None
+    env_var, default_size = config
+    return get_int_env_var(env_var, default_size)
+
+
+def get_musa_deterministic_prefill_truncation_align_size(
+    attention_backend, chunked_prefill_size, page_size
+):
+    align_size = get_deterministic_prefill_truncation_align_size(attention_backend)
+    if (
+        attention_backend != "triton"
+        or align_size is None
+        or chunked_prefill_size is None
+        or chunked_prefill_size <= 0
+    ):
+        return align_size
+
+    # ServerArgs deterministic handling runs before the default page size is
+    # finalized. The scheduler calls this helper again with the final value.
+    if page_size is None:
+        return min(align_size, chunked_prefill_size)
+
+    if chunked_prefill_size % page_size != 0:
+        raise ValueError(
+            "MUSA deterministic chunked_prefill_size must be a "
+            f"multiple of page_size={page_size}, got {chunked_prefill_size}"
+        )
+
+    if align_size <= 0 or align_size % page_size != 0:
+        raise ValueError(
+            "SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE must be a "
+            f"positive multiple of page_size={page_size}, got {align_size}"
+        )
+
+    return min(align_size, chunked_prefill_size)
+
+
+MUSA_DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["fa3", "triton"]
+MUSA_RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
+MUSA_DEFAULT_DETERMINISTIC_ATTENTION_BACKEND = "triton"
 
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori"]
 
@@ -4397,6 +4448,7 @@ class ServerArgs:
                 "Sampling backend is set to pytorch for deterministic inference."
             )
             is_deepseek_model = False
+            model_arch = None
             if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
                 try:
                     hf_config = self.get_model_config().hf_config
@@ -4413,9 +4465,17 @@ class ServerArgs:
                     pass
 
             # Check attention backend
+            musa_deterministic = is_musa()
+            deterministic_backend_choices = (
+                MUSA_DETERMINISTIC_ATTENTION_BACKEND_CHOICES
+                if musa_deterministic
+                else DETERMINISTIC_ATTENTION_BACKEND_CHOICES
+            )
             if self.attention_backend is None:
                 # User didn't specify attention backend, fallback based on GPU architecture
-                if is_sm100_supported() or is_sm120_supported():
+                if musa_deterministic:
+                    self.attention_backend = MUSA_DEFAULT_DETERMINISTIC_ATTENTION_BACKEND
+                elif is_sm100_supported() or is_sm120_supported():
                     # Blackwell and newer architectures
                     if is_deepseek_model:
                         # fallback to triton for DeepSeek models because flashinfer doesn't support deterministic inference for DeepSeek models yet
@@ -4428,20 +4488,52 @@ class ServerArgs:
                     self.attention_backend = "fa3"
                 logger.warning(
                     f"Attention backend not specified. Falling back to '{self.attention_backend}' for deterministic inference. "
-                    f"You can explicitly set --attention-backend to one of {DETERMINISTIC_ATTENTION_BACKEND_CHOICES}."
+                    f"You can explicitly set --attention-backend to one of {deterministic_backend_choices}."
                 )
-            elif self.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:
+            elif self.attention_backend not in deterministic_backend_choices:
                 # User explicitly specified an incompatible attention backend
                 raise ValueError(
-                    f"Currently only {DETERMINISTIC_ATTENTION_BACKEND_CHOICES} attention backends are supported for deterministic inference, "
+                    f"Currently only {deterministic_backend_choices} attention backends are supported for deterministic inference, "
                     f"but you explicitly specified '{self.attention_backend}'."
                 )
+
+            if musa_deterministic:
+                get_musa_deterministic_prefill_truncation_align_size(
+                    self.attention_backend,
+                    self.chunked_prefill_size,
+                    self.page_size,
+                )
+
+                if (
+                    self.attention_backend
+                    not in MUSA_RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND
+                ):
+                    self.disable_radix_cache = True
+                    logger.warning(
+                        "Radix cache is disabled for MUSA deterministic inference "
+                        f"with {self.attention_backend} attention backend. "
+                        f"Currently only {MUSA_RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} "
+                        "have deterministic radix-cache coverage."
+                    )
 
             if is_deepseek_model:
                 if self.attention_backend not in ["fa3", "triton"]:
                     raise ValueError(
                         f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with DeepSeek models. But you're using {self.attention_backend}."
                     )
+                if (
+                    musa_deterministic
+                    and self.attention_backend == "fa3"
+                    and not self.disable_radix_cache
+                    and not self.disable_cuda_graph
+                ):
+                    if not self.disable_cuda_graph_padding:
+                        logger.warning(
+                            "Disable CUDA graph padding for MUSA deterministic "
+                            "FA3 with radix cache because padded replay can "
+                            "change exact logprobs for short-prefix batches."
+                        )
+                    self.disable_cuda_graph_padding = True
 
             if (
                 self.attention_backend
@@ -4455,7 +4547,14 @@ class ServerArgs:
 
             # Check TP size
             if self.tp_size > 1:
-                if is_hip():
+                if is_musa():
+                    self.disable_custom_all_reduce = True
+                    logger.warning(
+                        "Custom all reduce is disabled for MUSA deterministic inference "
+                        "when TP size > 1. Falling back to rank-ordered all-gather "
+                        "and local reduction on the MUSA process group."
+                    )
+                elif is_hip():
                     # AMD: use 1-stage all-reduce kernel which is inherently deterministic
                     # (each GPU reads all data from all GPUs, reduces locally in fixed order)
                     logger.info(

@@ -1,6 +1,7 @@
 # Adapted from https://github.com/thinking-machines-lab/batch_invariant_ops/blob/main/batch_invariant_ops/batch_invariant_ops.py
 
 import contextlib
+import inspect
 from collections import namedtuple
 from collections.abc import Callable
 from typing import Any, Dict, Tuple
@@ -16,6 +17,23 @@ from sglang.srt.utils.common import (
     get_device_core_count,
     get_dispatch_device_backend,
 )
+
+
+def _enable_triton_range_flatten_compat(range_cls=tl.range):
+    if "flatten" in inspect.signature(range_cls).parameters:
+        return False
+
+    original_init = range_cls.__init__
+
+    # Triton before 3.3 does not expose this loop optimization hint.
+    def compatible_init(self, *args, flatten=None, **kwargs):
+        return original_init(self, *args, **kwargs)
+
+    range_cls.__init__ = compatible_init
+    return True
+
+
+_enable_triton_range_flatten_compat()
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
@@ -33,6 +51,49 @@ _ENABLE_MM_COMPARISON_TEST = get_bool_env_var(
 
 if not _ENABLE_MM_DEEPGEMM:
     print("Disable DeepGEMM in batch invariant ops. Performance may be suboptimal.")
+
+
+def _get_device_multi_processor_count(device: torch.device) -> int:
+    if device.type == "musa":
+        return torch.musa.get_device_properties(device).multi_processor_count
+    return get_device_core_count()
+
+
+def _matmul_persistent_configs(device: torch.device):
+    configs = {
+        torch.bfloat16: {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_stages": 3,
+            "num_warps": 8,
+        },
+        torch.float16: {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 256,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_stages": 3,
+            "num_warps": 8,
+        },
+        torch.float32: {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 32,
+            "GROUP_SIZE_M": 8,
+            "num_stages": 3,
+            "num_warps": 8,
+        },
+    }
+    if device.type == "musa":
+        configs[torch.float16]["num_stages"] = 2
+    return configs
+
+
+def _supports_batch_invariant_deepgemm_bf16_nn() -> bool:
+    return ENABLE_JIT_DEEPGEMM and hasattr(deep_gemm, "bf16_gemm_nn")
+
 
 __all__ = [
     "set_batch_invariant_mode",
@@ -174,7 +235,7 @@ def _matmul_persistent_triton(
     assert (
         bias is None or bias.dim() == 1
     ), "Currently assuming bias is 1D, let Horace know if you run into this"
-    NUM_SMS = get_device_core_count()
+    NUM_SMS = _get_device_multi_processor_count(a.device)
     M, K = a.shape
     K, N = b.shape
     dtype = a.dtype
@@ -191,32 +252,7 @@ def _matmul_persistent_triton(
             ),
         )
 
-    configs = {
-        torch.bfloat16: {
-            "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 64,
-            "GROUP_SIZE_M": 8,
-            "num_stages": 3,
-            "num_warps": 8,
-        },
-        torch.float16: {
-            "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 256,
-            "BLOCK_SIZE_K": 64,
-            "GROUP_SIZE_M": 8,
-            "num_stages": 3,
-            "num_warps": 8,
-        },
-        torch.float32: {
-            "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 32,
-            "GROUP_SIZE_M": 8,
-            "num_stages": 3,
-            "num_warps": 8,
-        },
-    }
+    configs = _matmul_persistent_configs(a.device)
     # print(a.device, b.device, c.device)
     matmul_kernel_persistent[grid](
         a,
@@ -250,15 +286,12 @@ def _matmul_persistent_deepgemm(
     dtype = a.dtype
     out = torch.empty((M, N), device=a.device, dtype=dtype)
 
-    try:
-        deep_gemm.bf16_gemm_nn(a, b, out)
-    except RuntimeError as e:
+    if not _supports_batch_invariant_deepgemm_bf16_nn():
         raise RuntimeError(
-            f"DeepGEMM failed for matrix shapes M={M}, N={N}, K={K}. "
-            f"This typically occurs when dimensions are too small for DeepGEMM's TMA descriptors. "
-            f"Consider increasing MIN_DEEPGEMM_DIM in matmul_persistent() or disabling DeepGEMM "
-            f"for small matrices. Original error: {e}"
-        ) from e
+            "DeepGEMM bf16_gemm_nn is unavailable in this environment."
+        )
+
+    deep_gemm.bf16_gemm_nn(a, b, out)
 
     # TODO can this be put in DeepGEMM's `c`?
     if bias is not None:
@@ -278,11 +311,12 @@ def matmul_persistent(
     if (
         _ENABLE_MM_DEEPGEMM
         and ENABLE_JIT_DEEPGEMM
+        and _supports_batch_invariant_deepgemm_bf16_nn()
         and (a.dtype == torch.bfloat16)
         and (b.dtype == torch.bfloat16)
         and a.is_contiguous()
         and b.transpose(0, 1).is_contiguous()
-        and N >= MIN_DEEPGEMM_DIM
+        and min(a.shape[0], K, N) >= MIN_DEEPGEMM_DIM
     ):
         if _ENABLE_MM_COMPARISON_TEST:
             out_triton = _matmul_persistent_triton(a=a, b=b, bias=bias)
@@ -299,6 +333,9 @@ def matmul_persistent(
             # print(f"{a=} {b=} {bias=} {out_triton=} {out_deepgemm=}")
             return out_deepgemm
 
+        # Unsupported APIs and small shapes are handled by the preflight
+        # checks above. Propagate runtime failures because an accelerator
+        # context may no longer be safe for fallback execution.
         return _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
 
     if _ENABLE_MM_FALLBACK_VARIANT:
@@ -738,35 +775,10 @@ def bmm_batch_invariant(a, b, *, out=None):
         else:
             c = out
 
-        NUM_SMS = get_device_core_count()
+        NUM_SMS = _get_device_multi_processor_count(a.device)
 
         # Use fixed kernel configuration for determinism
-        configs = {
-            torch.bfloat16: {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 128,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 8,
-                "num_stages": 3,
-                "num_warps": 8,
-            },
-            torch.float16: {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 256,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 8,
-                "num_stages": 3,
-                "num_warps": 8,
-            },
-            torch.float32: {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 128,
-                "BLOCK_SIZE_K": 32,
-                "GROUP_SIZE_M": 8,
-                "num_stages": 3,
-                "num_warps": 8,
-            },
-        }
+        configs = _matmul_persistent_configs(a.device)
 
         config = configs.get(dtype)
         if config is None:

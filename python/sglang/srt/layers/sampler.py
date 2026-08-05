@@ -549,7 +549,10 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
         # apply log to get logprobs. Therefore, we cannot use log_softmax directly.
         # For now, we use log to the modified probs to get logprobs, but for numerical
         # stability, we'd better come up with a solution to use log_softmax.
-        logprobs = probs_sort.to(torch.float64)  # Using float64 for numerical stability
+        # muDNN 3.3.5 does not implement LOG for float64. Keep the existing
+        # higher-precision path on other platforms and use the widest
+        # supported floating type for seeded MUSA sampling.
+        logprobs = probs_sort.to(torch.float32 if is_musa() else torch.float64)
         del probs_sort
         logprobs.log_()
         sampled_index = multinomial_with_seed(logprobs, sampling_seed, positions)

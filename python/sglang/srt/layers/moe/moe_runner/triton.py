@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -239,6 +240,8 @@ def _can_run_musa_moe_gemv_swiglu(
     quant_info: TritonMoeQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> bool:
+    if _is_musa and envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+        return False
     if runner_config.musa_moe_gemv_enabled is False:
         return False
 

@@ -1,6 +1,7 @@
 # Adapted from https://github.com/thinking-machines-lab/batch_invariant_ops/blob/main/test_batch_invariance.py
 import math
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -30,6 +31,28 @@ class TestBatchInvariantOps(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         batch_invariant_ops._ENABLE_MM_COMPARISON_TEST = False
+
+    def test_deepgemm_runtime_failure_is_not_hidden(self):
+        a = torch.empty((16, 16), dtype=torch.bfloat16)
+        b_storage = torch.empty((16, 16), dtype=torch.bfloat16)
+        b = b_storage.transpose(0, 1)
+        fatal_error = RuntimeError("device-side assert triggered")
+
+        with patch.object(
+            batch_invariant_ops, "_ENABLE_MM_DEEPGEMM", True
+        ), patch.object(
+            batch_invariant_ops, "ENABLE_JIT_DEEPGEMM", True
+        ), patch.object(
+            batch_invariant_ops,
+            "_supports_batch_invariant_deepgemm_bf16_nn",
+            return_value=True,
+        ), patch.object(
+            batch_invariant_ops,
+            "_matmul_persistent_deepgemm",
+            side_effect=fatal_error,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "device-side assert"):
+                batch_invariant_ops.matmul_persistent(a, b)
 
     def _test_batch_invariance(self, M, K, N, dtype):
         """

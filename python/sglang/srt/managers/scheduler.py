@@ -205,7 +205,13 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
+from sglang.srt.server_args import (
+    PortArgs,
+    ServerArgs,
+    get_deterministic_prefill_truncation_align_size,
+    get_global_server_args,
+    get_musa_deterministic_prefill_truncation_align_size,
+)
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -218,9 +224,8 @@ from sglang.srt.utils import (
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
-    get_int_env_var,
-    is_musa,
     is_mps,
+    is_musa,
     kill_itself_when_parent_died,
     point_to_point_pyobj,
     require_mlp_sync,
@@ -1416,16 +1421,22 @@ class Scheduler(
             self.truncation_align_size = None
             return
 
-        backend_sizes = {
-            "flashinfer": ("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096),
-            "triton": ("SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE", 4096),
-        }
-        env_var, default_size = backend_sizes.get(
-            self.server_args.attention_backend, (None, None)
-        )
-        self.truncation_align_size = (
-            get_int_env_var(env_var, default_size) if env_var else None
-        )
+        if is_musa():
+            truncation_align_size = (
+                get_musa_deterministic_prefill_truncation_align_size(
+                    self.server_args.attention_backend,
+                    self.server_args.chunked_prefill_size,
+                    self.server_args.page_size,
+                )
+            )
+        else:
+            truncation_align_size = (
+                get_deterministic_prefill_truncation_align_size(
+                    self.server_args.attention_backend
+                )
+            )
+
+        self.truncation_align_size = truncation_align_size
 
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
