@@ -1,9 +1,19 @@
 import json
+import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
+import pytest
+
+from sglang.srt.server_args import (
+    PortArgs,
+    ServerArgs,
+    get_deterministic_prefill_truncation_align_size,
+    get_musa_deterministic_prefill_truncation_align_size,
+    prepare_server_args,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
@@ -15,6 +25,147 @@ register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
 # Mock get_device() so all tests run on CPU-only CI runners
 _mock_device = patch("sglang.srt.server_args.get_device", return_value="cuda")
 _mock_device.start()
+
+
+class TestMusaDeterministicBackend(unittest.TestCase):
+    @staticmethod
+    def _server_args(attention_backend=None):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.enable_deterministic_inference = True
+        server_args.attention_backend = attention_backend
+        return server_args
+
+    def test_default_backend_is_triton(self):
+        server_args = self._server_args()
+
+        with patch("sglang.srt.server_args.is_musa", return_value=True):
+            server_args._handle_deterministic_inference()
+
+        self.assertEqual(server_args.attention_backend, "triton")
+
+    def test_flashinfer_backend_is_rejected(self):
+        server_args = self._server_args("flashinfer")
+
+        with patch("sglang.srt.server_args.is_musa", return_value=True):
+            with self.assertRaisesRegex(ValueError, "fa3.*triton"):
+                server_args._handle_deterministic_inference()
+
+
+def test_musa_deepseek_fa3_disables_padding_without_clamping_concurrency():
+    server_args = TestMusaDeterministicBackend._server_args("fa3")
+    server_args.max_running_requests = 50
+    server_args.cuda_graph_max_bs = 8
+    server_args.cuda_graph_bs = [1, 2, 4, 8]
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=["DeepseekV2ForCausalLM"]),
+    )
+
+    with (
+        patch("sglang.srt.server_args.is_musa", return_value=True),
+        patch.object(server_args, "get_model_config", return_value=model_config),
+    ):
+        server_args._handle_deterministic_inference()
+
+    assert server_args.max_running_requests == 50
+    assert server_args.cuda_graph_max_bs == 8
+    assert server_args.cuda_graph_bs == [1, 2, 4, 8]
+    assert server_args.disable_cuda_graph_padding
+
+
+def test_musa_deepseek_triton_keeps_request_concurrency():
+    server_args = TestMusaDeterministicBackend._server_args("triton")
+    server_args.max_running_requests = 50
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=["DeepseekV2ForCausalLM"]),
+    )
+
+    with (
+        patch("sglang.srt.server_args.is_musa", return_value=True),
+        patch.object(server_args, "get_model_config", return_value=model_config),
+    ):
+        server_args._handle_deterministic_inference()
+
+    assert server_args.max_running_requests == 50
+    assert server_args.disable_cuda_graph_padding
+
+
+@pytest.mark.parametrize("attention_backend", ["fa3", "triton"])
+def test_musa_deterministic_radix_graph_keeps_batch_padding(attention_backend):
+    server_args = TestMusaDeterministicBackend._server_args(attention_backend)
+    server_args.disable_radix_cache = False
+    server_args.disable_cuda_graph = False
+    server_args.disable_cuda_graph_padding = False
+    server_args.cuda_graph_max_bs = 8
+    server_args.cuda_graph_bs = [1, 2, 4, 8]
+
+    with patch("sglang.srt.server_args.is_musa", return_value=True):
+        server_args._handle_deterministic_inference()
+
+    assert not server_args.disable_cuda_graph_padding
+    assert server_args.cuda_graph_bs == [1, 2, 4, 8]
+
+
+class TestMusaDeterministicChunkedPrefill(unittest.TestCase):
+    def test_non_musa_alignment_contract_is_unchanged(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                get_deterministic_prefill_truncation_align_size("triton"), 4096
+            )
+
+    def test_alignment_never_enlarges_user_chunk(self):
+        with patch.dict(
+            os.environ,
+            {"SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE": "4096"},
+        ):
+            self.assertEqual(
+                get_musa_deterministic_prefill_truncation_align_size(
+                    "triton", 512, 64
+                ),
+                512,
+            )
+
+    def test_custom_alignment_is_preserved(self):
+        with patch.dict(
+            os.environ,
+            {"SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE": "128"},
+        ):
+            self.assertEqual(
+                get_musa_deterministic_prefill_truncation_align_size(
+                    "triton", 512, 64
+                ),
+                128,
+            )
+
+    def test_alignment_defers_page_validation_until_page_size_finalized(self):
+        with patch.dict(
+            os.environ,
+            {"SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE": "4096"},
+        ):
+            self.assertEqual(
+                get_musa_deterministic_prefill_truncation_align_size(
+                    "triton", 512, None
+                ),
+                512,
+            )
+
+    def test_user_chunk_must_match_page_size(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(
+                ValueError, "chunked_prefill_size must be a multiple"
+            ):
+                get_musa_deterministic_prefill_truncation_align_size(
+                    "triton", 500, 64
+                )
+
+    def test_alignment_must_match_page_size(self):
+        with patch.dict(
+            os.environ,
+            {"SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE": "96"},
+        ):
+            with self.assertRaisesRegex(ValueError, "positive multiple"):
+                get_musa_deterministic_prefill_truncation_align_size(
+                    "triton", 512, 64
+                )
 
 
 class TestPrepareServerArgs(CustomTestCase):

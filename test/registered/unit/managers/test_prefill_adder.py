@@ -65,6 +65,8 @@ class TestPrefillAdder(CustomTestCase):
         server_args.schedule_low_priority_values_first = (
             schedule_low_priority_values_first
         )
+        server_args.device = "cuda"
+        server_args.enable_deterministic_inference = False
         return server_args
 
     def create_mock_req(self, rid, priority, max_new_tokens, output_len=0, wait_time=0):
@@ -75,6 +77,7 @@ class TestPrefillAdder(CustomTestCase):
         req.extend_logprob_start_len = 0
         req.output_ids = [0] * output_len
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
+        req.return_logprob = False
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.finished.return_value = False
         return req
@@ -124,6 +127,41 @@ class TestPrefillAdder(CustomTestCase):
         self.assertTrue(success)
         self.assertIn(running_reqs[0], adder.preempt_list)
         self.assertEqual(adder.rem_total_token_offset, 175)  # 50 + 75 + 100 - 50 = 175
+        running_batch.release_req.assert_called_once()
+
+    def test_musa_deterministic_does_not_preempt_request(self):
+        running_req = self.create_mock_req("running", priority=0, max_new_tokens=50)
+        self.assertFalse(running_req.return_logprob)
+        running_batch = self.create_running_batch([running_req])
+        adder = self.create_adder(running_batch)
+        self.mock_token_allocator.available_size.return_value = 50
+
+        server_args = self.create_server_args(
+            schedule_low_priority_values_first=False
+        )
+        server_args.device = "musa"
+        server_args.enable_deterministic_inference = True
+        new_req = self.create_mock_req("new", priority=20, max_new_tokens=49)
+
+        self.assertFalse(adder.preempt_to_schedule(new_req, server_args))
+        self.assertEqual(adder.preempt_list, [])
+        running_batch.release_req.assert_not_called()
+
+    def test_musa_nondeterministic_can_preempt_request(self):
+        running_req = self.create_mock_req("running", priority=0, max_new_tokens=50)
+        running_batch = self.create_running_batch([running_req])
+        adder = self.create_adder(running_batch)
+        self.mock_token_allocator.available_size.return_value = 50
+
+        server_args = self.create_server_args(
+            schedule_low_priority_values_first=False
+        )
+        server_args.device = "musa"
+        server_args.enable_deterministic_inference = False
+        new_req = self.create_mock_req("new", priority=20, max_new_tokens=49)
+
+        self.assertTrue(adder.preempt_to_schedule(new_req, server_args))
+        self.assertEqual(adder.preempt_list, [running_req])
         running_batch.release_req.assert_called_once()
 
     def test_preempt_success_low_priority_values_first(self):

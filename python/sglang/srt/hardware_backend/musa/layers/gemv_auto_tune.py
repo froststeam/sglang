@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from sglang.srt.distributed import tensor_model_parallel_all_gather
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.utils import is_musa
 
@@ -132,7 +133,12 @@ def should_use_musa_gemv(
     *,
     quant_kind: str,
 ) -> bool:
-    if _DISABLE_POLICY or not is_musa() or not isinstance(x, torch.Tensor):
+    if (
+        _DISABLE_POLICY
+        or envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+        or not is_musa()
+        or not isinstance(x, torch.Tensor)
+    ):
         return False
     if x.dim() < 2 or x.shape[-1] != layer.weight.shape[-1]:
         return False
@@ -181,7 +187,12 @@ def maybe_apply_musa_gemv_activation(
     *,
     activation: Any,
 ) -> Optional[torch.Tensor]:
-    if _DISABLE_POLICY or not is_musa() or not isinstance(x, torch.Tensor):
+    if (
+        _DISABLE_POLICY
+        or envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+        or not is_musa()
+        or not isinstance(x, torch.Tensor)
+    ):
         return None
     if x.dim() < 2 or x.shape[-1] != layer.weight.shape[-1]:
         return None
@@ -276,7 +287,11 @@ def _find_gemv_targets(model: torch.nn.Module) -> list[_GemvTarget]:
 def maybe_autotune_musa_gemv(
     model: torch.nn.Module, *, rank: int = 0, reuse_only: bool = False
 ) -> None:
-    if not is_musa() or not _AUTOTUNE_TOKENS:
+    if (
+        envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+        or not is_musa()
+        or not _AUTOTUNE_TOKENS
+    ):
         return
     targets = _find_gemv_targets(model)
     if not targets:

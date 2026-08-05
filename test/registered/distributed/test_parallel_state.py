@@ -40,6 +40,7 @@ import sys
 from unittest.mock import Mock, patch
 
 import pytest
+import torch
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -48,6 +49,188 @@ register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
 
 # Import the actual parallel_state module
 parallel_state = pytest.importorskip("sglang.srt.distributed.parallel_state")
+
+
+def _make_device_coordinator():
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.world_size = 4
+    coordinator.unique_name = "test-group"
+    coordinator.hpu_communicator = None
+    coordinator.xpu_communicator = None
+    coordinator.npu_communicator = None
+    coordinator.pynccl_comm = Mock(disabled=False)
+    coordinator.ca_comm = Mock(disabled=False)
+    coordinator.qr_comm = Mock(disabled=False)
+    coordinator.pymscclpp_comm = Mock(disabled=False)
+    coordinator.torch_symm_mem_comm = Mock(disabled=False)
+    return coordinator
+
+
+def test_musa_deterministic_all_reduce_bypasses_alternative_communicators():
+    coordinator = _make_device_coordinator()
+    input_ = Mock(is_cpu=False)
+
+    with patch.object(parallel_state, "_is_musa", True), patch.object(
+        parallel_state.envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE,
+        "get",
+        return_value=True,
+    ), patch.object(parallel_state, "inplace_all_reduce") as deterministic_reduce:
+        output = coordinator.all_reduce(input_)
+
+    assert output is input_
+    deterministic_reduce.assert_called_once_with(input_, group_name="test-group")
+    coordinator.pynccl_comm.all_reduce.assert_not_called()
+    coordinator.ca_comm.should_custom_ar.assert_not_called()
+    coordinator.qr_comm.should_quick_allreduce.assert_not_called()
+    coordinator.pymscclpp_comm.should_mscclpp_allreduce.assert_not_called()
+    coordinator.torch_symm_mem_comm.should_torch_symm_mem_allreduce.assert_not_called()
+
+
+def test_musa_deterministic_disables_fused_allreduce_rmsnorm():
+    coordinator = _make_device_coordinator()
+
+    with patch.object(parallel_state, "_is_musa", True), patch.object(
+        parallel_state.envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE,
+        "get",
+        return_value=True,
+    ):
+        output = coordinator.fused_allreduce_rmsnorm(
+            Mock(), Mock(), Mock(), 1e-6
+        )
+
+    assert output is None
+    coordinator.ca_comm.fused_allreduce_rmsnorm.assert_not_called()
+
+
+def test_musa_deterministic_all_reduce_uses_fixed_rank_order():
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.world_size = 4
+    coordinator.device_group = Mock()
+    coordinator.pynccl_comm = Mock(disabled=False)
+    coordinator.torch_symm_mem_comm = Mock(disabled=False)
+
+    rank_values = [
+        torch.tensor([1.0e20]),
+        torch.tensor([-1.0e20]),
+        torch.tensor([3.0]),
+        torch.tensor([4.0]),
+    ]
+
+    def fake_all_gather(outputs, input_, group):
+        assert group is coordinator.device_group
+        for output, rank_value in zip(outputs, rank_values, strict=True):
+            output.copy_(rank_value)
+
+    input_ = rank_values[0].clone()
+    with patch.object(parallel_state, "_is_musa", True), patch.object(
+        parallel_state.envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE,
+        "get",
+        return_value=True,
+    ), patch("torch.distributed.all_gather", side_effect=fake_all_gather) as gather:
+        coordinator._all_reduce_in_place(input_)
+
+    gather.assert_called_once()
+    coordinator.pynccl_comm.all_reduce.assert_not_called()
+    coordinator.torch_symm_mem_comm.all_reduce.assert_not_called()
+    torch.testing.assert_close(input_, torch.tensor([7.0]))
+
+
+def test_musa_deterministic_all_reduce_chunks_large_payloads():
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.world_size = 4
+    coordinator.device_group = Mock()
+    coordinator.pynccl_comm = None
+    coordinator.torch_symm_mem_comm = None
+
+    def fake_all_gather(outputs, input_, group):
+        assert group is coordinator.device_group
+        for rank, output in enumerate(outputs, start=1):
+            output.copy_(input_ * rank)
+
+    input_ = torch.arange(5, dtype=torch.float32)
+    with patch.object(parallel_state, "_is_musa", True), patch.object(
+        parallel_state.envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE,
+        "get",
+        return_value=True,
+    ), patch.object(
+        parallel_state, "get_int_env_var", return_value=2
+    ), patch(
+        "torch.distributed.all_gather", side_effect=fake_all_gather
+    ) as gather:
+        coordinator._all_reduce_in_place(input_)
+
+    assert gather.call_count == 3
+    torch.testing.assert_close(input_, torch.arange(5, dtype=torch.float32) * 10)
+
+
+def test_musa_deterministic_all_reduce_supports_noncontiguous_input():
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.world_size = 2
+    coordinator.device_group = Mock()
+    coordinator.pynccl_comm = None
+    coordinator.torch_symm_mem_comm = None
+
+    def fake_all_gather(outputs, input_, group):
+        outputs[0].copy_(input_)
+        outputs[1].copy_(input_ * 2)
+
+    base = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    input_ = base.transpose(0, 1)
+    expected = input_.clone() * 3
+    assert not input_.is_contiguous()
+
+    with patch.object(parallel_state, "_is_musa", True), patch.object(
+        parallel_state.envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE,
+        "get",
+        return_value=True,
+    ), patch("torch.distributed.all_gather", side_effect=fake_all_gather):
+        coordinator._all_reduce_in_place(input_)
+
+    torch.testing.assert_close(input_, expected)
+
+
+def test_musa_deterministic_graph_all_reduce_uses_pynccl_all_gather():
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.world_size = 4
+    coordinator.device_group = Mock()
+    coordinator.pynccl_comm = Mock(disabled=False)
+    coordinator.torch_symm_mem_comm = None
+    coordinator._is_graph_capturing = True
+
+    rank_values = [
+        torch.tensor([1.0e20]),
+        torch.tensor([-1.0e20]),
+        torch.tensor([3.0]),
+        torch.tensor([4.0]),
+    ]
+
+    def fake_pynccl_all_gather(output, input_):
+        for rank, rank_value in enumerate(rank_values):
+            output[rank].copy_(rank_value)
+
+    coordinator.pynccl_comm.all_gather.side_effect = fake_pynccl_all_gather
+    input_ = rank_values[0].clone()
+
+    with patch.object(parallel_state, "_is_musa", True), patch.object(
+        parallel_state.envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE,
+        "get",
+        return_value=True,
+    ), patch("torch.distributed.all_gather") as torch_all_gather:
+        coordinator._all_reduce_in_place(input_)
+
+    coordinator.pynccl_comm.all_gather.assert_called_once()
+    torch_all_gather.assert_not_called()
+    torch.testing.assert_close(input_, torch.tensor([7.0]))
 
 
 def test_parallel_group_construction_tp8_attn_cp2():

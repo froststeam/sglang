@@ -14,6 +14,7 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_tp_group,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import (
@@ -90,6 +91,12 @@ def maybe_autotune_musa_moe_deepgemm_threshold(
     rank: int = 0,
     reuse_only: bool = False,
 ) -> None:
+    if envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+        if rank == 0:
+            logger.info(
+                "Skip MUSA MoE bucket autotune for deterministic inference."
+            )
+        return
     if not is_musa() or not get_moe_runner_backend().is_mixed():
         return
 

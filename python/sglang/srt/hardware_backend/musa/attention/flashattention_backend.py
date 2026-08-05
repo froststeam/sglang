@@ -28,6 +28,9 @@ from sglang.srt.layers.utils.cp_utils import (
 )
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import is_musa
+
+_is_musa = is_musa()
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -438,7 +441,10 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         )
 
     def _should_skip_mla_scheduler_metadata_update(
-        self, layer: RadixAttention, forward_batch: ForwardBatch
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        force_update: bool = False,
     ) -> bool:
         assert self.use_mla
 
@@ -461,18 +467,26 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         if layer.layer_id > start_layer_id:
             should_update = False
 
+        if force_update:
+            should_update = True
+
         if envs.SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA.get():
             should_update = True
 
         return not should_update
 
     def _mla_scheduler_metadata_for_kvcache(
-        self, layer: RadixAttention, forward_batch: ForwardBatch
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        force_update: bool = False,
     ) -> Tuple[torch.Tensor, bool]:
         assert self._mate_mla_workspace_buffer is not None
         return (
             self._mate_mla_workspace_buffer,
-            self._should_skip_mla_scheduler_metadata_update(layer, forward_batch),
+            self._should_skip_mla_scheduler_metadata_update(
+                layer, forward_batch, force_update=force_update
+            ),
         )
 
     def _init_mla_scheduler_metadata(self):
@@ -1363,6 +1377,35 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         )
         return cu_seqlens_k_new
 
+    def _gather_paged_kv_for_varlen(
+        self,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        seq_lens_cpu,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        seq_lens = self._seq_lens_cpu_list(seq_lens_cpu)
+        assert (
+            seq_lens is not None
+        ), "seq_lens_cpu is required for MUSA FA3 varlen KV gather."
+
+        key_chunks = []
+        value_chunks = []
+        for batch_idx, seq_len in enumerate(seq_lens):
+            seq_len = int(seq_len)
+            num_pages = (seq_len + self.page_size - 1) // self.page_size
+            pages = page_table[batch_idx, :num_pages].to(torch.long)
+            key_chunks.append(
+                key_cache.index_select(0, pages)
+                .reshape(-1, key_cache.shape[-2], key_cache.shape[-1])[:seq_len]
+            )
+            value_chunks.append(
+                value_cache.index_select(0, pages)
+                .reshape(-1, value_cache.shape[-2], value_cache.shape[-1])[:seq_len]
+            )
+
+        return torch.cat(key_chunks, dim=0), torch.cat(value_chunks, dim=0)
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1497,6 +1540,31 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                 window_size = (-1, -1)
                 scheduler_metadata_owner = metadata
 
+            deterministic_cached_prefix = (
+                get_global_server_args().enable_deterministic_inference
+                and forward_batch.extend_prefix_lens_cpu is not None
+                and any(forward_batch.extend_prefix_lens_cpu)
+            )
+            if deterministic_cached_prefix and (
+                not forward_batch.forward_mode.is_extend()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                or layer.is_cross_attention
+                or use_local_attn
+                or is_swa_layer
+                or use_cascade_attn
+                or (
+                    forward_batch.forward_mode.is_context_parallel_extend()
+                    and forward_batch.attn_cp_metadata is not None
+                    and self.attn_cp_size > 1
+                )
+            ):
+                raise NotImplementedError(
+                    "MUSA FA3 deterministic cached-prefix attention only supports "
+                    "standard self-attention without context parallel, local "
+                    "attention, SWA, cascade attention, or speculative decoding."
+                )
+
             if (
                 forward_batch.forward_mode.is_context_parallel_extend()
                 and forward_batch.attn_cp_metadata is not None
@@ -1549,6 +1617,34 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     self.device,
                     _fa_cp_attn,
                 )
+            elif deterministic_cached_prefix:
+                full_k, full_v = self._gather_paged_kv_for_varlen(
+                    key_cache,
+                    value_cache,
+                    page_table,
+                    forward_batch.seq_lens_cpu,
+                )
+                output = flash_attn_varlen_func(
+                    q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k=full_k.to(q.dtype),
+                    v=full_v.to(q.dtype),
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=metadata.max_seq_len_k,
+                    softmax_scale=layer.scaling,
+                    causal=causal,
+                    return_softmax_lse=forward_batch.mha_return_lse,
+                    **kwargs,
+                )
+                if forward_batch.mha_return_lse:
+                    output, lse, *rest = output
+                    lse = torch.transpose(lse, 0, 1).contiguous()
+                    return (
+                        output.view(-1, layer.tp_q_head_num * layer.v_head_dim),
+                        lse,
+                    )
+                return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             elif (
                 layer.is_cross_attention
                 or (
@@ -2019,28 +2115,67 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                 q_rope = q_all[:, :, layer.v_head_dim :]
             max_seqlen_q = metadata.max_seq_len_q
 
-            result = flash_attn_with_kvcache(
-                q=q_rope,
-                k_cache=k_rope_cache,
-                v_cache=c_kv_cache,
-                qv=q_nope,
-                page_table=metadata.page_table,
-                cache_seqlens=metadata.cache_seqlens_int32,
-                cu_seqlens_q=metadata.cu_seqlens_q,
-                cu_seqlens_k_new=metadata.cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                softmax_scale=layer.scaling,
-                causal=False if use_cascade_attn else causal,
-                softcap=layer.logit_cap,
-                k_descale=k_descale,
-                v_descale=v_descale,
-                return_softmax_lse=use_cascade_attn,
-                scheduler_metadata=self._mla_scheduler_metadata_for_kvcache(
-                    layer,
-                    forward_batch,
-                ),
-                num_splits=self.num_splits,
+            deterministic_mla_decode = (
+                _is_musa
+                and get_global_server_args().enable_deterministic_inference
+                and forward_batch.forward_mode.is_decode()
+                and not use_cascade_attn
+                and not use_local_attn
             )
+            if deterministic_mla_decode:
+                assert max_seqlen_q == 1
+                single_cu_seqlens_q = metadata.cu_seqlens_q[:2]
+                results = []
+                for batch_idx in range(forward_batch.batch_size):
+                    results.append(
+                        flash_attn_with_kvcache(
+                            q=q_rope[batch_idx : batch_idx + 1],
+                            k_cache=k_rope_cache,
+                            v_cache=c_kv_cache,
+                            qv=q_nope[batch_idx : batch_idx + 1],
+                            page_table=metadata.page_table[batch_idx : batch_idx + 1],
+                            cache_seqlens=metadata.cache_seqlens_int32[
+                                batch_idx : batch_idx + 1
+                            ],
+                            cu_seqlens_q=single_cu_seqlens_q,
+                            max_seqlen_q=1,
+                            softmax_scale=layer.scaling,
+                            causal=causal,
+                            softcap=layer.logit_cap,
+                            k_descale=k_descale,
+                            v_descale=v_descale,
+                            num_splits=1,
+                            scheduler_metadata=self._mla_scheduler_metadata_for_kvcache(
+                                layer,
+                                forward_batch,
+                                force_update=True,
+                            ),
+                        )
+                    )
+                result = torch.cat(results, dim=0)
+            else:
+                result = flash_attn_with_kvcache(
+                    q=q_rope,
+                    k_cache=k_rope_cache,
+                    v_cache=c_kv_cache,
+                    qv=q_nope,
+                    page_table=metadata.page_table,
+                    cache_seqlens=metadata.cache_seqlens_int32,
+                    cu_seqlens_q=metadata.cu_seqlens_q,
+                    cu_seqlens_k_new=metadata.cu_seqlens_k,
+                    max_seqlen_q=max_seqlen_q,
+                    softmax_scale=layer.scaling,
+                    causal=False if use_cascade_attn else causal,
+                    softcap=layer.logit_cap,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    return_softmax_lse=use_cascade_attn,
+                    scheduler_metadata=self._mla_scheduler_metadata_for_kvcache(
+                        layer,
+                        forward_batch,
+                    ),
+                    num_splits=self.num_splits,
+                )
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(

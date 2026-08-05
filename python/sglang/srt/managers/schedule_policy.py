@@ -974,7 +974,16 @@ class PrefillAdder:
         valid_running_reqs = (
             r
             for r in self.running_batch.reqs
-            if r not in self.preempt_list and not r.finished()
+            if r not in self.preempt_list
+            and not r.finished()
+            # A preempted request resumes through prefill. On MUSA, switching
+            # from decode to re-prefill can change boundary logits and may
+            # change exact logprobs or sampled token IDs. Keep deterministic
+            # requests on their original execution path.
+            and not (
+                server_args.device == "musa"
+                and server_args.enable_deterministic_inference
+            )
         )
 
         sorted_valid_running_reqs = sorted(

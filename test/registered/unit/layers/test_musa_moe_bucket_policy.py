@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import pytest
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import (
     TritonMoeQuantInfo,
@@ -101,6 +102,33 @@ def test_musa_moe_gemv_gate_honors_bucket_override(monkeypatch):
     # No mixed-policy override keeps the legacy standalone threshold behavior.
     config.musa_moe_gemv_enabled = None
     assert _can_run_musa_moe_gemv_swiglu(hidden_states, quant_info, config)
+
+
+def test_musa_moe_gemv_is_disabled_for_deterministic_inference(monkeypatch):
+    from sglang.srt.layers.moe.moe_runner import triton
+
+    monkeypatch.setattr(triton, "_is_musa", True)
+    hidden_states = torch.empty((1, 128), dtype=torch.bfloat16)
+    quant_info = TritonMoeQuantInfo(
+        w13_weight=torch.empty((2, 256, 128), dtype=torch.bfloat16),
+        w2_weight=torch.empty((2, 128, 128), dtype=torch.bfloat16),
+    )
+    config = MoeRunnerConfig(
+        num_experts=2,
+        num_local_experts=2,
+        hidden_size=128,
+        intermediate_size_per_partition=128,
+        top_k=1,
+    )
+    config.musa_moe_gemv_enabled = True
+    old_deterministic = envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+    try:
+        envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(True)
+        assert not _can_run_musa_moe_gemv_swiglu(
+            hidden_states, quant_info, config
+        )
+    finally:
+        envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(old_deterministic)
 
 
 def test_musa_moe_fp8_gemv_requires_block128(monkeypatch):

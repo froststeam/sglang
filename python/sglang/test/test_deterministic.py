@@ -15,6 +15,7 @@ python3 -m sglang.test.test_deterministic --test-mode radix_cache
 import argparse
 import dataclasses
 import json
+import math
 import os
 import random
 from typing import Any, Dict, List, Optional
@@ -36,6 +37,9 @@ class BenchArgs:
     port: int = 30000
     batch_size: int = 1
     temperature: float = 0.0
+    top_p: float = 1.0
+    top_k: int = -1
+    min_p: float = 0.0
     sampling_seed: int = 42
     max_new_tokens: int = 100
     frequency_penalty: float = 0.0
@@ -56,6 +60,9 @@ class BenchArgs:
         parser.add_argument("--n-trials", type=int, default=BenchArgs.n_trials)
         parser.add_argument("--n-start", type=int, default=BenchArgs.n_start)
         parser.add_argument("--temperature", type=float, default=BenchArgs.temperature)
+        parser.add_argument("--top-p", type=float, default=BenchArgs.top_p)
+        parser.add_argument("--top-k", type=int, default=BenchArgs.top_k)
+        parser.add_argument("--min-p", type=float, default=BenchArgs.min_p)
         parser.add_argument(
             "--sampling-seed", type=int, default=BenchArgs.sampling_seed
         )
@@ -114,6 +121,9 @@ def send_single(
             "input_ids": input_ids,
             "sampling_params": {
                 "temperature": args.temperature,
+                "top_p": args.top_p,
+                "top_k": args.top_k,
+                "min_p": args.min_p,
                 "max_new_tokens": (
                     max_new_tokens
                     if max_new_tokens is not None
@@ -132,6 +142,9 @@ def send_single(
             "text": prompt,
             "sampling_params": {
                 "temperature": args.temperature,
+                "top_p": args.top_p,
+                "top_k": args.top_k,
+                "min_p": args.min_p,
                 "max_new_tokens": (
                     max_new_tokens
                     if max_new_tokens is not None
@@ -187,22 +200,47 @@ def send_single(
         return ret["text"]
 
 
+def flush_cache(args, timeout_s: float = 60.0):
+    """Flush only after overlap-scheduled requests are fully retired."""
+    response = requests.post(
+        f"http://{args.host}:{args.port}/flush_cache",
+        params={"timeout": timeout_s},
+        timeout=timeout_s + 10.0,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Failed to flush cache before deterministic comparison: "
+            f"status={response.status_code}, body={response.text!r}"
+        )
+    return response
+
+
+def sample_prefix_indices(batch_size: int, num_prompts: int) -> List[int]:
+    """Build a mixed-prefix batch without randomly dropping prompt classes."""
+    if num_prompts <= 0:
+        raise ValueError("num_prompts must be positive")
+    sampled_indices = [index % num_prompts for index in range(batch_size)]
+    random.shuffle(sampled_indices)
+    return sampled_indices
+
+
 def send_prefix(
     args, batch_size: int, prompts: List[str], return_full_response: bool = False
 ):
-    requests.post(f"http://{args.host}:{args.port}/flush_cache")
+    flush_cache(args)
 
     batch_data = []
-    sampled_indices = []
-    for _ in range(batch_size):
-        sampled_index = random.randint(0, len(prompts) - 1)
-        sampled_indices.append(sampled_index)
+    sampled_indices = sample_prefix_indices(batch_size, len(prompts))
+    for sampled_index in sampled_indices:
         batch_data.append(prompts[sampled_index])
 
     json_data = {
         "text": batch_data,
         "sampling_params": {
             "temperature": args.temperature,
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+            "min_p": args.min_p,
             "max_new_tokens": args.max_new_tokens,
             "frequency_penalty": args.frequency_penalty,
             "presence_penalty": args.presence_penalty,
@@ -247,6 +285,10 @@ def compare_logprobs(logprobs1, logprobs2, tolerance=0):
         # Each element is [logprob, token_id]
         if lp1[1] != lp2[1]:
             return False, f"Token ID mismatch at position {i}: {lp1[1]} vs {lp2[1]}"
+        if lp1[0] is None or lp2[0] is None:
+            return False, f"Missing logprob at position {i}: {lp1[0]} vs {lp2[0]}"
+        if not math.isfinite(lp1[0]) or not math.isfinite(lp2[0]):
+            return False, f"Non-finite logprob at position {i}: {lp1[0]} vs {lp2[0]}"
         if abs(lp1[0] - lp2[0]) > tolerance:
             return (
                 False,
@@ -254,6 +296,68 @@ def compare_logprobs(logprobs1, logprobs2, tolerance=0):
             )
 
     return True, "Logprobs match"
+
+
+def compare_responses(reference, response, compare_exact_logprobs=False):
+    """Compare all deterministic response fields and return mismatch details."""
+    mismatches = []
+
+    if "text" not in reference or "text" not in response:
+        mismatches.append("Missing text in response")
+    elif reference["text"] != response["text"]:
+        mismatches.append(
+            f"Text mismatch: {reference['text']!r} vs {response['text']!r}"
+        )
+
+    if "output_ids" not in reference or "output_ids" not in response:
+        mismatches.append("Missing output_ids in response")
+    elif reference["output_ids"] != response["output_ids"]:
+        mismatches.append(
+            f"Output token IDs mismatch: {reference['output_ids']} vs {response['output_ids']}"
+        )
+
+    if compare_exact_logprobs:
+        try:
+            reference_logprobs = reference["meta_info"]["output_token_logprobs"]
+            response_logprobs = response["meta_info"]["output_token_logprobs"]
+        except (KeyError, TypeError):
+            mismatches.append("Missing output_token_logprobs in response")
+        else:
+            match, message = compare_logprobs(
+                reference_logprobs, response_logprobs, tolerance=0
+            )
+            if not match:
+                mismatches.append(message)
+
+    return not mismatches, mismatches
+
+
+def compare_response_sequence(responses, compare_exact_logprobs=False):
+    """Compare every response, including every item returned by a batch."""
+    if not responses:
+        return False, [(0, ["No responses returned"])]
+
+    reference = responses[0]
+    mismatched_responses = []
+    for sample_idx, response in enumerate(responses[1:], start=2):
+        match, mismatches = compare_responses(
+            reference,
+            response,
+            compare_exact_logprobs=compare_exact_logprobs,
+        )
+        if not match:
+            mismatched_responses.append((sample_idx, mismatches))
+    return not mismatched_responses, mismatched_responses
+
+
+def deterministic_test_passed(results):
+    """Return whether every requested deterministic comparison passed."""
+    return bool(results) and all(result == 1 for result in results)
+
+
+def deterministic_test_exit_code(results):
+    """Map deterministic comparison results to a process exit code."""
+    return 0 if deterministic_test_passed(results) else 1
 
 
 def _test_mode_p_vs_d(args, batch_size):
@@ -280,7 +384,7 @@ def _test_mode_p_vs_d(args, batch_size):
 
     # warmup + flush
     send_single(args, input_ids=[1] * 64, max_new_tokens=65, return_full_response=True)
-    requests.post(f"http://{args.host}:{args.port}/flush_cache")
+    flush_cache(args)
 
     prompts = _create_prompts()
 
@@ -294,7 +398,7 @@ def _test_mode_p_vs_d(args, batch_size):
     )
     info_a = _extract_ids_and_logprobs(resp_a)
 
-    requests.post(f"http://{args.host}:{args.port}/flush_cache")
+    flush_cache(args)
 
     resp_b = send_single(
         args,
@@ -460,15 +564,45 @@ def _extract_ids_and_logprobs(responses):
 def test_deterministic(args):
     if args.test_mode == "single":
         # In single mode, we test the deterministic behavior by sending the same prompt in batch sizes ranging from 1 to n_trials.
-        texts = []
+        responses = []
         for i in range(1, args.n_trials + 1):
             batch_size = i
-            text = send_single(args, args.profile, prompt=[PROMPT_1] * batch_size)
-            text = text.replace("\n", " ")
-            print(f"Trial {i} with batch size {batch_size}: {text}")
-            texts.append(text)
+            response_batch = send_single(
+                args,
+                args.profile,
+                prompt=[PROMPT_1] * batch_size,
+                return_full_response=True,
+                pick_first_result=False,
+            )
+            if not isinstance(response_batch, list):
+                response_batch = [response_batch]
+            if len(response_batch) != batch_size:
+                raise RuntimeError(
+                    f"Expected {batch_size} responses, got {len(response_batch)}"
+                )
+            display_text = response_batch[0]["text"].replace("\n", " ")
+            print(f"Trial {i} with batch size {batch_size}: {display_text}")
+            responses.extend(response_batch)
+
+        texts = [response["text"] for response in responses]
+        token_ids = [tuple(response["output_ids"]) for response in responses]
         print(f"Total samples: {len(texts)}, Unique samples: {len(set(texts))}")
-        return [len(set(texts))]
+        print(f"Unique output token ID sequences: {len(set(token_ids))}")
+
+        all_match, mismatched_responses = compare_response_sequence(
+            responses, compare_exact_logprobs=args.return_logprob
+        )
+        for sample_idx, mismatches in mismatched_responses:
+            for mismatch in mismatches:
+                print(f"  ✗ Sample {sample_idx}: {mismatch}")
+
+        if all_match:
+            fields = "text and output token IDs"
+            if args.return_logprob:
+                fields += " and exact logprobs"
+            print(f"✓ All {len(responses)} samples have identical {fields}")
+
+        return [int(all_match)]
 
     elif args.test_mode == "prefix":
         # In prefix mode, we create prompts from the same long prompt, with different lengths of common prefix.
@@ -476,84 +610,68 @@ def test_deterministic(args):
         num_prompts = len(len_prefix)
         outputs = {i: [] for i in range(4)}
         prompts = [LONG_PROMPT[: len_prefix[i]] for i in range(4)]
-
-        # If return_logprob is enabled, store full responses for comparison
-        if args.return_logprob:
-            full_responses = {i: [] for i in range(4)}
+        full_responses = {i: [] for i in range(4)}
 
         for i in range(args.n_start, args.n_start + args.n_trials):
             batch_size = i
-            ret_dict = send_prefix(
-                args, batch_size, prompts, return_full_response=args.return_logprob
-            )
+            ret_dict = send_prefix(args, batch_size, prompts, return_full_response=True)
             msg = f"Testing Trial {i} with batch size {batch_size},"
             for i in range(num_prompts):
                 msg += f" # prefix length {len_prefix[i]}: {len(ret_dict[i])},"
             print(msg)
             for i in range(num_prompts):
-                if args.return_logprob:
-                    # Store full response for logprob comparison
-                    full_responses[i].extend(ret_dict[i])
-                    # Extract text for determinism check
-                    outputs[i].extend([resp["text"] for resp in ret_dict[i]])
-                else:
-                    outputs[i].extend(ret_dict[i])
+                full_responses[i].extend(ret_dict[i])
+                outputs[i].extend([resp["text"] for resp in ret_dict[i]])
 
         for i in range(num_prompts):
             print(
                 f"Prompt {i} with prefix length {len_prefix[i]}: total samples: {len(outputs[i])}, Unique samples: {len(set(outputs[i]))}"
             )
 
+        print(f"\n{'='*60}")
+        print("Response Comparison Across Batch Sizes")
+        print("=" * 60)
+
         results = []
-        for i in range(num_prompts):
-            results.append(len(set(outputs[i])))
+        for prompt_idx in range(num_prompts):
+            print(f"\nPrompt {prompt_idx} (prefix length {len_prefix[prompt_idx]}):")
+            responses = full_responses[prompt_idx]
+            if not responses:
+                print("  ✗ No samples were generated for this prompt")
+                results.append(0)
+                continue
 
-        # If logprobs are enabled, compare them across different batch sizes
-        if args.return_logprob:
-            print(f"\n{'='*60}")
-            print("Logprobs Comparison Across Batch Sizes")
-            print("=" * 60)
-
-            logprob_results = []
-            for prompt_idx in range(num_prompts):
-                print(
-                    f"\nPrompt {prompt_idx} (prefix length {len_prefix[prompt_idx]}):"
+            reference = responses[0]
+            all_match = True
+            mismatch_count = 0
+            for sample_idx, response in enumerate(responses[1:], start=2):
+                match, mismatches = compare_responses(
+                    reference,
+                    response,
+                    compare_exact_logprobs=args.return_logprob,
                 )
-                responses = full_responses[prompt_idx]
+                if not match:
+                    all_match = False
+                    mismatch_count += 1
+                    for mismatch in mismatches:
+                        print(f"  ✗ Sample {sample_idx}: {mismatch}")
 
-                if len(responses) < 2:
-                    continue
-
-                # Compare all responses against the first one
-                reference = responses[0]
-                all_match = True
-                mismatches = []
-
-                for j, resp in enumerate(responses[1:], start=1):
-                    ref_logprobs = reference["meta_info"]["output_token_logprobs"]
-                    resp_logprobs = resp["meta_info"]["output_token_logprobs"]
-
-                    match, msg = compare_logprobs(ref_logprobs, resp_logprobs)
-
-                    if not match:
-                        print(f"  ✗ Sample {j+1}: {msg}")
-                        mismatches.append((j + 1, msg))
-                        all_match = False
-
-                if all_match:
-                    print(f"  ✓ All {len(responses)} samples have identical logprobs")
-                    logprob_results.append(1)
-                else:
-                    print(
-                        f"  ✗ Found {len(mismatches)} mismatches out of {len(responses)} samples"
-                    )
-                    logprob_results.append(0)
-
-            print(f"\n{'='*60}")
-            if all(r == 1 for r in logprob_results):
-                print("✓✓✓ Logprobs are identical across all batch sizes! ✓✓✓")
+            if all_match:
+                fields = "text and output token IDs"
+                if args.return_logprob:
+                    fields += " and exact logprobs"
+                print(f"  ✓ All {len(responses)} samples have identical {fields}")
             else:
-                print("✗✗✗ Some logprobs differ across batch sizes! ✗✗✗")
+                print(
+                    f"  ✗ Found {mismatch_count} mismatched samples out of {len(responses)}"
+                )
+            results.append(int(all_match))
+
+        print(f"\n{'='*60}")
+        if deterministic_test_passed(results):
+            print("✓✓✓ All deterministic response fields are identical! ✓✓✓")
+        else:
+            print("✗✗✗ Some deterministic response fields differ! ✗✗✗")
 
         return results
 
@@ -572,7 +690,7 @@ def test_deterministic(args):
         )
 
         # Flush cache first to make sure there is no cache hit from previous tests
-        flush_response = requests.post(f"http://{args.host}:{args.port}/flush_cache")
+        flush_response = flush_cache(args)
 
         prefix_len = 100
         print(f"Step 1: Generating random {prefix_len} token IDs...")
@@ -623,13 +741,15 @@ def test_deterministic(args):
         cached_token_data = cached_logprobs[0]
         cached_logprob = cached_token_data[0]
         cached_token_id = cached_token_data[1]
+        cached_text = cached_response["text"]
+        cached_output_ids = cached_response["output_ids"]
 
         print(f"✓ Generated with cache:")
         print(f"  Token ID: {cached_token_id}")
         print(f"  Logprob:  {cached_logprob:.10f}")
 
         print(f"\nStep 4: Flushing cache...")
-        flush_response = requests.post(f"http://{args.host}:{args.port}/flush_cache")
+        flush_response = flush_cache(args)
 
         print(
             f"\nStep 5: Generating without cache (same 164 tokens prefill, no cache)..."
@@ -647,6 +767,8 @@ def test_deterministic(args):
         uncached_token_data = uncached_logprobs[0]
         uncached_logprob = uncached_token_data[0]
         uncached_token_id = uncached_token_data[1]
+        uncached_text = uncached_response["text"]
+        uncached_output_ids = uncached_response["output_ids"]
 
         print(f"✓ Generated without cache:")
         print(f"  Token ID: {uncached_token_id}")
@@ -686,7 +808,11 @@ def test_deterministic(args):
         print("=" * 60)
 
         # Main test: compare cached vs uncached prefill (should be identical)
-        token_match = cached_token_id == uncached_token_id
+        text_match = cached_text == uncached_text
+        token_match = (
+            cached_token_id == uncached_token_id
+            and cached_output_ids == uncached_output_ids
+        )
         logprob_match = cached_logprob == uncached_logprob
 
         print(
@@ -695,10 +821,15 @@ def test_deterministic(args):
         print(
             f"  Uncached prefill token (Request 3): ID={uncached_token_id}, logprob={uncached_logprob:.10f}"
         )
+        print(f"  Text match:     {'✓ YES' if text_match else '✗ NO'}")
+        if not text_match:
+            print(f"    Cached:   {cached_text!r}")
+            print(f"    Uncached: {uncached_text!r}")
+
         print(f"  Token ID match: {'✓ YES' if token_match else '✗ NO'}")
         if not token_match:
-            print(f"    Cached:   {cached_token_id}")
-            print(f"    Uncached: {uncached_token_id}")
+            print(f"    Cached:   {cached_output_ids}")
+            print(f"    Uncached: {uncached_output_ids}")
 
         print(f"  Logprob match:  {'✓ YES' if logprob_match else '✗ NO'}")
         if not logprob_match:
@@ -709,7 +840,7 @@ def test_deterministic(args):
         print(f"  Note: We expect these to be IDENTICAL (both prefill kernels)")
 
         print(f"\n{'='*60}")
-        if token_match and logprob_match:
+        if text_match and token_match and logprob_match:
             print("✓✓✓ TEST PASSED - Radix cache is consistent! ✓✓✓")
             return [1]
         else:
@@ -735,4 +866,5 @@ if __name__ == "__main__":
     if args.sampling_seed is None:
         args.sampling_seed = 42
 
-    test_deterministic(args)
+    results = test_deterministic(args)
+    raise SystemExit(deterministic_test_exit_code(results))

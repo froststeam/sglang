@@ -608,7 +608,14 @@ class GroupCoordinator:
             else:
                 maybe_pymscclpp_context = pymscclpp_comm.change_state(enable=True)
             with maybe_pynccl_context, maybe_pymscclpp_context:
-                yield graph_capture_context
+                previous_graph_capture_state = getattr(
+                    self, "_is_graph_capturing", False
+                )
+                self._is_graph_capturing = True
+                try:
+                    yield graph_capture_context
+                finally:
+                    self._is_graph_capturing = previous_graph_capture_state
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         """
@@ -644,6 +651,13 @@ class GroupCoordinator:
 
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
+
+        if _is_musa and envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+            # Determinism is a communication policy, so select it before any
+            # symmetric-memory or out-of-place communicator can choose a
+            # payload-dependent reduction tree.
+            inplace_all_reduce(input_, group_name=self.unique_name)
+            return input_
 
         if self.pynccl_comm is not None and self.is_symmetric_memory_enabled():
             self.debug_check_symmetric_mempool(self, {"input": input_}, "all_reduce")
@@ -711,6 +725,11 @@ class GroupCoordinator:
         eps: float,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator. ROCm/HIP Only"""
+        if _is_musa and envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+            # Let the caller use the unfused path, whose all-reduce is ordered
+            # by rank. A fused communicator may use a shape-dependent tree.
+            return None
+
         ca_comm = self.ca_comm
         if ca_comm is None or getattr(ca_comm, "disabled", True):
             return None
@@ -780,7 +799,49 @@ class GroupCoordinator:
     def _all_reduce_in_place(self, input_: torch.Tensor) -> None:
         pynccl_comm = self.pynccl_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
-        if pynccl_comm is not None and not pynccl_comm.disabled:
+        if _is_musa and envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+            # MCCL may choose a different reduction tree for different payload
+            # sizes. With more than two ranks, that changes the floating-point
+            # addition order and breaks batch invariance. Gather exact rank
+            # contributions first, then add them in a fixed rank order.
+            reduction_input = input_ if input_.is_contiguous() else input_.contiguous()
+            flat_input = reduction_input.view(-1)
+            chunk_numel = get_int_env_var(
+                "SGLANG_MUSA_DETERMINISTIC_ALL_REDUCE_CHUNK_SIZE", 4 * 1024 * 1024
+            )
+            if chunk_numel <= 0:
+                raise ValueError(
+                    "SGLANG_MUSA_DETERMINISTIC_ALL_REDUCE_CHUNK_SIZE must be positive"
+                )
+
+            for start in range(0, flat_input.numel(), chunk_numel):
+                input_chunk = flat_input[start : start + chunk_numel]
+                if getattr(self, "_is_graph_capturing", False):
+                    if pynccl_comm is None or pynccl_comm.disabled:
+                        raise RuntimeError(
+                            "MUSA deterministic graph capture requires the "
+                            "PyNccl communicator for graph-safe all-gather"
+                        )
+                    gathered_inputs = torch.empty(
+                        (self.world_size, input_chunk.numel()),
+                        dtype=input_chunk.dtype,
+                        device=input_chunk.device,
+                    )
+                    pynccl_comm.all_gather(gathered_inputs, input_chunk)
+                    rank_inputs = gathered_inputs.unbind(0)
+                else:
+                    rank_inputs = [
+                        torch.empty_like(input_chunk) for _ in range(self.world_size)
+                    ]
+                    torch.distributed.all_gather(
+                        rank_inputs, input_chunk, group=self.device_group
+                    )
+                input_chunk.copy_(rank_inputs[0])
+                for rank_input in rank_inputs[1:]:
+                    input_chunk.add_(rank_input)
+            if reduction_input is not input_:
+                input_.copy_(reduction_input)
+        elif pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.all_reduce(input_)
         elif torch_symm_mem_comm is not None and not torch_symm_mem_comm.disabled:
             torch_symm_mem_comm.all_reduce(input_)
