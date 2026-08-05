@@ -169,6 +169,9 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.scheduler_beam_search_processor_mixin import (
+    SchedulerBeamSearchProcessorMixin,
+)
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
@@ -224,6 +227,7 @@ from sglang.srt.utils import (
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
+    get_int_env_var,
     is_mps,
     is_musa,
     kill_itself_when_parent_died,
@@ -329,6 +333,7 @@ def validate_dflash_request(req: Req) -> Optional[str]:
 
 
 class Scheduler(
+    SchedulerBeamSearchProcessorMixin,
     SchedulerOutputProcessorMixin,
     SchedulerUpdateWeightsMixin,
     SchedulerProfilerMixin,
@@ -999,9 +1004,7 @@ class Scheduler(
 
         # XXX (MUSA): MUSA uses the spec-v2 draft worker layout even when the
         # scheduler itself is not running overlap.
-        if self.spec_algorithm.supports_spec_v2() and (
-            self.enable_overlap or _is_musa
-        ):
+        if self.spec_algorithm.supports_spec_v2() and (self.enable_overlap or _is_musa):
             if self.server_args.enable_multi_layer_eagle:
                 draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
             else:
@@ -1554,13 +1557,11 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
-            # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
 
-            # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
@@ -2025,13 +2026,15 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+            # beam search not support return logprob
+            is_beam_search = self.server_args.enable_beam_search
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
-                return_logprob=recv_req.return_logprob,
-                top_logprobs_num=recv_req.top_logprobs_num,
+                return_logprob=recv_req.return_logprob if not is_beam_search else False,
+                top_logprobs_num=recv_req.top_logprobs_num if not is_beam_search else 0,
                 token_ids_logprob=recv_req.token_ids_logprob,
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
@@ -2044,6 +2047,7 @@ class Scheduler(
                 return_routed_experts=recv_req.return_routed_experts,
                 routed_experts_start_len=recv_req.routed_experts_start_len,
                 return_indexer_topk=recv_req.return_indexer_topk,
+                is_beam_search=is_beam_search,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
@@ -3211,7 +3215,10 @@ class Scheduler(
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         if batch.forward_mode.is_decode():
-            self.process_batch_result_decode(batch, result)
+            if batch.reqs and batch.reqs[0].is_beam_search:
+                self.process_beam_search_decode_result(batch, result)
+            else:
+                self.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)

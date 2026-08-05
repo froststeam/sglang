@@ -705,6 +705,7 @@ class TboForwardBatchPreparer:
             "padded_static_len",
             "split_index",  # for split prefill
             "orig_seq_lens",  # only used by qwen-1m, thus not care
+            "is_beam_search",  # for beam search
             "return_pooled_hidden_states",
         ]:
             output_dict[key] = getattr(batch, key)
