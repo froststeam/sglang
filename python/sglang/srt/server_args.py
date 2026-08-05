@@ -3338,6 +3338,11 @@ class ServerArgs:
             )
 
         if self.moe_a2a_backend == "deepep":
+            if is_musa() and self.moe_runner_backend == "auto":
+                self.moe_runner_backend = "deep_gemm"
+                logger.info(
+                    "MUSA DeepEP is enabled; using deep_gemm as the default MoE runner backend."
+                )
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.disable_cuda_graph = True

@@ -752,6 +752,30 @@ class TestNgramExternalSamArgs(CustomTestCase):
 
 
 class TestDeepEPWaterfillArgs(CustomTestCase):
+    @patch("sglang.srt.server_args.is_musa", return_value=True)
+    def test_musa_deepep_defaults_to_deep_gemm(self, _mock_is_musa):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="deepep",
+            moe_runner_backend="auto",
+        )
+
+        server_args._handle_a2a_moe()
+
+        self.assertEqual(server_args.moe_runner_backend, "deep_gemm")
+
+    @patch("sglang.srt.server_args.is_musa", return_value=True)
+    def test_musa_deepep_preserves_explicit_runner(self, _mock_is_musa):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="deepep",
+            moe_runner_backend="triton",
+        )
+
+        server_args._handle_a2a_moe()
+
+        self.assertEqual(server_args.moe_runner_backend, "triton")
+
     def test_waterfill_enforces_shared_experts_fusion(self):
         server_args = ServerArgs(
             model_path="dummy",
