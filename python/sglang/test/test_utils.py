@@ -741,14 +741,37 @@ def _launch_server_process(
     print(f"CI_OFFLINE: Launching server HF_HUB_OFFLINE={hf_hub_offline} model={model}")
 
     if return_stdout_stderr:
-        proc = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=child_env,
-            text=True,
-            bufsize=1,
-        )
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=child_env,
+                text=True,
+                bufsize=1,
+            )
+        except FileNotFoundError:
+            if command[:2] != ["sglang", "serve"]:
+                raise
+            driver_python = child_env.get("JD_TEST_DRIVER_PYTHON", "python3")
+            fallback_command = [
+                driver_python,
+                "-m",
+                "sglang.launch_server",
+                *command[2:],
+            ]
+            print(
+                "CI_OFFLINE: sglang binary not found, retrying with "
+                f"{shlex.join(fallback_command)}"
+            )
+            proc = subprocess.Popen(
+                fallback_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=child_env,
+                text=True,
+                bufsize=1,
+            )
 
         def _dump(src, sinks):
             for line in iter(src.readline, ""):
@@ -768,7 +791,25 @@ def _launch_server_process(
             daemon=True,
         ).start()
     else:
-        proc = subprocess.Popen(command, stdout=None, stderr=None, env=child_env)
+        try:
+            proc = subprocess.Popen(command, stdout=None, stderr=None, env=child_env)
+        except FileNotFoundError:
+            if command[:2] != ["sglang", "serve"]:
+                raise
+            driver_python = child_env.get("JD_TEST_DRIVER_PYTHON", "python3")
+            fallback_command = [
+                driver_python,
+                "-m",
+                "sglang.launch_server",
+                *command[2:],
+            ]
+            print(
+                "CI_OFFLINE: sglang binary not found, retrying with "
+                f"{shlex.join(fallback_command)}"
+            )
+            proc = subprocess.Popen(
+                fallback_command, stdout=None, stderr=None, env=child_env
+            )
 
     return proc
 

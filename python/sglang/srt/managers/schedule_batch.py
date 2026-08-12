@@ -2312,8 +2312,11 @@ class ScheduleBatch(
     @property
     def is_spec_v2(self):
         # FIXME: finally deprecate is_spec_v2
-        ret = (self.enable_overlap or _is_musa) and not self.spec_algorithm.is_none()
-        assert not ret or self.spec_algorithm.supports_spec_v2()
+        ret = (
+            (self.enable_overlap or _is_musa)
+            and not self.spec_algorithm.is_none()
+            and self.spec_algorithm.supports_spec_v2()
+        )
         return ret
 
     def prepare_for_decode(self):

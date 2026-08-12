@@ -58,7 +58,7 @@ void SuffixAutomaton::extend_(int32_t token, int64_t pos) {
   states_[cur].max_end_pos = pos;
 
   int p = last_;
-  while (p != -1 && !states_[p].next.contains(token)) {
+  while (p != -1 && states_[p].next.find(token) == states_[p].next.end()) {
     states_[p].next[token] = cur;
     p = states_[p].link;
   }
@@ -146,7 +146,7 @@ std::vector<SamAnchor> SuffixAutomaton::match(const int32_t* context, size_t len
   int32_t matched_len = 0;
   for (size_t i = start; i < len; ++i) {
     const auto token = context[i];
-    while (state != 0 && !states_[state].next.contains(token)) {
+    while (state != 0 && states_[state].next.find(token) == states_[state].next.end()) {
       state = states_[state].link;
       matched_len = std::min<int32_t>(matched_len, states_[state].max_len);
     }

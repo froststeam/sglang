@@ -3974,9 +3974,9 @@ class ServerArgs:
                 )
 
         if self.speculative_algorithm == "NGRAM":
-            if not self.device.startswith("cuda"):
+            if not (self.device.startswith("cuda") or is_musa()):
                 raise ValueError(
-                    "Ngram speculative decoding only supports CUDA device."
+                    "Ngram speculative decoding only supports CUDA or MUSA device."
                 )
 
             if self.max_running_requests is None:
@@ -4483,7 +4483,9 @@ class ServerArgs:
             if self.attention_backend is None:
                 # User didn't specify attention backend, fallback based on GPU architecture
                 if musa_deterministic:
-                    self.attention_backend = MUSA_DEFAULT_DETERMINISTIC_ATTENTION_BACKEND
+                    self.attention_backend = (
+                        MUSA_DEFAULT_DETERMINISTIC_ATTENTION_BACKEND
+                    )
                 elif is_sm100_supported() or is_sm120_supported():
                     # Blackwell and newer architectures
                     if is_deepseek_model:
