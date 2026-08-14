@@ -178,12 +178,12 @@
     - cd test
     - python3 run_suite.py --hw musa --suite "$MUSA_RUN_SUITE" --timeout-per-file "${MUSA_RUN_SUITE_TIMEOUT_PER_FILE:-1200}"
 
-.musa-gemma4-26b-a4b-registered-suite-job:
+.musa-gemma4-26b-a4b-it-registered-suite-job:
   extends:
     - .musa-registered-suite-python-overlay-job
   variables:
-    MUSA_RUN_SUITE: "stage-a-test-4-gpu-musa-gemma4-26b-a4b-smoke"
-    MUSA_PYTHON_OVERLAY_NAME: "gemma4-26b-a4b"
+    MUSA_RUN_SUITE: "stage-a-test-4-gpu-musa-gemma4-26b-a4b-it-smoke"
+    MUSA_PYTHON_OVERLAY_NAME: "gemma4-26b-a4b-it"
     MUSA_PYTHON_OVERLAY_PACKAGES: "transformers==5.12.1 numpy<2 fsspec[http]<=2026.4.0,>=2023.1.0"
     MUSA_PYTHON_OVERLAY_VERIFY_MODULES: "transformers numpy"
 

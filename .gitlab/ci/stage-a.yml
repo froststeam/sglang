@@ -167,18 +167,18 @@ mr:musa-server-smoke:qwen35-35b-a3b-fp8-4gpu:
     MUSA_SMOKE_GSM8K_MAX_TOKENS: "512"
     MUSA_SMOKE_GSM8K_CHAT_TEMPLATE_KWARGS: '{"enable_thinking": false}'
 
-mr:musa-server-smoke:gemma4-26b-a4b-4gpu:
+mr:musa-server-smoke:gemma4-26b-a4b-it-4gpu:
   needs:
     - mr:musa-install-dependency
   extends:
     - .musa-4gpu-test-job
     - .rules-merge-request
-    - .musa-gemma4-26b-a4b-registered-suite-job
+    - .musa-gemma4-26b-a4b-it-registered-suite-job
   variables:
     MUSA_SMOKE_COMMON_EXTRA_ARGS: "--disable-piecewise-cuda-graph --attention-backend fa3 --disable-overlap-schedule --chunked-prefill-size 2048"
-    MUSA_SMOKE_GEMMA4_26B_A4B_MODEL: "/data/models/gemma-4-26B-A4B"
+    MUSA_SMOKE_GEMMA4_26B_A4B_MODEL: "/data/models/gemma-4-26B-A4B-it"
     MUSA_SMOKE_GSM8K_DATA_PATH: "/data/eval/gsm8k/test.jsonl"
-    MUSA_SMOKE_GSM8K_API: "completion"
+    MUSA_SMOKE_GSM8K_API: "chat"
     MUSA_SMOKE_GSM8K_NUM_EXAMPLES: "1319"
     MUSA_SMOKE_GSM8K_NUM_THREADS: "72"
     MUSA_SMOKE_GSM8K_MAX_TOKENS: "512"
@@ -214,7 +214,7 @@ mr:musa-server-smoke-summary:
     - mr:musa-server-smoke:qwen35-moe-no-ep-2gpu
     - mr:musa-server-smoke:joyai-llm-flash-4gpu
     - mr:musa-server-smoke:qwen35-35b-a3b-fp8-4gpu
-    - mr:musa-server-smoke:gemma4-26b-a4b-4gpu
+    - mr:musa-server-smoke:gemma4-26b-a4b-it-4gpu
     - mr:musa-server-smoke:qwen3-vl-32b-4gpu
   script:
     - python3 scripts/ci/musa/ci_summarize_smoke_artifacts.py
