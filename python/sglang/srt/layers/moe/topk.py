@@ -717,7 +717,7 @@ def grouped_topk_gpu(
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
-    scores = torch.softmax(gating_output, dim=-1)
+    scores = torch.softmax(gating_output.float(), dim=-1)
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
     group_scores = (
@@ -766,6 +766,38 @@ def grouped_topk_gpu(
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
     return topk_weights, topk_ids
+
+
+def grouped_topk_tilelang_musa_impl(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: Optional[float] = None,
+    apply_routed_scaling_factor_on_output: Optional[bool] = False,
+):
+    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+    assert num_expert_group is not None and topk_group is not None
+
+    from sglang.srt.hardware_backend.musa.jit_kernel import (
+        grouped_topk_softmax_tilelang,
+    )
+
+    return grouped_topk_softmax_tilelang(
+        gating_output=gating_output,
+        topk=topk,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        renormalize=renormalize,
+        num_fused_shared_experts=num_fused_shared_experts,
+        routed_scaling_factor=routed_scaling_factor,
+        apply_routed_scaling_factor_on_output=bool(
+            apply_routed_scaling_factor_on_output
+        ),
+    )
 
 
 def grouped_topk_cpu(
@@ -832,7 +864,9 @@ def kimi_k2_biased_topk_impl(
     return topk_weights, topk_ids
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=(_is_npu or _is_musa))
+@torch.compile(
+    dynamic=True, backend=get_compiler_backend(), disable=(_is_npu or _is_musa)
+)
 def biased_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1181,17 +1215,14 @@ def biased_grouped_topk_gpu(
         )
 
         return topk_weights, topk_ids
-    elif (
-        _is_musa
-        and (
-            (
-                gating_output.shape[1] // num_expert_group <= 32
-                and is_power_of_two(correction_bias.shape[0])
-            )
-            or (
-                num_expert_group == 1 and gating_output.shape[1] in {160, 256, 384}
-            )  # single-group shapes are handled by mate's static kernel
+    elif _is_musa and (
+        (
+            gating_output.shape[1] // num_expert_group <= 32
+            and is_power_of_two(correction_bias.shape[0])
         )
+        or (
+            num_expert_group == 1 and gating_output.shape[1] in {160, 256, 384}
+        )  # single-group shapes are handled by mate's static kernel
     ):
         topk_weights, topk_ids = moe_fused_gate(
             gating_output.to(dtype=torch.float32),
@@ -1312,7 +1343,7 @@ if _is_cpu and _is_cpu_amx_available:
     fused_topk = fused_topk_cpu
 else:
     biased_grouped_topk = biased_grouped_topk_gpu
-    grouped_topk = grouped_topk_gpu
+    grouped_topk = grouped_topk_tilelang_musa_impl if _is_musa else grouped_topk_gpu
     fused_topk_native = fused_topk_torch_native
 
 
@@ -1501,11 +1532,7 @@ def select_experts(
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
-    elif (
-        torch_native
-        and custom_routing_function is None
-        and not _is_musa
-    ):
+    elif torch_native and custom_routing_function is None and not _is_musa:
         assert (
             num_token_non_padded is None
         ), "num_token_non_padded is not yet supported in fused_topk_native"
