@@ -485,6 +485,8 @@ class Envs:
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
     SGLANG_SPEC_NAN_DETECTION = EnvBool(False)
     SGLANG_SPEC_OOB_DETECTION = EnvBool(False)
+    # DSpark confidence-driven verification. static preserves the v1 behavior.
+    SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)

@@ -107,7 +107,10 @@ class TritonAttnBackend(AttentionBackend):
         self.sliding_window_size = model_runner.sliding_window_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
-        self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+        self.num_draft_tokens = model_runner.spec_algorithm.get_num_tokens_per_req_for_target_verify(
+            model_runner.server_args.speculative_num_draft_tokens,
+            model_runner.is_draft_worker,
+        )
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.num_head = (

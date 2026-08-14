@@ -332,6 +332,40 @@ def validate_dflash_request(req: Req) -> Optional[str]:
     return None
 
 
+def validate_dspark_request(req: Req) -> Optional[str]:
+    if req.return_logprob:
+        return "DSPARK speculative decoding does not support return_logprob yet."
+
+    sampling_params = req.sampling_params
+    if (
+        sampling_params.json_schema is not None
+        or sampling_params.regex is not None
+        or sampling_params.ebnf is not None
+        or sampling_params.structural_tag is not None
+    ):
+        return (
+            "DSPARK speculative decoding does not support "
+            "grammar-constrained decoding yet."
+        )
+
+    if (
+        sampling_params.frequency_penalty != 0.0
+        or sampling_params.presence_penalty != 0.0
+        or sampling_params.repetition_penalty != 1.0
+        or sampling_params.min_new_tokens != 0
+        or sampling_params.logit_bias is not None
+        or sampling_params.custom_params is not None
+        or sampling_params.min_p != 0.0
+    ):
+        return (
+            "DSPARK speculative decoding does not support logits modifiers yet "
+            "(frequency/presence/repetition penalties, min_new_tokens, logit_bias, "
+            "min_p, or custom sampling parameters)."
+        )
+
+    return None
+
+
 class Scheduler(
     SchedulerBeamSearchProcessorMixin,
     SchedulerOutputProcessorMixin,
@@ -2131,6 +2165,14 @@ class Scheduler(
 
         if self.spec_algorithm.is_dflash():
             error_msg = validate_dflash_request(req)
+            if error_msg is not None:
+                req.set_finish_with_abort(error_msg)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
+
+        if self.spec_algorithm.is_dspark():
+            error_msg = validate_dspark_request(req)
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)

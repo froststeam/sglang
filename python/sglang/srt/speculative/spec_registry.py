@@ -58,6 +58,17 @@ class CustomSpecAlgo:
     def is_dflash(self) -> bool:
         return False
 
+    def is_dspark(self) -> bool:
+        return False
+
+    def is_dflash_family(self) -> bool:
+        return False
+
+    def get_num_tokens_per_req_for_target_verify(
+        self, num_draft_tokens: int, is_draft_worker: bool
+    ) -> int:
+        return num_draft_tokens
+
     def is_standalone(self) -> bool:
         return False
 
@@ -79,7 +90,7 @@ _REGISTRY: Dict[str, CustomSpecAlgo] = {}
 
 # Builtin enum members + the NEXTN alias; plugins cannot shadow these.
 _RESERVED_NAMES = frozenset(
-    {"DFLASH", "EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "NONE"}
+    {"DFLASH", "DSPARK", "EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "NONE"}
 )
 
 

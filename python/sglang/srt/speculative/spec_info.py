@@ -31,6 +31,7 @@ class SpeculativeAlgorithm(Enum):
     """
 
     DFLASH = auto()
+    DSPARK = auto()
     EAGLE = auto()
     EAGLE3 = auto()
     FROZEN_KV_MTP = auto()
@@ -104,6 +105,12 @@ class SpeculativeAlgorithm(Enum):
     def is_dflash(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH
 
+    def is_dspark(self) -> bool:
+        return self == SpeculativeAlgorithm.DSPARK
+
+    def is_dflash_family(self) -> bool:
+        return self.is_dflash() or self.is_dspark()
+
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
 
@@ -112,6 +119,21 @@ class SpeculativeAlgorithm(Enum):
 
     def supports_spec_v2(self) -> bool:
         return (self.is_eagle() and not self.is_frozen_kv_mtp()) or self.is_standalone()
+
+    def get_num_tokens_per_req_for_target_verify(
+        self, num_draft_tokens: int, is_draft_worker: bool
+    ) -> int:
+        """Resolve per-request token width for TARGET_VERIFY-style capture/forward.
+
+        DSPARK keeps speculative_num_draft_tokens as the target verify window
+        (gamma + 1). Draft workers propose only gamma tokens, so their width is
+        derived here instead of mutating draft server_args.
+        """
+        if num_draft_tokens is None:
+            return num_draft_tokens
+        if self.is_dspark() and is_draft_worker:
+            return int(num_draft_tokens) - 1
+        return int(num_draft_tokens)
 
     def use_spec_v2_worker(self, server_args: ServerArgs) -> bool:
         if not self.supports_spec_v2():
@@ -143,6 +165,15 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.dflash_worker import DFlashWorker
 
             return DFlashWorker
+
+        if self.is_dspark():
+            if enable_overlap:
+                raise ValueError(
+                    "DSPARK does not support overlap scheduling in the initial v1 worker."
+                )
+            from sglang.srt.speculative.dspark_worker import DSparkWorker
+
+            return DSparkWorker
 
         if self.is_frozen_kv_mtp():
             if enable_overlap:
@@ -216,6 +247,8 @@ class SpecInputType(IntEnum):
     FROZEN_KV_MTP_VERIFY = auto()
     DFLASH_DRAFT = auto()
     DFLASH_VERIFY = auto()
+    DSPARK_DRAFT = auto()
+    DSPARK_VERIFY = auto()
     NGRAM_VERIFY = auto()
 
 
@@ -232,6 +265,7 @@ class SpecInput(ABC):
             SpecInputType.FROZEN_KV_MTP_DRAFT,
             SpecInputType.FROZEN_KV_MTP_DRAFT_EXTEND,
             SpecInputType.DFLASH_DRAFT,
+            SpecInputType.DSPARK_DRAFT,
         }
 
     def is_verify_input(self) -> bool:
@@ -239,6 +273,7 @@ class SpecInput(ABC):
             SpecInputType.EAGLE_VERIFY,
             SpecInputType.FROZEN_KV_MTP_VERIFY,
             SpecInputType.DFLASH_VERIFY,
+            SpecInputType.DSPARK_VERIFY,
             SpecInputType.NGRAM_VERIFY,
         }
 

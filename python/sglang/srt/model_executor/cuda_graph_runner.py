@@ -661,12 +661,19 @@ class CudaGraphRunner:
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
         if model_runner.spec_algorithm.is_speculative():
-            if self.model_runner.is_draft_worker:
-                # DFLASH draft workers reuse this runner for TARGET_VERIFY mode.
-                if not self.model_runner.spec_algorithm.is_dflash():
-                    raise RuntimeError("This should not happen")
+            if self.model_runner.is_draft_worker and not (
+                self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.is_dspark()
+            ):
+                raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-            self.num_tokens_per_bs = self.speculative_num_draft_tokens
+            # Resolve algorithm-specific verify width (DSPARK draft uses gamma).
+            self.num_tokens_per_bs = (
+                self.model_runner.spec_algorithm.get_num_tokens_per_req_for_target_verify(
+                    self.speculative_num_draft_tokens,
+                    self.model_runner.is_draft_worker,
+                )
+            )
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
@@ -789,6 +796,13 @@ class CudaGraphRunner:
         return "nolora"
 
     def can_run(self, forward_batch: ForwardBatch):
+        if (
+            self.model_runner.spec_algorithm.is_dspark()
+            and getattr(forward_batch.spec_info, "verify_lens", None) is not None
+        ):
+            # The legacy MUSA runner has only uniform batch-size graphs.
+            # Ragged verify is admitted by the eager path below.
+            return False
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
@@ -798,6 +812,7 @@ class CudaGraphRunner:
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.is_dspark()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -1382,6 +1397,7 @@ class CudaGraphRunner:
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.is_dspark()
                 else max_num_tokens
             )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
@@ -1566,6 +1582,32 @@ class CudaGraphRunner:
                 draft_token=None,
                 positions=None,
                 draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                custom_mask=(
+                    None
+                    if (self.model_runner.is_draft_worker or not build_custom_mask)
+                    else self.buffers.custom_mask
+                ),
+                capture_hidden_mode=(
+                    CaptureHiddenMode.NULL
+                    if self.model_runner.is_draft_worker
+                    else CaptureHiddenMode.FULL
+                ),
+            )
+
+        elif self.model_runner.spec_algorithm.is_dspark():
+            from sglang.srt.speculative.dflash_utils import (
+                resolve_dflash_verify_mask_policy,
+            )
+            from sglang.srt.speculative.dspark_info import DSparkVerifyInput
+
+            _, build_custom_mask = resolve_dflash_verify_mask_policy(
+                self.model_runner.attn_backend
+            )
+            spec_info = DSparkVerifyInput(
+                draft_token=None,
+                positions=None,
+                draft_token_num=self.num_tokens_per_bs,
+                confidence_threshold=self.model_runner.server_args.speculative_dspark_confidence_threshold,
                 custom_mask=(
                     None
                     if (self.model_runner.is_draft_worker or not build_custom_mask)

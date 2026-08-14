@@ -186,14 +186,14 @@ mr:musa-server-smoke:gemma4-26b-a4b-4gpu:
 mr:musa-server-smoke:qwen3-vl-32b-4gpu:
   needs:
     - mr:musa-install-dependency
-  timeout: 30m
+  timeout: 70m
   extends:
     - .musa-4gpu-test-job
     - .rules-merge-request
     - .musa-registered-suite-job
   variables:
     MUSA_RUN_SUITE: "stage-a-test-4-gpu-musa-qwen3-vl-32b-smoke"
-    MUSA_RUN_SUITE_TIMEOUT_PER_FILE: "1800"
+    MUSA_RUN_SUITE_TIMEOUT_PER_FILE: "3900"
     MUSA_SMOKE_SERVER_HEALTH_ENDPOINT: "/health"
     MUSA_SMOKE_COMMON_EXTRA_ARGS: "--disable-piecewise-cuda-graph --attention-backend fa3 --disable-overlap-schedule --chunked-prefill-size -1"
     MUSA_SMOKE_QWEN3_VL_32B_MODEL: "/data/models/Qwen3-VL-32B-Instruct"

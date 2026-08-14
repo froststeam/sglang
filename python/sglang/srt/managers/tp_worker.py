@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
@@ -234,6 +234,7 @@ class TpModelWorker(BaseTpWorker):
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         is_multi_layer_eagle: bool = False,
+        model_load_callback: Optional[Callable[[torch.nn.Module], None]] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -254,6 +255,7 @@ class TpModelWorker(BaseTpWorker):
         self.moe_dp_rank = moe_dp_rank
         # Draft worker: target's resolved MemoryPoolConfig (forwarded to ModelRunner).
         self.memory_pool_config = memory_pool_config
+        self.model_load_callback = model_load_callback
 
         # MTP model runners
         self.model_runner_list: List[ModelRunner] = []
@@ -362,6 +364,7 @@ class TpModelWorker(BaseTpWorker):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
+            model_load_callback=self.model_load_callback,
         )
 
     def _init_multi_layer_eagle_model_runners(self):
