@@ -137,7 +137,10 @@ class WaveAttnBackend(AttentionBackend):
                 (max_bs + 1,), dtype=torch.int64, device=model_runner.device
             )
 
-        self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+        self.num_draft_tokens = model_runner.spec_algorithm.get_num_tokens_per_req_for_target_verify(
+            model_runner.server_args.speculative_num_draft_tokens,
+            model_runner.is_draft_worker,
+        )
 
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()

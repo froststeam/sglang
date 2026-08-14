@@ -144,7 +144,10 @@ class FlashAttentionBackend(AttentionBackend):
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = (
-            model_runner.server_args.speculative_num_draft_tokens
+            model_runner.spec_algorithm.get_num_tokens_per_req_for_target_verify(
+                model_runner.server_args.speculative_num_draft_tokens,
+                model_runner.is_draft_worker,
+            )
         )
         self.speculative_step_id = speculative_step_id
 

@@ -637,6 +637,12 @@ class ServerArgs:
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
+    speculative_dspark_block_size: Optional[int] = None
+    speculative_dspark_confidence_threshold: float = 0.0
+    speculative_dspark_target_layer_ids: Optional[str] = None
+    speculative_dspark_sps_table_path: Optional[str] = None
+    speculative_dspark_confidence_sts_path: Optional[str] = None
+    speculative_dspark_align_verify_tokens_to_graph_tier: bool = False
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -3847,6 +3853,139 @@ class ServerArgs:
                     "Mixed chunked prefill is disabled because of using dflash speculative decoding."
                 )
 
+        if self.speculative_algorithm == "DSPARK":
+            if is_musa() and str(envs.SGLANG_RAGGED_VERIFY_MODE.get()) == "compact":
+                raise ValueError(
+                    "MUSA DSPARK does not support SGLANG_RAGGED_VERIFY_MODE=compact: "
+                    "the MUSA FA3 backend has no ragged verify attention metadata. "
+                    "Use SGLANG_RAGGED_VERIFY_MODE=static or cap-accept."
+                )
+
+            if self.enable_dp_attention:
+                raise ValueError(
+                    "Currently DSPARK speculative decoding does not support dp attention."
+                )
+
+            if self.pp_size != 1:
+                raise ValueError(
+                    "Currently DSPARK speculative decoding only supports pp_size == 1."
+                )
+
+            if self.speculative_draft_model_path is None:
+                from sglang.srt.speculative.dspark_components.dspark_config import (
+                    checkpoint_bundles_dspark_draft,
+                )
+
+                if checkpoint_bundles_dspark_draft(self.get_model_config().hf_config):
+                    self.speculative_draft_model_path = self.model_path
+                    self.speculative_draft_model_revision = self.revision
+                    logger.info(
+                        "DSPARK draft weights are bundled in the target checkpoint; "
+                        "defaulting --speculative-draft-model-path to --model-path (%s).",
+                        self.model_path,
+                    )
+                else:
+                    raise ValueError(
+                        "DSPARK speculative decoding requires setting "
+                        "--speculative-draft-model-path."
+                    )
+
+            if self.speculative_num_steps is None:
+                self.speculative_num_steps = 1
+            elif int(self.speculative_num_steps) != 1:
+                logger.warning(
+                    "DSPARK only supports speculative_num_steps == 1 in the initial v1 worker; overriding speculative_num_steps=%s to 1.",
+                    self.speculative_num_steps,
+                )
+                self.speculative_num_steps = 1
+
+            if self.speculative_eagle_topk is None:
+                self.speculative_eagle_topk = 1
+            elif int(self.speculative_eagle_topk) != 1:
+                logger.warning(
+                    "DSPARK only supports speculative_eagle_topk == 1 in the initial v1 worker; overriding speculative_eagle_topk=%s to 1.",
+                    self.speculative_eagle_topk,
+                )
+                self.speculative_eagle_topk = 1
+
+            dspark_gamma = None
+            if self.speculative_dspark_block_size is not None:
+                if int(self.speculative_dspark_block_size) <= 0:
+                    raise ValueError(
+                        "DSPARK requires --speculative-dspark-block-size to be positive, "
+                        f"got {self.speculative_dspark_block_size}."
+                    )
+                dspark_gamma = int(self.speculative_dspark_block_size)
+            else:
+                from sglang.srt.speculative.dspark_components.dspark_config import (
+                    read_draft_checkpoint_gamma,
+                )
+
+                try:
+                    dspark_gamma = read_draft_checkpoint_gamma(server_args=self)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to infer DSPARK block size from draft model config; "
+                        "falling back to --speculative-num-draft-tokens/default. Error: %s",
+                        e,
+                    )
+
+            if dspark_gamma is not None:
+                verify_window = int(dspark_gamma) + 1
+                if (
+                    self.speculative_num_draft_tokens is not None
+                    and int(self.speculative_num_draft_tokens) != verify_window
+                ):
+                    raise ValueError(
+                        "DSPARK speculative_num_draft_tokens must equal gamma + 1 "
+                        f"(= {verify_window} for gamma={dspark_gamma}), but got "
+                        f"speculative_num_draft_tokens={self.speculative_num_draft_tokens}."
+                    )
+                self.speculative_num_draft_tokens = verify_window
+
+            if self.speculative_num_draft_tokens is None:
+                from sglang.srt.speculative.dspark_components.dspark_config import (
+                    DEFAULT_DSPARK_GAMMA,
+                )
+
+                dspark_gamma = DEFAULT_DSPARK_GAMMA
+                self.speculative_num_draft_tokens = dspark_gamma + 1
+                logger.warning(
+                    "DSPARK gamma is not set; defaulting gamma to %d and "
+                    "speculative_num_draft_tokens to %d.",
+                    dspark_gamma,
+                    self.speculative_num_draft_tokens,
+                )
+
+            if int(self.speculative_num_draft_tokens) < 2:
+                raise ValueError(
+                    "DSPARK speculative_num_draft_tokens must be >= 2 (= gamma + 1), "
+                    f"got {self.speculative_num_draft_tokens}."
+                )
+
+            if self.speculative_dspark_confidence_threshold < 0.0:
+                raise ValueError(
+                    "--speculative-dspark-confidence-threshold must be non-negative, "
+                    f"got {self.speculative_dspark_confidence_threshold}."
+                )
+
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+                )
+
+            self.disable_overlap_schedule = True
+            logger.warning(
+                "Overlap scheduler is disabled when using DSPARK speculative decoding (initial v1 worker)."
+            )
+
+            if self.enable_mixed_chunk:
+                self.enable_mixed_chunk = False
+                logger.warning(
+                    "Mixed chunked prefill is disabled because of using dspark speculative decoding."
+                )
+
         if self.speculative_algorithm == "FROZEN_KV_MTP":
             if self.max_running_requests is None:
                 self.max_running_requests = 48
@@ -6009,7 +6148,7 @@ class ServerArgs:
             type=str,
             help=(
                 "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, "
-                "NGRAM, DFLASH. Or any name registered via "
+                "NGRAM, DFLASH, DSPARK. Or any name registered via "
                 "`SpeculativeAlgorithm.register`."
             ),
         )
@@ -6059,6 +6198,42 @@ class ServerArgs:
             type=int,
             help="DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
             default=ServerArgs.speculative_dflash_block_size,
+        )
+        parser.add_argument(
+            "--speculative-dspark-block-size",
+            type=int,
+            help="DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens to gamma + 1. Defaults to the draft checkpoint block_size when omitted.",
+            default=ServerArgs.speculative_dspark_block_size,
+        )
+        parser.add_argument(
+            "--speculative-dspark-confidence-threshold",
+            type=float,
+            help="DSPARK only. Confidence threshold used to truncate a proposed draft block.",
+            default=ServerArgs.speculative_dspark_confidence_threshold,
+        )
+        parser.add_argument(
+            "--speculative-dspark-target-layer-ids",
+            type=str,
+            help="DSPARK only. Optional comma-separated target hidden layer ids. Defaults to the draft checkpoint config when omitted.",
+            default=ServerArgs.speculative_dspark_target_layer_ids,
+        )
+        parser.add_argument(
+            "--speculative-dspark-sps-table-path",
+            type=str,
+            help="DSPARK ragged verify: path to an offline SPS cost-table JSON.",
+            default=ServerArgs.speculative_dspark_sps_table_path,
+        )
+        parser.add_argument(
+            "--speculative-dspark-confidence-sts-path",
+            type=str,
+            help="DSPARK ragged verify: path to confidence-head STS calibration JSON.",
+            default=ServerArgs.speculative_dspark_confidence_sts_path,
+        )
+        parser.add_argument(
+            "--speculative-dspark-align-verify-tokens-to-graph-tier",
+            action="store_true",
+            help="DSPARK compact mode: fill graph-tier padding with real verify tokens.",
+            default=ServerArgs.speculative_dspark_align_verify_tokens_to_graph_tier,
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",

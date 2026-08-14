@@ -170,6 +170,12 @@ from sglang.srt.server_args import (
     get_global_server_args,
     set_global_server_args_for_scheduler,
 )
+from sglang.srt.model_executor.model_runner_components.attention_backend_setup import (
+    configure_aux_hidden_state_capture,
+)
+from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
+    resolve_spec_aux_hidden_state_config,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.state_capturer.indexer_topk import (
@@ -290,6 +296,7 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 logger = logging.getLogger(__name__)
 
 
+
 def resolve_language_model(model: nn.Module) -> nn.Module:
     model_cls_name = model.__class__.__name__
     if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
@@ -347,6 +354,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         draft_model_idx: Optional[int] = None,
+        model_load_callback: Optional[Callable[[torch.nn.Module], None]] = None,
     ):
         # Parse args
         self.mem_fraction_static = mem_fraction_static
@@ -372,6 +380,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        self.model_load_callback = model_load_callback
         self.is_generation = model_config.is_generation
         self.device_timer = None
         self.is_multimodal = model_config.is_multimodal
@@ -412,9 +421,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         self.eagle_use_aux_hidden_state = False
+        self.eagle_aux_hidden_state_layer_ids = None
         self.dflash_use_aux_hidden_state = False
         self.dflash_target_layer_ids = None
         self.dflash_draft_num_layers = None
+        self.dspark_use_aux_hidden_state = False
+        self.dspark_target_layer_ids = None
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
             # load draft config
             draft_model_config = self._build_model_config(
@@ -440,51 +452,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # if there is no aux layer, set to None
                 self.eagle_aux_hidden_state_layer_ids = None
 
-        if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
-            from sglang.srt.speculative.dflash_utils import (
-                parse_dflash_draft_config,
-            )
-
-            # Select target layers to capture for building DFlash context features.
-            draft_model_config = self._build_model_config(
-                server_args,
-                model_path=(server_args.speculative_draft_model_path),
-                model_revision=server_args.speculative_draft_model_revision,
-                is_draft_model=True,
-            )
-            dflash_draft_config = parse_dflash_draft_config(
-                draft_hf_config=draft_model_config.hf_config
-            )
-            draft_num_layers = dflash_draft_config.require_num_layers()
-            trained_target_layers = dflash_draft_config.num_target_layers
-
-            target_num_layers = getattr(
-                self.model_config.hf_text_config, "num_hidden_layers", None
-            )
-            if target_num_layers is None:
-                raise ValueError(
-                    "DFLASH requires target num_hidden_layers in config. "
-                    f"Got target={target_num_layers}."
-                )
-            target_num_layers = int(target_num_layers)
-
-            if (
-                trained_target_layers is not None
-                and trained_target_layers != target_num_layers
-            ):
-                logger.warning(
-                    "DFLASH draft config num_target_layers=%s differs from runtime target num_hidden_layers=%s; "
-                    "selecting capture layers based on the runtime target model.",
-                    trained_target_layers,
-                    target_num_layers,
-                )
-
-            self.dflash_use_aux_hidden_state = True
-            self.dflash_draft_num_layers = int(draft_num_layers)
-            self.dflash_target_layer_ids = dflash_draft_config.resolve_target_layer_ids(
-                target_num_layers=int(target_num_layers),
-                draft_num_layers=int(draft_num_layers),
-            )
+        aux_hidden_state_config = resolve_spec_aux_hidden_state_config(
+            server_args=server_args,
+            model_config=self.model_config,
+            spec_algorithm=self.spec_algorithm,
+            is_draft_worker=self.is_draft_worker,
+        )
+        self.dflash_use_aux_hidden_state = (
+            aux_hidden_state_config.dflash_use_aux_hidden_state
+        )
+        self.dflash_draft_num_layers = aux_hidden_state_config.dflash_draft_num_layers
+        self.dflash_target_layer_ids = aux_hidden_state_config.dflash_target_layer_ids
+        self.dspark_use_aux_hidden_state = (
+            aux_hidden_state_config.dspark_use_aux_hidden_state
+        )
+        self.dspark_target_layer_ids = aux_hidden_state_config.dspark_target_layer_ids
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
@@ -653,6 +635,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
+        if self.model_load_callback is not None:
+            self.model_load_callback(self.model)
         self._prepare_moe_topk()
 
         # Load the expert backup client
@@ -900,17 +884,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         Must be called before CUDA graph capture so the captured graphs
         include aux hidden state output paths.
         """
-        if self.eagle_use_aux_hidden_state:
-            self.model.set_eagle3_layers_to_capture(
-                self.eagle_aux_hidden_state_layer_ids
-            )
-        if self.dflash_use_aux_hidden_state:
-            if not hasattr(self.model, "set_dflash_layers_to_capture"):
-                raise ValueError(
-                    f"Model {self.model.__class__.__name__} does not implement "
-                    "set_dflash_layers_to_capture, which is required for DFLASH."
-                )
-            self.model.set_dflash_layers_to_capture(self.dflash_target_layer_ids)
+        configure_aux_hidden_state_capture(
+            model=self.model,
+            eagle_use_aux_hidden_state=self.eagle_use_aux_hidden_state,
+            eagle_aux_hidden_state_layer_ids=self.eagle_aux_hidden_state_layer_ids,
+            dflash_use_aux_hidden_state=self.dflash_use_aux_hidden_state,
+            dflash_target_layer_ids=self.dflash_target_layer_ids,
+            is_dspark=self.spec_algorithm.is_dspark(),
+        )
 
     def remote_instance_init_transfer_engine(self):
         try:
@@ -2637,11 +2618,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         capture_hidden_mode = CaptureHiddenMode.NULL
         num_tokens_per_bs = 1
         if self.spec_algorithm.is_speculative():
-            if self.is_draft_worker:
-                if not self.spec_algorithm.is_dflash():
-                    raise RuntimeError("This should not happen")
+            if self.is_draft_worker and not (
+                self.spec_algorithm.is_dflash() or self.spec_algorithm.is_dspark()
+            ):
+                raise RuntimeError("This should not happen")
             capture_forward_mode = ForwardMode.TARGET_VERIFY
-            num_tokens_per_bs = self.server_args.speculative_num_draft_tokens
+            num_tokens_per_bs = self.spec_algorithm.get_num_tokens_per_req_for_target_verify(
+                self.server_args.speculative_num_draft_tokens,
+                self.is_draft_worker,
+            )
 
         if self.server_args.enable_return_hidden_states:
             capture_hidden_mode = CaptureHiddenMode.FULL
@@ -2794,6 +2779,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     draft_token=None,
                     positions=None,
                     draft_token_num=self.server_args.speculative_num_draft_tokens,
+                    custom_mask=None,
+                    capture_hidden_mode=(
+                        CaptureHiddenMode.NULL
+                        if self.is_draft_worker
+                        else CaptureHiddenMode.FULL
+                    ),
+                )
+
+            elif self.spec_algorithm.is_dspark():
+                from sglang.srt.speculative.dspark_info import DSparkVerifyInput
+
+                spec_info = DSparkVerifyInput(
+                    draft_token=None,
+                    positions=None,
+                    draft_token_num=num_tokens_per_bs,
+                    confidence_threshold=self.server_args.speculative_dspark_confidence_threshold,
                     custom_mask=None,
                     capture_hidden_mode=(
                         CaptureHiddenMode.NULL

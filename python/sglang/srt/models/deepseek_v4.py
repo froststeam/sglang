@@ -1143,6 +1143,8 @@ class DeepseekV4Model(nn.Module):
         if self.nsa_enable_prefill_cp:
             self.cp_size = get_attention_cp_size()
 
+        self.dspark_layers_to_capture: Optional[List[int]] = None
+
     def prewarm_mhc_token_count_buckets(
         self, max_num_tokens: int, device: torch.device
     ) -> Tuple[int, ...]:
@@ -1216,6 +1218,15 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
+        capture_dspark = self.dspark_layers_to_capture is not None
+        if capture_dspark and nsa_use_prefill_cp(forward_batch):
+            raise NotImplementedError(
+                "DSpark aux hidden-state capture is not supported together with "
+                "DeepSeek-V4 prefill context parallelism (attn_cp_size > 1). "
+                "Disable one of them: DSpark static-verify is CP-off for v1."
+            )
+        dspark_aux_hidden_states: List[torch.Tensor] = []
+
         n_hash_layers = self.n_hash_layers
         server_args = get_global_server_args()
         record_expert_stats = (
@@ -1239,6 +1250,8 @@ class DeepseekV4Model(nn.Module):
                     input_ids=input_ids,
                     input_ids_global=input_ids_global,
                 )
+                if capture_dspark and i in self.dspark_layers_to_capture:
+                    dspark_aux_hidden_states.append(hidden_states.mean(dim=1))
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if self.pp_group.is_last_rank and nsa_use_prefill_cp(forward_batch):
@@ -1261,6 +1274,9 @@ class DeepseekV4Model(nn.Module):
         hidden_states = _maybe_tilelang_rmsnorm(
             hidden_states, self.norm, "model.final_norm"
         )
+
+        if capture_dspark:
+            return (hidden_states, pre_hc_head), dspark_aux_hidden_states
 
         return hidden_states, pre_hc_head
 
@@ -1344,6 +1360,16 @@ class DeepseekV4ForCausalLM(nn.Module):
     @property
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
+
+    def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.dspark_layers_to_capture = list(layer_ids)
 
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = 0
