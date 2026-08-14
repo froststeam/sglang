@@ -5,13 +5,13 @@ from sglang.test.ci.ci_register import register_musa_ci
 
 register_musa_ci(
     est_time=600,
-    suite="stage-a-test-4-gpu-musa-gemma4-26b-a4b-smoke",
+    suite="stage-a-test-4-gpu-musa-gemma4-26b-a4b-it-smoke",
 )
 
 
 class TestMusaServerSmokeGemma426BA4B4GPU(musa_server_smoke.MusaServerSmokeTest):
     smoke_case = musa_server_smoke.MusaSmokeCase(
-        name="gemma4-26b-a4b-tp4",
+        name="gemma4-26b-a4b-it-tp4",
         model_env="MUSA_SMOKE_GEMMA4_26B_A4B_MODEL",
         tp_size=4,
         default_gsm8k_min_score=0.70,

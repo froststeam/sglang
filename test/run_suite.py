@@ -45,7 +45,7 @@ PER_COMMIT_SUITES = {
         "stage-a-test-2-gpu-musa-qwen35-moe-no-ep-smoke",
         "stage-a-test-4-gpu-musa-smoke",
         "stage-a-test-4-gpu-musa-joyai-llm-flash-smoke",
-        "stage-a-test-4-gpu-musa-gemma4-26b-a4b-smoke",
+        "stage-a-test-4-gpu-musa-gemma4-26b-a4b-it-smoke",
         "stage-a-test-4-gpu-musa-qwen3-vl-32b-smoke",
     ],
     HWBackend.CUDA: [
