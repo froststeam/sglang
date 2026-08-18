@@ -34,7 +34,7 @@ def display_model_name(model: str) -> str:
 
 def model_from_metrics_file(path: Path) -> str:
     stem = path.stem
-    for prefix in ("gsm8k__", "vlm__"):
+    for prefix in ("gsm8k__", "vlm__", "speculative__"):
         if stem.startswith(prefix):
             stem = stem[len(prefix) :]
             break
@@ -65,7 +65,9 @@ def dataset_name(metrics: dict, json_file: Path | None) -> str:
 
 def manifest_metrics(manifest: dict) -> dict:
     eval_value = manifest.get("smoke_eval", "")
-    dataset = manifest.get("smoke_vlm_dataset", "") if eval_value == "vlm" else eval_value
+    dataset = (
+        manifest.get("smoke_vlm_dataset", "") if eval_value == "vlm" else eval_value
+    )
     metric = manifest.get("smoke_vlm_metric", "") if eval_value == "vlm" else "score"
     limit = manifest.get("smoke_vlm_limit", "") if eval_value == "vlm" else ""
     return {
@@ -122,8 +124,10 @@ def main() -> None:
     if ARTIFACT_ROOT.exists():
         for job_dir in sorted(p for p in ARTIFACT_ROOT.iterdir() if p.is_dir()):
             manifest = load_manifest(job_dir)
-            json_files = sorted(job_dir.glob("gsm8k__*.json")) + sorted(
-                job_dir.glob("vlm__*.json")
+            json_files = (
+                sorted(job_dir.glob("gsm8k__*.json"))
+                + sorted(job_dir.glob("vlm__*.json"))
+                + sorted(job_dir.glob("speculative__*.json"))
             )
             if not json_files:
                 rows.append(
@@ -134,6 +138,7 @@ def main() -> None:
                         "file": "",
                         "metrics": manifest_metrics(manifest),
                         "missing_metrics": True,
+                        "speculative": False,
                     }
                 )
                 continue
@@ -155,23 +160,48 @@ def main() -> None:
                         "metrics": metrics,
                         "missing_metrics": False,
                         "parse_error": parse_error,
+                        # A speculative job also produces a generic GSM8K
+                        # artifact for its accuracy run.  Only the dedicated
+                        # speculative artifact belongs in the speculative
+                        # summary table.
+                        "speculative": json_file.name.startswith("speculative__"),
                     }
                 )
 
     summary_json = SUMMARY_ROOT / "summary.json"
     summary_json.write_text(json.dumps(rows, indent=2, ensure_ascii=False) + "\n")
 
+    # A speculative job emits both a generic GSM8K accuracy artifact and a
+    # dedicated speculative artifact.  Suppress the generic artifact from the
+    # ordinary table for those jobs; otherwise one CI job appears as two rows
+    # and its accuracy throughput is mixed with decode-only speculative TPS.
+    speculative_job_dirs = {
+        Path(row["file"]).parent
+        for row in rows
+        if row.get("speculative") and row.get("file")
+    }
+    ordinary_rows = [
+        row
+        for row in rows
+        if not row.get("speculative")
+        and (
+            not row.get("file")
+            or Path(row["file"]).parent not in speculative_job_dirs
+        )
+    ]
+    speculative_rows = [row for row in rows if row.get("speculative")]
+
     lines = ["# MUSA Smoke Eval Summary", ""]
     if not rows:
         lines.append("No MUSA smoke artifacts were found.")
     else:
-        lines.append(
-            "| Model | Parallel | Dataset | Examples | Score | Throughput(tok/s) |"
+        lines.extend(
+            [
+                "| Model | Parallel | Dataset | Examples | Score | Throughput(tok/s) |",
+                "| --- | --- | --- | ---: | ---: | ---: |",
+            ]
         )
-        lines.append(
-            "| --- | --- | --- | ---: | ---: | ---: |"
-        )
-        for row in rows:
+        for row in ordinary_rows:
             metrics = row["metrics"]
             json_file = Path(row["file"]) if row.get("file") else None
             lines.append(
@@ -183,6 +213,35 @@ def main() -> None:
                     fmt(metrics.get("score")),
                     fmt(metrics.get("output_throughput")),
                 )
+            )
+
+        lines.extend(
+            [
+                "",
+                "## Speculative decoding evaluation",
+                "",
+                "| Model | Algorithm | Parallel | Dataset | Accuracy Score | Accept Length | Speedup |",
+                "| --- | --- | --- | --- | ---: | ---: | ---: |",
+            ]
+        )
+        if speculative_rows:
+            for row in speculative_rows:
+                metrics = row["metrics"]
+                json_file = Path(row["file"]) if row.get("file") else None
+                lines.append(
+                    "| `{}` | {} | {} | {} | {} | {} | {} |".format(
+                        row["model"],
+                        metrics.get("algorithm", ""),
+                        row.get("parallel", ""),
+                        dataset_name(metrics, json_file),
+                        fmt(metrics.get("score")),
+                        fmt(metrics.get("avg_spec_accept_length")),
+                        fmt(metrics.get("speedup")),
+                    )
+                )
+        else:
+            lines.append(
+                "| No speculative decoding artifacts found. | | | | | | |"
             )
 
     summary_md = SUMMARY_ROOT / "summary.md"

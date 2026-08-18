@@ -204,6 +204,139 @@ mr:musa-server-smoke:qwen3-vl-32b-4gpu:
     MUSA_SMOKE_VLM_BATCH_SIZE: "128"
     MUSA_SMOKE_VLM_MIN_SCORE: "0.55"
 
+mr:musa-speculative-smoke:dspark-1gpu:
+  needs:
+    - mr:musa-install-dependency
+  timeout: 40m
+  extends:
+    - .musa-1gpu-test-job
+    - .rules-merge-request
+    - .musa-registered-suite-job
+  variables:
+    MUSA_RUN_SUITE: "stage-a-test-1-gpu-musa-dspark-smoke"
+    MUSA_RUN_SUITE_TIMEOUT_PER_FILE: "1800"
+    MUSA_SPEC_SERVER_TIMEOUT: "900"
+    MUSA_SPEC_ACCURACY_THRESHOLD: "0.92"
+    MUSA_SPEC_MIN_ACCEPT_LENGTH: "4.0"
+    MUSA_SPEC_MIN_SPEEDUP: "2.0"
+    MUSA_SPEC_DSPARK_TARGET_MODEL: "/data/models/Qwen3-8B"
+    MUSA_SPEC_DSPARK_DRAFT_MODEL: "/data/models/dspark_qwen3_8b_block7"
+    MUSA_SPEC_ALGORITHM: "DSPARK"
+    SGLANG_MUSA_GEMV_AUTOTUNE_TOKENS: "0"
+    MUSA_SPEC_EVAL_API: "chat"
+    MUSA_SPEC_EVAL_GSM8K_DATA_PATH: "/data/eval/gsm8k/test.jsonl"
+    MUSA_SPEC_EVAL_NUM_EXAMPLES: "200"
+    MUSA_SPEC_EVAL_NUM_THREADS: "32"
+    MUSA_SPEC_EVAL_NUM_SHOTS: "5"
+    MUSA_SPEC_EVAL_MAX_TOKENS: "1024"
+    MUSA_SPEC_EVAL_CHAT_TEMPLATE_KWARGS: '{"enable_thinking": false}'
+    MUSA_SPEC_EVAL_REASONING_EFFORT: "none"
+    MUSA_SPEC_PERF_DATA_PATH: "/data/eval/gsm8k/test.jsonl"
+    MUSA_SPEC_PERF_NUM_EXAMPLES: "64"
+    MUSA_SPEC_PERF_BS: "1"
+    MUSA_SPEC_PERF_MAX_NEW_TOKENS: "512"
+    MUSA_SPEC_PERF_SEED: "980406"
+    MUSA_SPEC_COMMON_EXTRA_ARGS: "--disable-piecewise-cuda-graph --attention-backend fa3 --disable-overlap-schedule --chunked-prefill-size 2048 --mem-fraction-static 0.80 --max-running-requests 1 --cuda-graph-max-bs 1 --skip-server-warmup"
+
+mr:musa-speculative-smoke:eagle3-1gpu:
+  needs:
+    - mr:musa-install-dependency
+  timeout: 40m
+  extends:
+    - .musa-1gpu-test-job
+    - .rules-merge-request
+    - .musa-registered-suite-job
+  variables:
+    MUSA_RUN_SUITE: "stage-a-test-1-gpu-musa-eagle3-smoke"
+    MUSA_RUN_SUITE_TIMEOUT_PER_FILE: "1800"
+    MUSA_SPEC_SERVER_TIMEOUT: "900"
+    MUSA_SPEC_ACCURACY_THRESHOLD: "0.92"
+    MUSA_SPEC_MIN_ACCEPT_LENGTH: "2.0"
+    MUSA_SPEC_MIN_SPEEDUP: "1.3"
+    MUSA_SPEC_EAGLE3_TARGET_MODEL: "/data/models/Qwen3-8B"
+    MUSA_SPEC_EAGLE3_DRAFT_MODEL: "/data/models/qwen3_8b_eagle3"
+    MUSA_SPEC_ALGORITHM: "EAGLE3"
+    SGLANG_MUSA_GEMV_AUTOTUNE_TOKENS: "0"
+    MUSA_SPEC_EVAL_API: "chat"
+    MUSA_SPEC_EVAL_GSM8K_DATA_PATH: "/data/eval/gsm8k/test.jsonl"
+    MUSA_SPEC_EVAL_NUM_EXAMPLES: "200"
+    MUSA_SPEC_EVAL_NUM_THREADS: "32"
+    MUSA_SPEC_EVAL_NUM_SHOTS: "5"
+    MUSA_SPEC_EVAL_MAX_TOKENS: "1024"
+    MUSA_SPEC_EVAL_CHAT_TEMPLATE_KWARGS: '{"enable_thinking": false}'
+    MUSA_SPEC_EVAL_REASONING_EFFORT: "none"
+    MUSA_SPEC_PERF_DATA_PATH: "/data/eval/gsm8k/test.jsonl"
+    MUSA_SPEC_PERF_NUM_EXAMPLES: "64"
+    MUSA_SPEC_PERF_BS: "1"
+    MUSA_SPEC_PERF_MAX_NEW_TOKENS: "512"
+    MUSA_SPEC_PERF_SEED: "980406"
+    MUSA_SPEC_COMMON_EXTRA_ARGS: "--disable-piecewise-cuda-graph --attention-backend fa3 --disable-overlap-schedule --chunked-prefill-size 2048 --mem-fraction-static 0.80 --max-running-requests 1 --cuda-graph-max-bs 1 --skip-server-warmup"
+
+mr:musa-speculative-smoke:ngram-1gpu:
+  needs:
+    - mr:musa-install-dependency
+  timeout: 40m
+  extends:
+    - .musa-1gpu-test-job
+    - .rules-merge-request
+    - .musa-registered-suite-job
+  variables:
+    MUSA_RUN_SUITE: "stage-a-test-1-gpu-musa-ngram-smoke"
+    MUSA_RUN_SUITE_TIMEOUT_PER_FILE: "1800"
+    MUSA_SPEC_SERVER_TIMEOUT: "900"
+    MUSA_SPEC_ACCURACY_THRESHOLD: "0.92"
+    MUSA_SPEC_MIN_ACCEPT_LENGTH: "1.8"
+    MUSA_SPEC_MIN_SPEEDUP: "1.3"
+    MUSA_SPEC_NGRAM_MODEL: "/data/models/Qwen3-8B"
+    MUSA_SPEC_EVAL_API: "chat"
+    MUSA_SPEC_EVAL_GSM8K_DATA_PATH: "/data/eval/gsm8k/test.jsonl"
+    MUSA_SPEC_EVAL_NUM_EXAMPLES: "200"
+    MUSA_SPEC_EVAL_NUM_THREADS: "32"
+    MUSA_SPEC_EVAL_NUM_SHOTS: "5"
+    MUSA_SPEC_EVAL_MAX_TOKENS: "1024"
+    MUSA_SPEC_EVAL_CHAT_TEMPLATE_KWARGS: '{"enable_thinking": false}'
+    MUSA_SPEC_EVAL_REASONING_EFFORT: "none"
+    MUSA_SPEC_PERF_DATA_PATH: "/data/eval/gsm8k/test.jsonl"
+    MUSA_SPEC_PERF_NUM_EXAMPLES: "64"
+    MUSA_SPEC_PERF_BS: "1"
+    MUSA_SPEC_PERF_MAX_NEW_TOKENS: "512"
+    MUSA_SPEC_PERF_SEED: "980406"
+    MUSA_SPEC_COMMON_EXTRA_ARGS: "--disable-piecewise-cuda-graph --attention-backend fa3 --page-size 1 --disable-overlap-schedule --chunked-prefill-size 2048 --mem-fraction-static 0.80 --max-running-requests 1 --cuda-graph-max-bs 1 --skip-server-warmup"
+
+mr:musa-speculative-smoke:mtp-4gpu:
+  needs:
+    - mr:musa-install-dependency
+  timeout: 50m
+  extends:
+    - .musa-4gpu-test-job
+    - .rules-merge-request
+    - .musa-registered-suite-job
+  variables:
+    MUSA_RUN_SUITE: "stage-a-test-4-gpu-musa-mtp-smoke"
+    MUSA_RUN_SUITE_TIMEOUT_PER_FILE: "2400"
+    MUSA_SPEC_SERVER_TIMEOUT: "1200"
+    MUSA_SPEC_ACCURACY_THRESHOLD: "0.94"
+    MUSA_SPEC_MIN_ACCEPT_LENGTH: "3.0"
+    MUSA_SPEC_MIN_SPEEDUP: "1.5"
+    MUSA_SPEC_MTP_MODEL: "/data/models/Qwen3.5-35B-A3B-FP8"
+    MUSA_SPEC_ALGORITHM: "NEXTN"
+    SGLANG_MUSA_GEMV_AUTOTUNE_TOKENS: "0"
+    SGLANG_MUSA_CUSTOM_AR_GRAPH_REGISTERED_INPUT: "0"
+    MUSA_SPEC_EVAL_API: "chat"
+    MUSA_SPEC_EVAL_GSM8K_DATA_PATH: "/data/eval/gsm8k/test.jsonl"
+    MUSA_SPEC_EVAL_NUM_EXAMPLES: "200"
+    MUSA_SPEC_EVAL_NUM_THREADS: "32"
+    MUSA_SPEC_EVAL_NUM_SHOTS: "5"
+    MUSA_SPEC_EVAL_MAX_TOKENS: "512"
+    MUSA_SPEC_EVAL_CHAT_TEMPLATE_KWARGS: '{"enable_thinking": false}'
+    MUSA_SPEC_EVAL_REASONING_EFFORT: "none"
+    MUSA_SPEC_PERF_DATA_PATH: "/data/eval/gsm8k/test.jsonl"
+    MUSA_SPEC_PERF_NUM_EXAMPLES: "64"
+    MUSA_SPEC_PERF_BS: "1"
+    MUSA_SPEC_PERF_MAX_NEW_TOKENS: "512"
+    MUSA_SPEC_PERF_SEED: "980406"
+    MUSA_SPEC_COMMON_EXTRA_ARGS: "--disable-piecewise-cuda-graph --attention-backend fa3 --disable-overlap-schedule --chunked-prefill-size 2048 --linear-attn-prefill-backend flashinfer --linear-attn-decode-backend flashinfer --moe-runner-backend auto --mamba-scheduler-strategy extra_buffer --mamba-track-interval 128 --mem-fraction-static 0.70 --max-running-requests 1 --cuda-graph-bs 1 --skip-server-warmup"
+
 mr:musa-server-smoke-summary:
   stage: mr-summary
   extends:
@@ -216,6 +349,10 @@ mr:musa-server-smoke-summary:
     - mr:musa-server-smoke:qwen35-35b-a3b-fp8-4gpu
     - mr:musa-server-smoke:gemma4-26b-a4b-it-4gpu
     - mr:musa-server-smoke:qwen3-vl-32b-4gpu
+    - mr:musa-speculative-smoke:dspark-1gpu
+    - mr:musa-speculative-smoke:eagle3-1gpu
+    - mr:musa-speculative-smoke:ngram-1gpu
+    - mr:musa-speculative-smoke:mtp-4gpu
   script:
     - python3 scripts/ci/musa/ci_summarize_smoke_artifacts.py
   artifacts:

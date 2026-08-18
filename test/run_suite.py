@@ -41,9 +41,13 @@ PER_COMMIT_SUITES = {
     ],
     HWBackend.MUSA: [
         "stage-a-test-1-gpu-musa-smoke",
+        "stage-a-test-1-gpu-musa-dspark-smoke",
+        "stage-a-test-1-gpu-musa-eagle3-smoke",
+        "stage-a-test-1-gpu-musa-ngram-smoke",
         "stage-a-test-2-gpu-musa-smoke",
         "stage-a-test-2-gpu-musa-qwen35-moe-no-ep-smoke",
         "stage-a-test-4-gpu-musa-smoke",
+        "stage-a-test-4-gpu-musa-mtp-smoke",
         "stage-a-test-4-gpu-musa-joyai-llm-flash-smoke",
         "stage-a-test-4-gpu-musa-gemma4-26b-a4b-it-smoke",
         "stage-a-test-4-gpu-musa-qwen3-vl-32b-smoke",
