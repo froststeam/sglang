@@ -1825,6 +1825,19 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata_expand.cu_seqlens_k = self.target_verify_metadata_topk_expand[
                     "cu_seqlens_k"
                 ][: bs * self.speculative_num_draft_tokens + 1]
+                if is_musa() and self.fa_impl_ver == 3:
+                    # MUSA FA3 cannot capture an all-zero expand workload. Replay
+                    # replaces these values with the request-specific tree mask.
+                    metadata_expand.cache_seqlens_int32.fill_(
+                        self.speculative_num_draft_tokens
+                    )
+                    metadata_expand.cu_seqlens_k[1:].copy_(
+                        torch.cumsum(
+                            metadata_expand.cache_seqlens_int32,
+                            dim=0,
+                            dtype=torch.int32,
+                        )
+                    )
 
                 metadata_expand.page_table = self.target_verify_metadata_topk_expand[
                     "page_table"
