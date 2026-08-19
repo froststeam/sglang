@@ -165,6 +165,21 @@ class TestCacheDitRefreshContext(unittest.TestCase):
             },
         )
 
+    def test_parallelism_config_falls_back_when_auto_backend_is_missing(self):
+        module = self._import_module_with_stub()
+
+        class Backend:
+            NATIVE_PYTORCH = "native-pytorch"
+
+        module.ParallelismBackend = Backend
+        module.ParallelismConfig = lambda **kwargs: kwargs
+        module.get_tp_world_size = lambda: 2
+
+        config = module._build_parallelism_config(None, object())
+
+        self.assertEqual(config["backend"], "native-pytorch")
+        self.assertEqual(config["tp_size"], 2)
+
     def test_refresh_context_with_scm_preset_uses_steps_mask(self):
         module = self._import_module_with_stub()
         module.refresh_context_on_transformer(

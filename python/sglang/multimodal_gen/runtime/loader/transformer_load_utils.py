@@ -504,6 +504,11 @@ def _resolve_quant_config(
         component_model_path,
         reverse_param_names_mapping=reverse_param_names_mapping_dict,
     )
+    if quant_config is None and server_args.transformer_weights_path:
+        for safetensors_file in safetensors_list:
+            quant_config = get_quant_config_from_safetensors_metadata(safetensors_file)
+            if quant_config is not None:
+                return quant_config
     quant_config_name = _get_quant_config_name(quant_config)
     inferred_nvfp4_config = None
     if quant_config is None or quant_config_name == "modelopt_fp4":
@@ -526,11 +531,6 @@ def _resolve_quant_config(
     quant_config = _merge_modelopt_fp4_configs(quant_config, inferred_nvfp4_config)
     if quant_config is not None:
         return quant_config
-
-    for safetensors_file in safetensors_list:
-        quant_config = get_quant_config_from_safetensors_metadata(safetensors_file)
-        if quant_config is not None:
-            return quant_config
 
     return inferred_nvfp4_config
 

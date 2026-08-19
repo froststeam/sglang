@@ -49,11 +49,14 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
 )
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
+    ModelOptFp8Config,
+    ModelOptFp8LinearMethod,
     _prepare_nvfp4_weight_bytes,
 )
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     _filter_duplicate_precision_variant_safetensors,
     _Flux2Nvfp4FallbackAdapter,
+    _resolve_quant_config,
     resolve_transformer_quant_load_spec,
     resolve_transformer_safetensors_to_load,
 )
@@ -71,6 +74,12 @@ class _FakeQuantConfig:
     @classmethod
     def get_name(cls):
         return "modelopt_fp4"
+
+
+class _FakeFp8QuantConfig:
+    @classmethod
+    def get_name(cls):
+        return "modelopt"
 
 
 class TestTransformerQuantHelpers(unittest.TestCase):
@@ -147,6 +156,40 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         resolved = _filter_duplicate_precision_variant_safetensors(files)
 
         self.assertEqual(resolved, files)
+
+    @patch(
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.build_nvfp4_config_from_safetensors_list"
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils._resolve_quant_config_from_transformer_override",
+        return_value=_FakeFp8QuantConfig(),
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.get_quant_config_from_safetensors_metadata",
+        return_value=_FakeFp8QuantConfig(),
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.get_quant_config",
+        return_value=None,
+    )
+    def test_transformer_metadata_precedes_nvfp4_inference(
+        self, _mock_base_config, mock_metadata, mock_override_config, mock_nvfp4
+    ):
+        server_args = self._make_server_args(
+            transformer_weights_path="/tmp/modelopt-fp8-transformer"
+        )
+
+        resolved = _resolve_quant_config(
+            hf_config={},
+            server_args=server_args,
+            safetensors_list=["/tmp/modelopt-fp8-transformer/shard.safetensors"],
+            component_model_path="/tmp/base-transformer",
+        )
+
+        self.assertIsInstance(resolved, _FakeFp8QuantConfig)
+        mock_metadata.assert_called_once()
+        mock_override_config.assert_not_called()
+        mock_nvfp4.assert_not_called()
 
     @patch(
         "sglang.multimodal_gen.runtime.loader.transformer_load_utils.build_nvfp4_config_from_safetensors_list",
@@ -233,6 +276,37 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         prepared = _prepare_nvfp4_weight_bytes(weight, swap_weight_nibbles=False)
 
         self.assertEqual(prepared.tolist(), [[0xAB, 0x10]])
+
+    @patch(
+        "sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant.current_platform.is_musa",
+        return_value=True,
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant.requantize_with_max_scale"
+    )
+    def test_modelopt_fp8_musa_keeps_single_partition_checkpoint_weight(
+        self, mock_requantize, _mock_is_musa
+    ):
+        layer = torch.nn.Module()
+        layer.logical_widths = [3]
+        layer.weight = torch.nn.Parameter(
+            torch.arange(6, dtype=torch.float32).reshape(3, 2).to(torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        layer.weight_scale = torch.nn.Parameter(
+            torch.tensor([0.25], dtype=torch.float32), requires_grad=False
+        )
+        layer.input_scale = torch.nn.Parameter(
+            torch.tensor([0.5], dtype=torch.float32), requires_grad=False
+        )
+        method = ModelOptFp8LinearMethod(ModelOptFp8Config())
+
+        method.process_weights_after_loading(layer)
+
+        self.assertEqual(tuple(layer.weight.shape), (2, 3))
+        self.assertEqual(layer.weight_scale.item(), 0.25)
+        self.assertEqual(layer.input_scale.item(), 0.5)
+        mock_requantize.assert_not_called()
 
     def test_modelopt_fp4_config_reads_swap_weight_nibbles_from_flat_config(self):
         config = ModelOptFp4Config.from_config(

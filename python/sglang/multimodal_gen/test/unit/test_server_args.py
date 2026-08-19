@@ -592,6 +592,15 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(server_args.enable_cfg_parallel)
 
 
+class TestCFGParallelAliases(unittest.TestCase):
+    def test_cfg_parallel_size_is_preserved_as_cfg_parallel_degree(self):
+        args = type("Args", (), {"cfg_parallel_degree": 2})()
+        with patch.object(sys, "argv", ["sglang", "--cfg-parallel-size", "2"]):
+            provided = ServerArgs.get_provided_args(args, [])
+
+        self.assertEqual(provided, {"cfg_parallel_degree": 2})
+
+
 class TestFSDPShardConditions(unittest.TestCase):
     def test_helpers_match_only_direct_block_entries(self):
         self.assertTrue(

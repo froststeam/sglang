@@ -158,6 +158,7 @@ class GroupCoordinator:
         local_rank: int,
         torch_distributed_backend: Union[str, Backend],
         use_device_communicator: bool = True,
+        use_custom_collectives: bool = False,
         use_message_queue_broadcaster: bool = False,
         group_name: str | None = None,
     ):
@@ -211,6 +212,35 @@ class GroupCoordinator:
                     device_group=self.device_group,
                     unique_name=self.unique_name,
                 )
+
+        self.ca_comm: Optional[Any] = None
+        self.cag_comm: Optional[Any] = None
+        if (
+            use_custom_collectives
+            and self.world_size > 1
+            and current_platform.is_musa()
+        ):
+            from sglang.srt.distributed.device_communicators.custom_all_gather import (
+                dispatch_custom_allgather,
+            )
+            from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+                dispatch_custom_allreduce,
+            )
+
+            for attr, collective, dispatch in (
+                ("ca_comm", "all-reduce", dispatch_custom_allreduce),
+                ("cag_comm", "all-gather", dispatch_custom_allgather),
+            ):
+                try:
+                    comm_cls = dispatch()
+                    if comm_cls is not None:
+                        setattr(
+                            self,
+                            attr,
+                            comm_cls(group=self.cpu_group, device=self.device),
+                        )
+                except Exception as e:
+                    logger.warning("TP custom %s setup failed: %s", collective, e)
 
         self.mq_broadcaster = None
 
@@ -327,6 +357,16 @@ class GroupCoordinator:
             return input_
         else:
             if (
+                self.ca_comm is not None
+                and not self.ca_comm.disabled
+                and not async_op
+                and op is torch.distributed.ReduceOp.SUM
+                and self.ca_comm.should_custom_ar(input_)
+            ):
+                output = self.ca_comm.custom_all_reduce(input_)
+                if output is not None:
+                    return output
+            if (
                 current_platform.is_cpu()
                 and is_shm_available(input_.dtype, self.world_size, len(self.ranks))
                 and op is torch.distributed.ReduceOp.SUM
@@ -367,9 +407,16 @@ class GroupCoordinator:
         ):
             return torch.ops.sgl_kernel.shm_allgather(input_, dim)
         else:
-            torch.distributed.all_gather_into_tensor(
-                output_tensor, input_, group=self.device_group
+            use_custom_all_gather = (
+                self.cag_comm is not None
+                and not self.cag_comm.disabled
+                and self.cag_comm.should_custom_ag(output_tensor, input_)
+                and self.cag_comm.custom_all_gather(output_tensor, input_) is not None
             )
+            if not use_custom_all_gather:
+                torch.distributed.all_gather_into_tensor(
+                    output_tensor, input_, group=self.device_group
+                )
 
         if dim != 0:
             input_size[0] //= world_size
@@ -761,6 +808,12 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self) -> None:
+        for attr in ("ca_comm", "cag_comm"):
+            comm = getattr(self, attr)
+            if comm is not None:
+                if hasattr(comm, "close"):
+                    comm.close()
+                setattr(self, attr, None)
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
