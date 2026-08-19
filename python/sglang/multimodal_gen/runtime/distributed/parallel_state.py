@@ -170,7 +170,8 @@ def init_parallel_group_coordinator(
             group_ranks=group_ranks,
             local_rank=local_rank,
             torch_distributed_backend=backend,
-            group_name="cfg_group",
+            use_custom_collectives=parallel_mode == "tensor",
+            group_name="tp_group" if parallel_mode == "tensor" else "cfg_group",
         )
 
 

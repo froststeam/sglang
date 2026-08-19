@@ -370,9 +370,19 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        max_w_scale, quantized_weight = requantize_with_max_scale(
-            layer.weight, layer.weight_scale, layer.logical_widths
-        )
+        if current_platform.is_musa():
+            if len(layer.logical_widths) != 1 or layer.weight_scale.numel() != 1:
+                raise NotImplementedError(
+                    "MUSA ModelOpt FP8 currently supports only single-partition "
+                    "linear weights; fused multi-partition weights require "
+                    "scale-aware requantization."
+                )
+            max_w_scale = layer.weight_scale.max()
+            quantized_weight = layer.weight
+        else:
+            max_w_scale, quantized_weight = requantize_with_max_scale(
+                layer.weight, layer.weight_scale, layer.logical_widths
+            )
         # Preserve the parameter subclass metadata while rebinding to the
         # transposed FP8 view expected by the runtime.
         layer.weight.data = quantized_weight.t().detach()

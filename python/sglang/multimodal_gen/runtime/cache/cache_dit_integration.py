@@ -119,8 +119,11 @@ def _build_parallelism_config(
     if tp_group is not None:
         tp_size = get_tp_world_size()
 
+    backend = getattr(ParallelismBackend, "AUTO", None)
+    if backend is None:
+        backend = getattr(ParallelismBackend, "NATIVE_PYTORCH")
     return ParallelismConfig(
-        backend=ParallelismBackend.AUTO,
+        backend=backend,
         ulysses_size=ulysses_size,
         ring_size=ring_size,
         tp_size=tp_size,

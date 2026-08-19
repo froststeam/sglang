@@ -1589,8 +1589,15 @@ class ServerArgs(DisaggArgsMixin):
                 # For '--arg=value', this gets 'arg'; for '--arg', this also gets 'arg'.
                 arg_name = arg.split("=", 1)[0].replace("-", "_").lstrip("_")
                 provided_arg_names.add(arg_name)
-        if "mode" in provided_arg_names:
-            provided_arg_names.add("performance_mode")
+        cli_aliases = {
+            "cfg_parallel_size": "cfg_parallel_degree",
+            "mode": "performance_mode",
+        }
+        provided_arg_names.update(
+            target
+            for alias, target in cli_aliases.items()
+            if alias in provided_arg_names
+        )
 
         # Populate provided_args if the argument from the namespace was on the command line.
         for k, v in vars(args).items():
