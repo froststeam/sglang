@@ -43,6 +43,13 @@ if _is_npu:
 
 if _is_musa:
     from sgl_kernel import fused_add_rmsnorm
+    from sglang.srt.hardware_backend.musa.jit_kernel.csrc.diffusion import (
+        can_use_musa_layernorm_scale_shift,
+        can_use_musa_qknorm_rope,
+        musa_layernorm_scale_shift,
+        musa_qknorm_rope,
+        musa_scale_residual_layernorm_scale_shift,
+    )
 
 if _use_aiter:
     from aiter import rmsnorm2d_fwd as rms_norm
@@ -406,6 +413,25 @@ def _ensure_contiguous(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]
     return tensor.contiguous() if tensor is not None else None
 
 
+def _is_batch_modulation_shape(tensor: torch.Tensor, x: torch.Tensor) -> bool:
+    return tensor.shape in (
+        (x.shape[0], x.shape[-1]),
+        (x.shape[0], 1, x.shape[-1]),
+    )
+
+
+def _torch_scale_shift(
+    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
+) -> torch.Tensor:
+    if scale.dim() == 4:
+        num_frames = scale.shape[1]
+        frame_seqlen = x.shape[1] // num_frames
+        return (
+            x.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + scale) + shift
+        ).flatten(1, 2)
+    return x * (1 + scale) + shift
+
+
 class _ScaleResidualNormScaleShift(CustomOp):
     """
     Fused kernel that combines:
@@ -480,10 +506,33 @@ class _ScaleResidualNormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
-    def forward_musa(self, *args, **kwargs):
-        # MUSA does not support CUDA/CUTLASS-based fused kernels yet,
-        # so we fall back to the native PyTorch implementation.
-        return self.forward_native(*args, **kwargs)
+    def forward_musa(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ):
+        if (
+            isinstance(gate, torch.Tensor)
+            and self.norm_type == "layer"
+            and getattr(self.norm, "weight", None) is None
+            and getattr(self.norm, "bias", None) is None
+            and x.is_contiguous()
+            and residual.is_contiguous()
+            and x.dtype == residual.dtype == gate.dtype == scale.dtype == shift.dtype
+            and scale.shape == shift.shape
+            and gate.shape == (x.shape[0], 1, x.shape[-1])
+            and _is_batch_modulation_shape(scale, x)
+            and can_use_musa_layernorm_scale_shift(x.shape[-1], x.dtype)
+        ):
+            return musa_scale_residual_layernorm_scale_shift(
+                residual, x, gate, scale, shift, self.eps
+            )
+        residual_output = self._apply_residual(residual, x, gate)
+        normalized = self.norm(residual_output)
+        return _torch_scale_shift(normalized, scale, shift), residual_output
 
     def forward_xpu(self, *args, **kwargs):
         # XPU does not support CUDA/CUTLASS-based fused kernels yet,
@@ -498,27 +547,33 @@ class _ScaleResidualNormScaleShift(CustomOp):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        residual_output = self._apply_residual(residual, x, gate)
+        normalized = self.norm(residual_output)
+        modulated = fuse_scale_shift_kernel(normalized, scale, shift)
+        return modulated, residual_output
+
+    @staticmethod
+    def _apply_residual(
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+    ) -> torch.Tensor:
         # x.shape: [batch_size, seq_len, inner_dim]
         if isinstance(gate, int):
             # used by cross-attention, should be 1
             assert gate == 1
-            residual_output = residual + x
+            return residual + x
         elif isinstance(gate, torch.Tensor):
             if gate.dim() == 4:
                 # gate.shape: [batch_size, num_frames, 1, inner_dim]
                 num_frames = gate.shape[1]
                 frame_seqlen = x.shape[1] // num_frames
-                residual_output = residual + (
+                return residual + (
                     x.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * gate
                 ).flatten(1, 2)
-            else:
-                # gate.shape: [batch_size, 1, inner_dim]
-                residual_output = residual + x * gate
-        else:
-            raise ValueError(f"Gate type {type(gate)} not supported")
-        normalized = self.norm(residual_output)
-        modulated = fuse_scale_shift_kernel(normalized, scale, shift)
-        return modulated, residual_output
+            # gate.shape: [batch_size, 1, inner_dim]
+            return residual + x * gate
+        raise ValueError(f"Gate type {type(gate)} not supported")
 
     def forward_npu(
         self,
@@ -621,10 +676,20 @@ class _NormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
-    def forward_musa(self, *args, **kwargs):
-        # MUSA does not support CUDA/CUTLASS-based fused kernels yet,
-        # so we fall back to the native PyTorch implementation.
-        return self.forward_native(*args, **kwargs)
+    def forward_musa(self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
+        if (
+            self.norm_type == "layer"
+            and getattr(self.norm, "weight", None) is None
+            and getattr(self.norm, "bias", None) is None
+            and x.is_contiguous()
+            and x.dtype == scale.dtype == shift.dtype
+            and scale.shape == shift.shape
+            and _is_batch_modulation_shape(scale, x)
+            and can_use_musa_layernorm_scale_shift(x.shape[-1], x.dtype)
+        ):
+            return musa_layernorm_scale_shift(x, scale, shift, self.eps)
+        normalized = self.norm(x)
+        return _torch_scale_shift(normalized, scale, shift).to(x.dtype)
 
     def forward_xpu(self, *args, **kwargs):
         # XPU does not support CUDA/CUTLASS-based fused kernels yet,
@@ -825,7 +890,7 @@ def apply_qk_norm_rope(
     position_offset: int = 0,
     allow_inplace: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply QK RMSNorm followed by RoPE, fusing both on supported CUDA shapes."""
+    """Apply QK RMSNorm followed by RoPE on supported CUDA and MUSA shapes."""
 
     from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
         apply_flashinfer_rope_qk_inplace,
@@ -864,17 +929,41 @@ def apply_qk_norm_rope(
             raise ValueError(
                 f"positions must be 1D of length {batch_size * seq_len}, got shape={tuple(positions.shape)}"
             )
-
-    if (
+    can_fuse_inplace = (
         fused_enabled
-        and _is_cuda
         and allow_inplace
-        and (q_eps == k_eps)
+        and q_eps == k_eps
         and q.dtype in (torch.float16, torch.bfloat16)
         and q_norm.weight.dtype == q.dtype
         and k_norm.weight.dtype == k.dtype
         and q.is_contiguous()
         and k.is_contiguous()
+    )
+
+    if (
+        can_fuse_inplace
+        and _is_musa
+        and head_dim == 128
+        and rope_dim == 128
+        and not is_neox
+        and cos_sin_cache.dtype == torch.float32
+        and cos_sin_cache.is_contiguous()
+        and can_use_musa_qknorm_rope(q.dtype)
+    ):
+        musa_qknorm_rope(
+            q.reshape(-1, q.shape[-2], head_dim),
+            k.reshape(-1, k.shape[-2], head_dim),
+            q_norm.weight,
+            k_norm.weight,
+            cos_sin_cache,
+            positions.contiguous(),
+            q_eps,
+        )
+        return q, k
+
+    if (
+        can_fuse_inplace
+        and _is_cuda
         and can_use_fused_inplace_qknorm_rope(head_dim, rope_dim, is_neox, q.dtype)
     ):
         fused_inplace_qknorm_rope(

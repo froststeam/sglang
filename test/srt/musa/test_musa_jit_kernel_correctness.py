@@ -9,6 +9,43 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_diffusion_qknorm_rope_matches_reference(dtype):
+    from sglang.srt.hardware_backend.musa.jit_kernel.csrc.diffusion import (
+        musa_qknorm_rope,
+    )
+
+    torch.manual_seed(0)
+    tokens, heads, head_dim = 16, 24, 128
+    q = torch.randn(tokens, heads, head_dim, device="musa", dtype=dtype)
+    k = torch.randn_like(q)
+    q_weight = torch.randn(head_dim, device="musa", dtype=dtype)
+    k_weight = torch.randn(head_dim, device="musa", dtype=dtype)
+    phase = torch.randn(tokens, head_dim // 2, device="musa", dtype=torch.float32)
+    rope_cache = torch.cat((phase.cos(), phase.sin()), dim=-1)
+    positions = torch.arange(tokens, device="musa", dtype=torch.int64)
+
+    def reference(x, weight):
+        value = x.float()
+        value *= torch.rsqrt(value.square().mean(dim=-1, keepdim=True) + 1e-6)
+        value *= weight.float()
+        pairs = value.reshape(tokens, heads, head_dim // 2, 2)
+        cos = rope_cache[:, : head_dim // 2].unsqueeze(1)
+        sin = rope_cache[:, head_dim // 2 :].unsqueeze(1)
+        even, odd = pairs[..., 0], pairs[..., 1]
+        return torch.stack(
+            (even * cos - odd * sin, odd * cos + even * sin), dim=-1
+        ).reshape_as(x)
+
+    q_expected = reference(q, q_weight)
+    k_expected = reference(k, k_weight)
+    musa_qknorm_rope(q, k, q_weight, k_weight, rope_cache, positions, 1e-6)
+    torch.musa.synchronize()
+
+    torch.testing.assert_close(q.float(), q_expected, rtol=0, atol=0.0625)
+    torch.testing.assert_close(k.float(), k_expected, rtol=0, atol=0.0625)
+
+
 def test_gdn_fused_proj_tilelang_matches_triton():
     from sglang.jit_kernel.triton.gdn_fused_proj import (
         fused_qkvzba_split_reshape_cat_contiguous as triton_gdn,
