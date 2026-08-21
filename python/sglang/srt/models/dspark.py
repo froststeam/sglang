@@ -19,6 +19,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -31,6 +32,16 @@ from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
+
+
+def _require_unquantized_vocab_layer(layer: nn.Module, name: str) -> None:
+    quant_method = getattr(layer, "quant_method", None)
+    if not isinstance(quant_method, UnquantizedEmbeddingMethod):
+        raise RuntimeError(
+            "DSPARK replicated vocab weights require unquantized weights, but "
+            f"{name} uses {type(quant_method).__name__}. Use TP=1 or an "
+            "unquantized DSPARK checkpoint."
+        )
 
 
 def gather_and_crop_vocab(
@@ -346,6 +357,9 @@ class DSparkDraftModel(nn.Module):
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self._shared_embed_tokens: Optional[nn.Module] = None
         self.lm_head: Optional[nn.Module] = None
+        self.replicated_lm_head_weight: Optional[torch.Tensor] = None
+        self.replicated_markov_w1_weight: Optional[torch.Tensor] = None
+        self.replicated_markov_w2_weight: Optional[torch.Tensor] = None
 
         self.markov_head = None
         markov_rank = int(config.markov_rank)
@@ -406,6 +420,67 @@ class DSparkDraftModel(nn.Module):
         object.__setattr__(self, "_shared_embed_tokens", embed_tokens)
         object.__setattr__(self, "lm_head", lm_head)
 
+    @torch.no_grad()
+    def configure_replicated_vocab_weights(self, *, replicate_lm_head: bool) -> None:
+        """Replicate unquantized vocab weights across TP ranks.
+
+        The replicas are startup snapshots, not registered buffers. They increase
+        per-rank model memory and are not refreshed by online target/draft weight
+        updates; workers must be restarted after such an update.
+        """
+        if get_tensor_model_parallel_world_size() == 1:
+            return
+        if self.lm_head is None:
+            raise RuntimeError("DSPARK target lm_head is not attached.")
+
+        if replicate_lm_head:
+            _require_unquantized_vocab_layer(self.lm_head, "target lm_head")
+        if self.markov_head is not None:
+            _require_unquantized_vocab_layer(
+                self.markov_head.markov_w1, "Markov embedding"
+            )
+            _require_unquantized_vocab_layer(
+                self.markov_head.markov_w2, "Markov projection"
+            )
+
+        vocab_size = int(self.config.vocab_size)
+        if replicate_lm_head and self.replicated_lm_head_weight is None:
+            self.replicated_lm_head_weight = tensor_model_parallel_all_gather(
+                self.lm_head.weight, dim=0
+            )[:vocab_size].contiguous()
+        if (
+            self.markov_head is not None
+            and self.replicated_markov_w1_weight is None
+        ):
+            self.replicated_markov_w1_weight = tensor_model_parallel_all_gather(
+                self.markov_head.markov_w1.weight, dim=0
+            )[:vocab_size].contiguous()
+            self.replicated_markov_w2_weight = tensor_model_parallel_all_gather(
+                self.markov_head.markov_w2.weight, dim=0
+            )[:vocab_size].contiguous()
+        replicated_weights = (
+            self.replicated_lm_head_weight,
+            self.replicated_markov_w1_weight,
+            self.replicated_markov_w2_weight,
+        )
+        replicated_mib = sum(
+            weight.numel() * weight.element_size()
+            for weight in replicated_weights
+            if weight is not None
+        ) / (1024**2)
+        logger.warning(
+            "DSPARK replicated vocab weights configured: lm_head=%s markov=%s, "
+            "extra_weight_memory=%.1f MiB/rank. These replicas are startup "
+            "snapshots; restart workers after online target/draft weight updates.",
+            (
+                tuple(self.replicated_lm_head_weight.shape)
+                if self.replicated_lm_head_weight is not None
+                else False
+            ),
+            self.replicated_markov_w1_weight is not None,
+            replicated_mib,
+        )
+
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         expected = int(self.fc.in_features)
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
@@ -421,7 +496,11 @@ class DSparkDraftModel(nn.Module):
                 "DSPARK dense draft requires the target lm_head "
                 "(call attach_shared_modules first)."
             )
-        weight = self.lm_head.weight
+        weight = (
+            self.replicated_lm_head_weight
+            if self.replicated_lm_head_weight is not None
+            else self.lm_head.weight
+        )
         if hidden_states.dtype != weight.dtype:
             hidden_states = hidden_states.to(weight.dtype)
         return F.linear(hidden_states, weight)
@@ -440,6 +519,9 @@ class DSparkDraftModel(nn.Module):
     ) -> torch.Tensor:
         if self.markov_head is None:
             return logits
+        if self.replicated_markov_w1_weight is not None:
+            latent = F.embedding(prev_tokens.long(), self.replicated_markov_w1_weight)
+            return logits + F.linear(latent, self.replicated_markov_w2_weight)
         return self.markov_head.apply_step_logits(
             logits,
             tokens=prev_tokens,
@@ -457,9 +539,14 @@ class DSparkDraftModel(nn.Module):
         if self.confidence_head_with_markov:
             if self.markov_head is None:
                 raise RuntimeError("DSpark confidence head requires markov_head.")
-            prev_embeddings = self.markov_head.get_prev_embeddings(prev_tokens).to(
-                dtype=hidden_states.dtype
-            )
+            if self.replicated_markov_w1_weight is not None:
+                prev_embeddings = F.embedding(
+                    prev_tokens.long(), self.replicated_markov_w1_weight
+                ).to(dtype=hidden_states.dtype)
+            else:
+                prev_embeddings = self.markov_head.get_prev_embeddings(prev_tokens).to(
+                    dtype=hidden_states.dtype
+                )
             hidden_states = torch.cat([hidden_states, prev_embeddings], dim=-1)
         return self.confidence_head(hidden_states).float()
 
