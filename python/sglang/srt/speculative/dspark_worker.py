@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from copy import deepcopy
 from typing import Optional, Tuple, Union
 
@@ -113,6 +114,20 @@ class DSparkWorker:
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self.draft_worker.model_runner
         self.draft_model = self.draft_model_runner.model
+        self.replicate_vocab_weights = (
+            os.getenv("SGLANG_DSPARK_REPLICATE_VOCAB_WEIGHTS", "0") == "1"
+            and int(get_tp_group().world_size) > 1
+        )
+        if int(get_tp_group().world_size) > 1:
+            self.draft_model.configure_replicated_vocab_weights(
+                replicate_lm_head=self.replicate_vocab_weights
+            )
+            if self.tp_rank == 0:
+                logger.info(
+                    "DSPARK TP vocab policy: replicated_markov=True "
+                    "replicated_lm_head=%s",
+                    self.replicate_vocab_weights,
+                )
 
         self.ragged_planner = DSparkRaggedPlanner(
             worker=self, gamma=self.block_size, server_args=server_args
@@ -151,6 +166,9 @@ class DSparkWorker:
         self._verify_positions_buf: Optional[torch.Tensor] = None
         self._draft_block_end_buf: Optional[torch.Tensor] = None
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None
+        self._num_token_non_padded_buf = torch.empty(
+            (), dtype=torch.int32, device=self.device
+        )
         self._draft_block_spec_info = DSparkVerifyInput(
             draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
             positions=torch.empty((0,), dtype=torch.int64, device=self.device),
@@ -158,13 +176,6 @@ class DSparkWorker:
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
-        self._draft_greedy_gathered_max_buf: Optional[torch.Tensor] = None
-        self._draft_greedy_gathered_ids_buf: Optional[torch.Tensor] = None
-        self._draft_greedy_gather_cap: int = 0
-        self._draft_greedy_best_rank_buf: Optional[torch.Tensor] = None
-        self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
-        self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
-        self._draft_greedy_index_cap: int = 0
 
     def __getattr__(self, name):
         return getattr(self.target_worker, name)
@@ -334,118 +345,6 @@ class DSparkWorker:
         draft_input.ctx_lens = torch.zeros_like(ctx_lens)
         draft_input.target_hidden = draft_input.target_hidden[:0]
 
-    def _greedy_sample_from_vocab_parallel_logits(
-        self,
-        *,
-        local_logits: torch.Tensor,
-        lm_head,
-    ) -> torch.Tensor:
-        if local_logits.numel() == 0:
-            return torch.empty((0,), dtype=torch.long, device=local_logits.device)
-
-        tp_group = get_tp_group()
-        tp_size = int(tp_group.world_size)
-        if not hasattr(lm_head, "shard_indices"):
-            raise RuntimeError(
-                "DSPARK greedy sampling requires a vocab-parallel head with `shard_indices`."
-            )
-
-        shard = lm_head.shard_indices
-        num_org = int(shard.num_org_elements)
-        num_org_padded = int(shard.num_org_elements_padded)
-        num_added = int(shard.num_added_elements)
-        org_vocab_start = int(shard.org_vocab_start_index)
-        added_vocab_start = int(shard.added_vocab_start_index)
-        num_tokens = int(local_logits.shape[0])
-
-        if num_org > 0:
-            local_max, local_arg = torch.max(local_logits[:, :num_org], dim=-1)
-        else:
-            local_max = torch.full(
-                (num_tokens,),
-                torch.finfo(local_logits.dtype).min,
-                dtype=local_logits.dtype,
-                device=local_logits.device,
-            )
-            local_arg = torch.zeros((num_tokens,), dtype=torch.int64, device=local_logits.device)
-
-        if num_added > 0:
-            added_slice_start = num_org_padded
-            added_slice_end = num_org_padded + num_added
-            added_max, added_arg = torch.max(
-                local_logits[:, added_slice_start:added_slice_end], dim=-1
-            )
-            use_added = added_max > local_max
-            local_max = torch.where(use_added, added_max, local_max)
-            local_arg = torch.where(
-                use_added, added_arg.to(local_arg.dtype) + num_org_padded, local_arg
-            )
-
-        if num_added == 0:
-            global_ids = local_arg + org_vocab_start
-        else:
-            global_ids = torch.empty(
-                (num_tokens,), dtype=torch.int64, device=local_logits.device
-            )
-            is_base = local_arg < num_org
-            global_ids[is_base] = org_vocab_start + local_arg[is_base]
-            global_ids[~is_base] = added_vocab_start + (
-                local_arg[~is_base] - num_org_padded
-            )
-
-        if tp_size == 1:
-            return global_ids.to(torch.long)
-
-        needed = tp_size * num_tokens
-        if (
-            self._draft_greedy_gather_cap < needed
-            or self._draft_greedy_gathered_max_buf is None
-            or self._draft_greedy_gathered_ids_buf is None
-            or self._draft_greedy_gathered_max_buf.dtype != local_max.dtype
-            or self._draft_greedy_gathered_max_buf.device != local_logits.device
-        ):
-            self._draft_greedy_gathered_max_buf = torch.empty(
-                (needed,), dtype=local_max.dtype, device=local_logits.device
-            )
-            self._draft_greedy_gathered_ids_buf = torch.empty(
-                (needed,), dtype=global_ids.dtype, device=local_logits.device
-            )
-            self._draft_greedy_gather_cap = needed
-
-        if (
-            self._draft_greedy_index_cap < num_tokens
-            or self._draft_greedy_best_rank_buf is None
-            or self._draft_greedy_rank_index_buf is None
-            or self._draft_greedy_selected_ids_buf is None
-            or self._draft_greedy_best_rank_buf.device != local_logits.device
-            or self._draft_greedy_selected_ids_buf.device != local_logits.device
-        ):
-            self._draft_greedy_best_rank_buf = torch.empty(
-                (num_tokens,), dtype=torch.int64, device=local_logits.device
-            )
-            self._draft_greedy_rank_index_buf = torch.empty(
-                (1, num_tokens), dtype=torch.int64, device=local_logits.device
-            )
-            self._draft_greedy_selected_ids_buf = torch.empty(
-                (1, num_tokens), dtype=torch.int64, device=local_logits.device
-            )
-            self._draft_greedy_index_cap = num_tokens
-
-        gathered_max = self._draft_greedy_gathered_max_buf[:needed]
-        gathered_ids = self._draft_greedy_gathered_ids_buf[:needed]
-        tp_group.all_gather_into_tensor(gathered_max, local_max.contiguous())
-        tp_group.all_gather_into_tensor(gathered_ids, global_ids.contiguous())
-        gathered_max = gathered_max.view(tp_size, num_tokens)
-        gathered_ids = gathered_ids.view(tp_size, num_tokens)
-
-        best_rank = self._draft_greedy_best_rank_buf[:num_tokens]
-        torch.argmax(gathered_max, dim=0, out=best_rank)
-        rank_index = self._draft_greedy_rank_index_buf[:, :num_tokens]
-        rank_index[0].copy_(best_rank)
-        selected_ids = self._draft_greedy_selected_ids_buf[:, :num_tokens]
-        torch.gather(gathered_ids, 0, rank_index, out=selected_ids)
-        return selected_ids.view(-1).to(torch.long)
-
     def _sample_draft_tokens(
         self,
         *,
@@ -458,16 +357,22 @@ class DSparkWorker:
             (bs, proposal_len), dtype=torch.long, device=draft_hidden.device
         )
         prev_tokens = first_prev_tokens.to(torch.long)
-        lm_head = self.draft_model.lm_head
-        # The draft block has already produced every hidden state.  The base
-        # LM head is row-wise independent, so batch its seven projections and
-        # leave only the Markov correction and argmax in the sequential loop.
-        base_logits = self.draft_model.compute_logits(
-            draft_hidden.reshape(bs * proposal_len, -1)
-        ).view(bs, proposal_len, -1)
-        is_all_greedy = sampling_info is None or sampling_info.is_all_greedy
         tp_size = int(get_tp_group().world_size)
         vocab_size = int(self.draft_model.config.vocab_size)
+        replicated_lm_head = bool(
+            getattr(self.draft_model, "replicated_lm_head_weight", None) is not None
+        )
+        # The draft block has already produced every hidden state.  The base
+        # LM head is row-wise independent, so batch all projections.  With a
+        # sharded LM head, gather the whole block once before the sequential
+        # Markov loop instead of communicating once per draft step.
+        base_logits = self.draft_model.compute_logits(
+            draft_hidden.reshape(bs * proposal_len, -1)
+        )
+        if tp_size > 1 and not replicated_lm_head:
+            base_logits = self.draft_model.gather_vocab_logits(base_logits)
+        base_logits = base_logits[:, :vocab_size].view(bs, proposal_len, vocab_size)
+        is_all_greedy = sampling_info is None or sampling_info.is_all_greedy
         draft_probs = [] if not is_all_greedy else None
         confidence_values = [] if self.ragged_planner.enabled else None
         greedy_mask = (
@@ -487,17 +392,8 @@ class DSparkWorker:
                     )
                 )
             if is_all_greedy:
-                step_tokens = self._greedy_sample_from_vocab_parallel_logits(
-                    local_logits=step_logits,
-                    lm_head=lm_head,
-                )
+                step_tokens = torch.argmax(step_logits, dim=-1).to(torch.long)
             else:
-                if tp_size != 1:
-                    step_logits = self.draft_model.gather_vocab_logits(step_logits)
-                else:
-                    # TP=1 local logits are target-vocabulary logits; discard any
-                    # padding rows before constructing the proposal distribution q.
-                    step_logits = step_logits[:, :vocab_size]
                 probs = F.softmax(
                     step_logits.float()
                     / sampling_info.temperatures.to(torch.float32).clamp_min(1e-5),
@@ -616,6 +512,7 @@ class DSparkWorker:
                 block_cache_loc,
                 bs,
             )
+            self._num_token_non_padded_buf.fill_(bs * self.block_size)
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.TARGET_VERIFY,
                 batch_size=bs,
@@ -632,6 +529,7 @@ class DSparkWorker:
                 spec_algorithm=SpeculativeAlgorithm.DSPARK,
                 spec_info=self._draft_block_spec_info,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
+                num_token_non_padded=self._num_token_non_padded_buf,
             )
 
             with torch.inference_mode():
