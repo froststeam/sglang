@@ -653,24 +653,29 @@ class MusaJitCustomAllreduce:
             self._IS_CAPTURING
             and torch.get_device_module().is_current_stream_capturing()
         )
-        if is_graph_launch:
-            self._record_graph_input(inp, shot)
-            signature = self._graph_input_signature(inp, shot)
-            cursor = self._graph_registered_cursor
-            self._graph_registered_cursor += 1
-            if cursor < len(self._graph_registered_input_sequence):
-                cached_signature, rank_data, rank_data_slot = (
-                    self._graph_registered_input_sequence[cursor]
-                )
-                if cached_signature == signature and self._rank_data_ptr_tuple(
-                    rank_data
-                )[self.rank] == int(inp.data_ptr()):
-                    return rank_data_slot
-            if self._graph_registered_input_sequence:
-                self._graph_registered_miss = True
+        # Unlike regular CUDA Graph capture, PCG does not run the graph-input
+        # registration/recapture lifecycle. Recording here would leave
+        # ``_graph_inputs`` unconsumed and could retain stale tensor references;
+        # skip recording and use the unregistered launcher instead.
+        if not is_graph_launch or is_in_piecewise_cuda_graph():
             return None
-        # Registered graph launchers always consume the stable device slot.
-        # Eager and SHOT_PUSH paths use their explicit-input launchers instead.
+
+        self._record_graph_input(inp, shot)
+        signature = self._graph_input_signature(inp, shot)
+        cursor = self._graph_registered_cursor
+        self._graph_registered_cursor += 1
+        if cursor < len(self._graph_registered_input_sequence):
+            cached_signature, rank_data, rank_data_slot = (
+                self._graph_registered_input_sequence[cursor]
+            )
+            if cached_signature == signature and self._rank_data_ptr_tuple(
+                rank_data
+            )[self.rank] == int(inp.data_ptr()):
+                return rank_data_slot
+        if self._graph_registered_input_sequence:
+            self._graph_registered_miss = True
+        # No matching registered slot: let the caller use the explicit-input
+        # launcher to preserve correctness during recapture.
         return None
 
     @staticmethod
