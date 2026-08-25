@@ -57,27 +57,40 @@ def _create_shared_buffer(
 ) -> List[int]:
     lib = CudaRTLibrary()
     pointer = lib.cudaMalloc(size_in_bytes)
-    lib.cudaMemset(pointer, 0, size_in_bytes)
-    handle = lib.cudaIpcGetMemHandle(pointer)
-    world_size = dist.get_world_size(group=group)
-    rank = dist.get_rank(group=group)
-    handles = [None] * world_size
-    dist.all_gather_object(handles, handle, group=group)
+    opened_pointers: List[int] = []
+    try:
+        lib.cudaMemset(pointer, 0, size_in_bytes)
+        handle = lib.cudaIpcGetMemHandle(pointer)
+        world_size = dist.get_world_size(group=group)
+        rank = dist.get_rank(group=group)
+        handles = [None] * world_size
+        dist.all_gather_object(handles, handle, group=group)
 
-    pointers: List[int] = []
-    for i, h in enumerate(handles):
-        if i == rank:
-            pointers.append(pointer.value)
-        else:
-            pointers.append(lib.cudaIpcOpenMemHandle(h).value)
-    return pointers
+        pointers: List[int] = []
+        for i, h in enumerate(handles):
+            if i == rank:
+                pointers.append(pointer.value)
+            else:
+                peer_pointer = lib.cudaIpcOpenMemHandle(h).value
+                opened_pointers.append(peer_pointer)
+                pointers.append(peer_pointer)
+        return pointers
+    except Exception:
+        for peer_pointer in opened_pointers:
+            lib.cudaIpcCloseMemHandle(ctypes.c_void_p(peer_pointer))
+        lib.cudaFree(pointer)
+        raise
 
 
 def _free_shared_buffer(
     pointers: List[int], group: Optional[ProcessGroup] = None
 ) -> None:
     rank = dist.get_rank(group=group)
-    CudaRTLibrary().cudaFree(ctypes.c_void_p(pointers[rank]))
+    lib = CudaRTLibrary()
+    for peer_rank, pointer in enumerate(pointers):
+        if peer_rank != rank and pointer:
+            lib.cudaIpcCloseMemHandle(ctypes.c_void_p(pointer))
+    lib.cudaFree(ctypes.c_void_p(pointers[rank]))
 
 
 class MusaJitCustomAllGather:

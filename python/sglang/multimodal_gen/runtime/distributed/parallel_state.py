@@ -166,11 +166,19 @@ def init_parallel_group_coordinator(
         )
     else:
         # fallback to GroupCoordinator
+        use_musa_custom_collectives = parallel_mode in (
+            "tensor",
+            "classifier_free_guidance",
+        )
         return GroupCoordinator(
             group_ranks=group_ranks,
             local_rank=local_rank,
             torch_distributed_backend=backend,
-            use_custom_collectives=parallel_mode == "tensor",
+            use_custom_collectives=use_musa_custom_collectives,
+            # Do not leave TP/CFG All-Gather behind the opt-in environment
+            # switch. GroupCoordinator already limits this path to MUSA and
+            # falls back for unsupported shapes/platforms.
+            use_custom_all_gather=use_musa_custom_collectives,
             group_name="tp_group" if parallel_mode == "tensor" else "cfg_group",
         )
 

@@ -138,7 +138,7 @@ def worker(rank, world_size, port):
         destroy_distributed_environment()
 
 
-@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("world_size", [2, 4, 8])
 def test_musa_custom_all_gather(world_size):
     if torch.musa.device_count() < world_size:
         pytest.skip(f"Requires at least {world_size} MUSA devices")

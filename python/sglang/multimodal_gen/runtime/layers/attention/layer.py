@@ -15,7 +15,6 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
     get_sequence_parallel_world_size,
-    get_sp_group,
     get_sp_parallel_rank,
     get_sp_world_size,
     get_ulysses_parallel_world_size,
@@ -26,8 +25,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.usp import (
-    _usp_input_all_to_all,
+    _usp_input_qkv_all_to_all,
     _usp_output_all_to_all,
+    _usp_output_with_replicated_prefix,
     ring_attn,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
@@ -497,9 +497,7 @@ class USPAttention(nn.Module):
 
             sp_size = get_ulysses_parallel_world_size()
             if sp_size > 1:
-                q = _usp_input_all_to_all(q, head_dim=2)
-                k = _usp_input_all_to_all(k, head_dim=2)
-                v = _usp_input_all_to_all(v, head_dim=2)
+                q, k, v = _usp_input_qkv_all_to_all(q, k, v)
 
             # If NCCL timeout/deadlock occurs here, check whether
             # attn_mask is inconsistent across SP ranks (None on some, Tensor on
@@ -553,9 +551,7 @@ class USPAttention(nn.Module):
         # Ulysses-style All-to-All for sequence/head sharding
         if sp_size > 1:
             # -> [B, S, H_local, D]
-            q = _usp_input_all_to_all(q, head_dim=2)
-            k = _usp_input_all_to_all(k, head_dim=2)
-            v = _usp_input_all_to_all(v, head_dim=2)
+            q, k, v = _usp_input_qkv_all_to_all(q, k, v)
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:
@@ -597,16 +593,13 @@ class USPAttention(nn.Module):
         4. Concatenate [prefix_h_local, gathered_suffix] and run attention.
         5. Split output, all-to-all back the suffix, all-gather prefix heads.
         """
-        sp_size = get_ulysses_parallel_world_size()
         sp_rank = get_sp_parallel_rank()
 
         q_rep, q_shard = q[:, :num_rep], q[:, num_rep:]
         k_rep, k_shard = k[:, :num_rep], k[:, num_rep:]
         v_rep, v_shard = v[:, :num_rep], v[:, num_rep:]
 
-        q_shard = _usp_input_all_to_all(q_shard, head_dim=2)
-        k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
-        v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
+        q_shard, k_shard, v_shard = _usp_input_qkv_all_to_all(q_shard, k_shard, v_shard)
 
         h_local = q_shard.shape[2]
         h_start = sp_rank * h_local
@@ -623,18 +616,7 @@ class USPAttention(nn.Module):
 
         out_rep = out[:, :num_rep]
         out_shard = out[:, num_rep:]
-
-        out_shard = _usp_output_all_to_all(out_shard, head_dim=2)
-
-        gathered = [torch.empty_like(out_rep) for _ in range(sp_size)]
-        torch.distributed.all_gather(
-            gathered,
-            out_rep.contiguous(),
-            group=get_sp_group().ulysses_group,
-        )
-        out_rep = torch.cat(gathered, dim=2)
-
-        return torch.cat([out_rep, out_shard], dim=1)
+        return _usp_output_with_replicated_prefix(out_rep, out_shard)
 
     def _forward_with_replicated_suffix(
         self,
