@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_parallel_rank,
     get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
@@ -71,6 +72,19 @@ def _local_seq_len(seq_len: int, sp_world_size: int) -> int:
     if padded_len % sp_world_size != 0:
         padded_len += sp_world_size - (padded_len % sp_world_size)
     return padded_len // sp_world_size
+
+
+def _shard_text_for_sp(hidden_states: torch.Tensor):
+    """Shard a divisible text sequence across SP ranks."""
+    sp_size = get_sp_world_size()
+    if sp_size <= 1:
+        return hidden_states
+    seq_len = hidden_states.shape[1]
+    assert seq_len % sp_size == 0
+    local_len = seq_len // sp_size
+    rank = get_sp_parallel_rank()
+    start = rank * local_len
+    return hidden_states[:, start : start + local_len]
 
 
 def _get_qkv_projections(
@@ -671,6 +685,7 @@ class QwenImageCrossAttention(nn.Module):
         encoder_hidden_states_mask = cross_attention_kwargs.get(
             "encoder_hidden_states_mask"
         )
+        sp_text_sharded = cross_attention_kwargs.get("sp_text_sharded", False)
 
         img_query, img_key, img_value, txt_query, txt_key, txt_value = (
             _get_qkv_projections(self, hidden_states, encoder_hidden_states)
@@ -746,7 +761,7 @@ class QwenImageCrossAttention(nn.Module):
             joint_key,
             joint_value,
             attn_mask=attn_mask,
-            num_replicated_prefix=seq_len_txt,
+            num_replicated_prefix=0 if sp_text_sharded else seq_len_txt,
         )
 
         # Reshape back
@@ -1397,6 +1412,20 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             block_attention_kwargs["attn_mask"] = torch.cat(
                 [encoder_hidden_states_mask, image_mask], dim=1
             )
+        elif (
+            get_sp_world_size() > 1
+            and encoder_hidden_states.shape[1] >= get_sp_world_size()
+            and encoder_hidden_states.shape[1] % get_sp_world_size() == 0
+        ):
+            # Upstream SP optimization: shard the text prefix as well as the
+            # image sequence. The mask path intentionally keeps the old
+            # replicated-prefix behavior until varlen metadata is available.
+            encoder_hidden_states = _shard_text_for_sp(encoder_hidden_states)
+            if freqs_cis is not None:
+                img_freqs, txt_freqs = freqs_cis
+                txt_freqs = _shard_text_for_sp(txt_freqs.unsqueeze(0)).squeeze(0)
+                freqs_cis = (img_freqs, txt_freqs)
+            block_attention_kwargs["sp_text_sharded"] = True
 
         temb = self.time_text_embed(timestep, hidden_states, additional_t_cond)
 

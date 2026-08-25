@@ -1172,6 +1172,12 @@ def dispatch_custom_allreduce():
     if _is_cuda:
         return CustomAllreduce
 
+    # MUSA uses the JIT implementation above. When it is explicitly disabled,
+    # return None so GroupCoordinator falls back to MCCL instead of entering
+    # the ROCm-only dispatch below.
+    if _is_musa:
+        return None
+
     assert _is_hip
 
     if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():

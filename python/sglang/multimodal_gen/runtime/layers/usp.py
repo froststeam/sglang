@@ -34,15 +34,10 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _usp_all_to_all_single(x: torch.Tensor) -> torch.Tensor:
-    ulysses_pg = get_sp_group().ulysses_group
-    assert ulysses_pg is not None, "Ulysses process group is not initialized."
+    sp_group = get_sp_group()
     x_shape = x.shape
     x = x.flatten().contiguous()
-    output = torch.empty_like(x)
-    # USP calls this collective many times per denoising step and waits
-    # immediately, so avoid the extra wrapper overhead of functional collectives.
-    torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
-    return output.reshape(x_shape)
+    return sp_group.all_to_all(x).reshape(x_shape)
 
 
 def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
@@ -69,6 +64,9 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
+    custom_output = get_sp_group().custom_ulysses(x, head_dim, input_layout=True)
+    if custom_output is not None:
+        return custom_output
 
     # Move the dimension to be split (h_global) to dim 0 for all_to_all_single
     if head_dim == 1:
@@ -101,6 +99,19 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     return x
 
 
+def _usp_input_qkv_all_to_all(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    custom_outputs = get_sp_group().custom_qkv_ulysses(query, key, value)
+    if custom_outputs is not None:
+        return custom_outputs
+    return (
+        _usp_input_all_to_all(query, head_dim=2),
+        _usp_input_all_to_all(key, head_dim=2),
+        _usp_input_all_to_all(value, head_dim=2),
+    )
+
+
 def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     """
     Perform Ulysses-style output all-to-all over the head dimension (inverse of input).
@@ -125,6 +136,9 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
+    custom_output = get_sp_group().custom_ulysses(x, head_dim, input_layout=False)
+    if custom_output is not None:
+        return custom_output
 
     # Move the dimension to be split (s_global) to dim 0 for all_to_all_single
     if head_dim == 1:
@@ -155,6 +169,19 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         x = x.permute(2, 1, 0, 3, 4).contiguous().reshape(b, s_local, h_global, d)
 
     return x
+
+
+def _usp_output_with_replicated_prefix(
+    prefix: torch.Tensor, sharded: torch.Tensor
+) -> torch.Tensor:
+    sp_group = get_sp_group()
+    custom_output = sp_group.custom_ulysses_prefix_output(prefix, sharded)
+    if custom_output is not None:
+        return custom_output
+
+    sharded = _usp_output_all_to_all(sharded, head_dim=2)
+    gathered = sp_group.all_gather(prefix.contiguous(), dim=2)
+    return torch.cat([gathered, sharded], dim=1)
 
 
 def ring_attn(

@@ -7,6 +7,7 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/distributed/parallel_state.py
 # Copyright 2023 The vLLM team.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+import os
 import pickle
 from collections import namedtuple
 from contextlib import contextmanager
@@ -30,6 +31,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     suppress_stdout,
 )
 from sglang.srt.utils import is_shm_available
+from sglang.srt.environ import envs
 
 try:
     import torch_musa  # noqa: F401
@@ -43,6 +45,23 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
 
 _group_name_counter: dict[str, int] = {}
+
+
+def _strict_musa_custom_collectives() -> bool:
+    value = os.environ.get("SGLANG_MUSA_STRICT_CUSTOM_COLLECTIVES", "0")
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+def _is_node_local_group(group: ProcessGroup) -> bool:
+    """Return False on uncertainty because MUSA IPC cannot cross nodes."""
+    try:
+        world_size = torch.distributed.get_world_size(group=group)
+        hosts: list[Optional[str]] = [None] * world_size
+        torch.distributed.all_gather_object(hosts, os.uname().nodename, group=group)
+        return len(set(hosts)) == 1
+    except Exception as e:
+        logger.warning("Failed to verify node-local process group: %s", e)
+        return False
 
 
 def get_local_torch_device() -> torch.device:
@@ -159,6 +178,9 @@ class GroupCoordinator:
         torch_distributed_backend: Union[str, Backend],
         use_device_communicator: bool = True,
         use_custom_collectives: bool = False,
+        use_custom_all_gather: bool = False,
+        custom_all_gather_max_size: Optional[int] = None,
+        use_custom_all_to_all: bool = False,
         use_message_queue_broadcaster: bool = False,
         group_name: str | None = None,
     ):
@@ -215,32 +237,85 @@ class GroupCoordinator:
 
         self.ca_comm: Optional[Any] = None
         self.cag_comm: Optional[Any] = None
+        self.ca2a_comm: Optional[Any] = None
         if (
-            use_custom_collectives
+            (use_custom_collectives or use_custom_all_gather)
             and self.world_size > 1
             and current_platform.is_musa()
         ):
             from sglang.srt.distributed.device_communicators.custom_all_gather import (
+                MusaJitCustomAllGather,
                 dispatch_custom_allgather,
             )
-            from sglang.srt.distributed.device_communicators.custom_all_reduce import (
-                dispatch_custom_allreduce,
-            )
 
-            for attr, collective, dispatch in (
-                ("ca_comm", "all-reduce", dispatch_custom_allreduce),
-                ("cag_comm", "all-gather", dispatch_custom_allgather),
-            ):
+            collectives = []
+            if use_custom_collectives:
+                from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+                    dispatch_custom_allreduce,
+                )
+
+                collectives.append(
+                    ("ca_comm", "all-reduce", dispatch_custom_allreduce())
+                )
+            if use_custom_collectives or use_custom_all_gather:
+                allgather_cls = (
+                    MusaJitCustomAllGather
+                    if use_custom_all_gather
+                    else dispatch_custom_allgather()
+                )
+                collectives.append(
+                    ("cag_comm", "all-gather", allgather_cls)
+                )
+            for attr, collective, comm_cls in collectives:
                 try:
-                    comm_cls = dispatch()
                     if comm_cls is not None:
                         setattr(
                             self,
                             attr,
-                            comm_cls(group=self.cpu_group, device=self.device),
+                            comm_cls(
+                                group=self.cpu_group,
+                                device=self.device,
+                                **(
+                                    {"max_size": custom_all_gather_max_size}
+                                    if attr == "cag_comm"
+                                    else {}
+                                ),
+                            ),
                         )
                 except Exception as e:
-                    logger.warning("TP custom %s setup failed: %s", collective, e)
+                    logger.warning(
+                        "%s custom %s setup failed: %s",
+                        self.unique_name,
+                        collective,
+                        e,
+                    )
+
+        if (
+            use_custom_all_to_all
+            and self.world_size > 1
+            and current_platform.is_musa()
+            and _is_node_local_group(self.cpu_group)
+        ):
+            try:
+                from sglang.srt.distributed.device_communicators.custom_all_to_all import (
+                    dispatch_custom_alltoall,
+                )
+
+                comm_cls = dispatch_custom_alltoall()
+                if comm_cls is not None:
+                    self.ca2a_comm = comm_cls(
+                        group=self.cpu_group,
+                        device=self.device,
+                    )
+            except Exception as e:
+                logger.warning("SP custom all-to-all setup failed: %s", e)
+        elif (
+            use_custom_all_to_all and self.world_size > 1 and current_platform.is_musa()
+        ):
+            logger.warning(
+                "Skip SP custom all-to-all for non-node-local or unverified group %s",
+                self.unique_name,
+            )
 
         self.mq_broadcaster = None
 
@@ -366,6 +441,12 @@ class GroupCoordinator:
                 output = self.ca_comm.custom_all_reduce(input_)
                 if output is not None:
                     return output
+            if current_platform.is_musa() and _strict_musa_custom_collectives():
+                raise RuntimeError(
+                    f"{self.unique_name} All-Reduce did not use the MUSA custom path: "
+                    f"shape={tuple(input_.shape)}, dtype={input_.dtype}, "
+                    f"contiguous={input_.is_contiguous()}, async_op={async_op}, op={op}"
+                )
             if (
                 current_platform.is_cpu()
                 and is_shm_available(input_.dtype, self.world_size, len(self.ranks))
@@ -414,6 +495,12 @@ class GroupCoordinator:
                 and self.cag_comm.custom_all_gather(output_tensor, input_) is not None
             )
             if not use_custom_all_gather:
+                if current_platform.is_musa() and _strict_musa_custom_collectives():
+                    raise RuntimeError(
+                        f"{self.unique_name} All-Gather did not use the MUSA custom path: "
+                        f"shape={tuple(input_.shape)}, dtype={input_.dtype}, "
+                        f"contiguous={input_.is_contiguous()}"
+                    )
                 torch.distributed.all_gather_into_tensor(
                     output_tensor, input_, group=self.device_group
                 )
@@ -486,6 +573,24 @@ class GroupCoordinator:
         # Broadcast.
         if not input_.is_contiguous():
             input_ = input_.contiguous()
+        # Qwen-Image CFG only needs a synchronous tensor broadcast. Reuse the
+        # custom SUM reduction so CFG communication stays on the MUSA custom
+        # collective path as well: non-source ranks contribute zeros.
+        if (
+            self.ca_comm is not None
+            and not self.ca_comm.disabled
+            and not async_op
+        ):
+            if self.rank_in_group != src:
+                input_.zero_()
+            output = self.ca_comm.custom_all_reduce(input_)
+            if output is not None:
+                return output
+        if current_platform.is_musa() and _strict_musa_custom_collectives():
+            raise RuntimeError(
+                f"{self.unique_name} Broadcast did not use custom All-Reduce: "
+                f"shape={tuple(input_.shape)}, dtype={input_.dtype}"
+            )
         torch.distributed.broadcast(
             input_,
             src=self.ranks[src],
@@ -808,7 +913,7 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self) -> None:
-        for attr in ("ca_comm", "cag_comm"):
+        for attr in ("ca_comm", "cag_comm", "ca2a_comm"):
             comm = getattr(self, attr)
             if comm is not None:
                 if hasattr(comm, "close"):
@@ -1275,6 +1380,10 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
             group_ranks=group_ranks,
             local_rank=local_rank,
             torch_distributed_backend=torch_distributed_backend,
+            use_custom_collectives=True,
+            use_custom_all_gather=True,
+            custom_all_gather_max_size=64 * 1024 * 1024,
+            use_custom_all_to_all=envs.SGLANG_MUSA_USE_JIT_ALL_TO_ALL.get(),
             group_name=group_name,
         )
         ulysses_group = kwargs.get("ulysses_group", None)
@@ -1294,3 +1403,114 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
         self.ulysses_rank = torch.distributed.get_rank(self.ulysses_group)
         self.ring_world_size = torch.distributed.get_world_size(self.ring_group)
         self.ring_rank = torch.distributed.get_rank(self.ring_group)
+
+    def all_to_all(self, input_: torch.Tensor) -> torch.Tensor:
+        """Run equal-split Ulysses All-to-All through the custom MUSA path."""
+        if self.world_size == 1:
+            return input_
+        output = self.custom_all_to_all(input_)
+        if output is not None:
+            return output
+        if (
+            current_platform.is_musa()
+            and envs.SGLANG_MUSA_USE_JIT_ALL_TO_ALL.get()
+            and _strict_musa_custom_collectives()
+        ):
+            raise RuntimeError(
+                f"{self.unique_name} All-to-All did not use the MUSA custom path: "
+                f"shape={tuple(input_.shape)}, dtype={input_.dtype}, "
+                f"contiguous={input_.is_contiguous()}"
+            )
+        output = torch.empty_like(input_)
+        torch.distributed.all_to_all_single(
+            output, input_, group=self.ulysses_group
+        )
+        return output
+
+    def all_to_all_4D(
+        self, input_: torch.Tensor, scatter_dim: int = 2, gather_dim: int = 1
+    ) -> torch.Tensor:
+        """Ulysses layout transform backed by the custom equal-split A2A."""
+        if self.world_size == 1:
+            return input_
+        assert input_.dim() == 4, (
+            f"input must be 4D tensor, got {input_.dim()} and shape {input_.shape}"
+        )
+
+        if scatter_dim == 2 and gather_dim == 1:
+            batch, local_sequence, heads, dim = input_.shape
+            local_heads = heads // self.world_size
+            input_ = input_.transpose(0, 2).contiguous()
+            output = self.all_to_all(input_)
+            output = torch.cat(output.split(local_heads), dim=1)
+            return output.transpose(0, 2).contiguous()
+
+        if scatter_dim == 1 and gather_dim == 2:
+            batch, sequence, local_heads, dim = input_.shape
+            local_sequence = sequence // self.world_size
+            input_ = input_.transpose(0, 2).contiguous()
+            input_ = (
+                input_.reshape(
+                    local_heads,
+                    self.world_size,
+                    local_sequence,
+                    batch,
+                    dim,
+                )
+                .transpose(0, 1)
+                .reshape(
+                    local_heads * self.world_size,
+                    local_sequence,
+                    batch,
+                    dim,
+                )
+                .contiguous()
+            )
+            output = self.all_to_all(input_)
+            return output.transpose(0, 2).contiguous()
+
+        raise RuntimeError(
+            f"Unsupported scatter_dim={scatter_dim}, gather_dim={gather_dim}"
+        )
+
+    def custom_all_to_all(self, input_: torch.Tensor) -> Optional[torch.Tensor]:
+        if (
+            self.ulysses_world_size != self.world_size
+            or self.ca2a_comm is None
+            or self.ca2a_comm.disabled
+        ):
+            return None
+        return self.ca2a_comm.custom_all_to_all(input_)
+
+    def custom_ulysses(
+        self, input_: torch.Tensor, head_dim: int, input_layout: bool
+    ) -> Optional[torch.Tensor]:
+        if (
+            self.ulysses_world_size != self.world_size
+            or self.ca2a_comm is None
+            or self.ca2a_comm.disabled
+        ):
+            return None
+        return self.ca2a_comm.custom_ulysses(input_, head_dim, input_layout)
+
+    def custom_qkv_ulysses(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if (
+            self.ulysses_world_size != self.world_size
+            or self.ca2a_comm is None
+            or self.ca2a_comm.disabled
+        ):
+            return None
+        return self.ca2a_comm.custom_qkv_ulysses(query, key, value)
+
+    def custom_ulysses_prefix_output(
+        self, prefix: torch.Tensor, sharded: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        if (
+            self.ulysses_world_size != self.world_size
+            or self.ca2a_comm is None
+            or self.ca2a_comm.disabled
+        ):
+            return None
+        return self.ca2a_comm.custom_ulysses_prefix_output(prefix, sharded)
