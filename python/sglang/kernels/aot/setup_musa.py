@@ -188,16 +188,32 @@ class _CustomBuildExt(BuildExtension):
     def _clone_and_checkout(repo_path, repo_url, git_tag, git_shallow):
         """Clone a git repository and checkout a specific tag/commit."""
         repo_path.parent.mkdir(parents=True, exist_ok=True)
-        if not repo_path.exists():
-            clone_cmd = ["git", "clone"]
+        if repo_path.exists():
+            has_commit = (
+                subprocess.call(
+                    ["git", "cat-file", "-e", f"{git_tag}^{{commit}}"],
+                    cwd=repo_path,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                == 0
+            )
+            if has_commit:
+                subprocess.check_call(["git", "checkout", git_tag], cwd=repo_path)
+                return
+            subprocess.check_call(
+                ["git", "remote", "set-url", "origin", repo_url], cwd=repo_path
+            )
+        else:
+            clone_cmd = ["git", "clone", "--filter=blob:none", "--no-checkout"]
             if git_shallow:
                 clone_cmd += ["--depth", "1"]
             clone_cmd += [repo_url, str(repo_path)]
             subprocess.check_call(clone_cmd)
-            subprocess.check_call(["git", "checkout", git_tag], cwd=repo_path)
-        else:
-            subprocess.check_call(["git", "fetch", "--all"], cwd=repo_path)
-            subprocess.check_call(["git", "checkout", git_tag], cwd=repo_path)
+        subprocess.check_call(
+            ["git", "fetch", "--depth", "1", "origin", git_tag], cwd=repo_path
+        )
+        subprocess.check_call(["git", "checkout", "FETCH_HEAD"], cwd=repo_path)
 
     def run(self):
         if os.environ.get("SGLANG_MUSA_SKIP_THIRD_PARTY", "0") == "1":

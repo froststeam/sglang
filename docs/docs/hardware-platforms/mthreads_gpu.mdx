@@ -4,11 +4,46 @@ metatags:
     description: "Run SGLang on Moore Threads GPUs."
 ---
 
-This document describes how run SGLang on Moore Threads GPUs. If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
+This document describes how to run SGLang on Moore Threads GPUs. If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
+
+SGLang uses the MUSA runtime through `torch_musa` and TorchADA. Install the
+MUSA torch, Triton, and TileLang stack from the Moore Threads package index
+before installing SGLang dependencies from public PyPI.
 
 ## Install SGLang
 
 You can install SGLang using one of the methods below.
+
+### Docker
+
+```bash
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+
+docker build -f docker/musa.Dockerfile -t sglang:musa .
+```
+
+Pin the SGLang source revision or MUSA runtime version when needed:
+
+```bash
+docker build -f docker/musa.Dockerfile \
+  --build-arg SGLANG_REF=<commit-or-tag> \
+  --build-arg MUSA_RUNTIME_VERSION=5.2 \
+  --build-arg TRITON_VERSION=3.2.0 \
+  --build-arg TILELANG_MUSA_VERSION=0.1.8+musa.3 \
+  -t sglang:musa .
+```
+
+Run the image with MUSA devices exposed by the host runtime:
+
+```bash
+docker run -it \
+  --shm-size 32g \
+  --ipc host \
+  --network host \
+  --privileged \
+  sglang:musa
+```
 
 ### Install from Source
 
@@ -17,13 +52,49 @@ You can install SGLang using one of the methods below.
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
 
-# Compile sgl-kernel
-pip install --upgrade pip
-cd python/sglang/kernels/aot
-python setup_musa.py install
+# Install the MUSA torch/Triton/TileLang stack
+pip install --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple \
+  --trusted-host dl.mthreads.com \
+  torch==2.9.1.post1+musa5.2.0 \
+  torch_musa==2.9.1.post1+musa5.2.0 \
+  torchaudio==2.9.1+musa5.2.0 \
+  torchvision==0.24.1.post1+musa5.2.0 \
+  triton==3.2.0 \
+  tilelang_musa==0.1.8+musa.3
+
+pip install "torchada>=0.1.84"
 
 # Install sglang python package along with diffusion support
-cd ../../../..
-rm -f python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
-pip install -e "python[all_musa]"
+cp python/pyproject_other.toml python/pyproject.toml
+pip install -e "python[all_musa]" --no-build-isolation \
+  --index-url https://pypi.org/simple \
+  --extra-index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple \
+  --trusted-host dl.mthreads.com
+
+# Compile sgl-kernel
+cd python/sglang/kernels/aot
+cp pyproject_musa.toml pyproject.toml
+MTGPU_TARGET=mp_31 python setup_musa.py install
 ```
+
+## Verify
+
+```bash
+python - <<'PY'
+import torch
+import torchada  # noqa: F401
+import triton
+import sglang
+
+print("torch:", torch.__version__)
+print("musa:", torch.version.musa)
+print("triton:", triton.__version__)
+print("devices:", torch.musa.device_count())
+print("sglang:", sglang.__version__)
+PY
+```
+
+## Downstream packages
+
+Downstream projects such as SGLang-Omni should build on this SGLang MUSA
+environment and install only their own overlay dependencies.

@@ -118,7 +118,7 @@ srt_hip = [
   "compressed-tensors==0.15.0",
   "petit_kernel==0.0.2",
   "sglang[runtime_common]",
-  "torch",
+  "torch<2.10",
   "wave-lang==3.8.2",
 ]
 
@@ -154,9 +154,13 @@ srt_musa = [
   "mthreads-ml-py",
   "numpy<2.0",
   "sglang[runtime_common]",
-  "torch",
+  "tilelang_musa==0.1.8+musa.3",
+  "torch<2.10",
   "torch_musa",
-  "torchada>=0.1.74",
+  "torchada>=0.1.84",
+  "torchaudio",
+  "torchvision",
+  "triton==3.2.0",
 ]
 
 diffusion_musa = [
