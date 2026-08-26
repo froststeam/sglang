@@ -53,9 +53,10 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.gemma3_causal import Gemma3MLP, Gemma3TextScaledWordEmbedding
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, is_musa, make_layers
 
 logger = logging.getLogger(__name__)
+_is_musa = is_musa()
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -601,7 +602,10 @@ class Gemma4DecoderLayer(nn.Module):
             # Fused: (rmsnorm(rmsnorm(h1,w1) + rmsnorm(h2,w2), w3) + residual) * scalar
             if (
                 not self.has_ple
-                and hidden_states_1.is_cuda
+                and (
+                    hidden_states_1.is_cuda
+                    or (_is_musa and hidden_states_1.device.type == "musa")
+                )
                 and hidden_states_1.dim() == 2
             ):
                 norm1 = self.post_feedforward_layernorm_1
@@ -633,7 +637,14 @@ class Gemma4DecoderLayer(nn.Module):
             )
             hidden_states = self.mlp(hidden_states)
 
-        if not self.has_ple and hidden_states.is_cuda and hidden_states.dim() == 2:
+        if (
+            not self.has_ple
+            and (
+                hidden_states.is_cuda
+                or (_is_musa and hidden_states.device.type == "musa")
+            )
+            and hidden_states.dim() == 2
+        ):
             # Fused: (post_ff_norm(h) + residual) * layer_scalar in one kernel
             norm = self.post_feedforward_layernorm
             hidden_states = gemma_rmsnorm_residual_scalar(
