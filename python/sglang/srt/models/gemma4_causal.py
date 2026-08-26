@@ -53,9 +53,10 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.gemma3_causal import Gemma3MLP, Gemma3TextScaledWordEmbedding
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, is_musa, make_layers
 
 logger = logging.getLogger(__name__)
+_is_musa = is_musa()
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -349,7 +350,7 @@ class Gemma4Attention(nn.Module):
             self.is_kv_shared_layer and self.kv_shared_layer_index is not None
         )
         can_fuse_qkv_norm = (
-            q.is_cuda
+            (q.is_cuda or (_is_musa and q.device.type == "musa"))
             and self.q_norm.scale_shift == 0.0
             and self.k_norm.scale_shift == 0.0
             and not self.v_norm.with_scale
