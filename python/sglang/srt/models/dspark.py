@@ -29,6 +29,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
+from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -306,14 +307,19 @@ class DSparkDraftModel(nn.Module):
         self.config = config
         self.quant_config = quant_config
 
-        required_fields = (
-            "target_layer_ids",
-            "mask_token_id",
-            "markov_rank",
-        )
-        for field in required_fields:
-            if not hasattr(config, field):
-                raise ValueError(f"config.{field} must be provided for DSparkDraftModel.")
+        draft_config = parse_dflash_draft_config(draft_hf_config=config)
+        if draft_config.target_layer_ids is None:
+            raise ValueError(
+                "config.target_layer_ids or dflash_config.target_layer_ids "
+                "must be provided for DSparkDraftModel."
+            )
+        if draft_config.mask_token_id is None:
+            raise ValueError(
+                "config.mask_token_id or dflash_config.mask_token_id "
+                "must be provided for DSparkDraftModel."
+            )
+        if not hasattr(config, "markov_rank"):
+            raise ValueError("config.markov_rank must be provided for DSparkDraftModel.")
         if int(config.markov_rank) > 0 and not hasattr(config, "markov_head_type"):
             raise ValueError(
                 "config.markov_head_type must be provided when markov_rank > 0."
@@ -331,9 +337,14 @@ class DSparkDraftModel(nn.Module):
 
         hidden_size = int(config.hidden_size)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
-        self.target_layer_ids = [int(layer_id) for layer_id in config.target_layer_ids]
-        self.block_size = int(config.block_size)
-        self.mask_token_id = int(config.mask_token_id)
+        self.target_layer_ids = [
+            int(layer_id) for layer_id in draft_config.target_layer_ids
+        ]
+        block_size = draft_config.resolve_block_size()
+        if block_size is None:
+            raise ValueError("config.block_size must be provided for DSparkDraftModel.")
+        self.block_size = int(block_size)
+        self.mask_token_id = int(draft_config.mask_token_id)
         self.start_layer = 0
         self.end_layer = int(config.num_hidden_layers)
 
@@ -657,4 +668,4 @@ class Qwen3DSparkModel(DSparkDraftModel):
     pass
 
 
-EntryClass = [Qwen3DSparkModel]
+EntryClass = [Qwen3DSparkModel, DSparkDraftModel]
