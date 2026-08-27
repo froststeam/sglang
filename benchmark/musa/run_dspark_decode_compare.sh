@@ -37,19 +37,26 @@ TEMPERATURE="${TEMPERATURE:-0.0}"
 TOP_P="${TOP_P:-1.0}"
 TOP_K="${TOP_K:--1}"
 RUN_BASELINE="${RUN_BASELINE:-1}"
+RUN_DSPARK="${RUN_DSPARK:-1}"
 SGLANG_REPO="${SGLANG_REPO:-/data/shiven/sglang}"
-MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.8}"
-GEMV_AUTOTUNE_TOKENS="${SGLANG_MUSA_GEMV_AUTOTUNE_TOKENS:-0}"
-GEMV_AUTOTUNE_WARMUP="${SGLANG_MUSA_GEMV_AUTOTUNE_WARMUP:-3}"
-GEMV_AUTOTUNE_ITERS="${SGLANG_MUSA_GEMV_AUTOTUNE_ITERS:-7}"
-GEMV_AUTOTUNE_CONFIG="${SGLANG_MUSA_GEMV_AUTOTUNE_CONFIG:-}"
-MOE_GEMV_SWIGLU_MAX_TOKENS="${SGLANG_MUSA_MOE_GEMV_SWIGLU_MAX_TOKENS:-}"
-MOE_CONFIG_DIR="${SGLANG_MOE_CONFIG_DIR:-}"
+if [[ "${TARGET_MODEL_PATH,,}" == *qwen3.8-27b* ]]; then
+  MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.5}"
+  PAGE_SIZE="${PAGE_SIZE:-1}"
+  DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-1}"
+elif [[ "${TARGET_MODEL_PATH,,}" == *deepseek-v2-lite* ]]; then
+  MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.5}"
+  PAGE_SIZE="${PAGE_SIZE:-}"
+  DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
+  SGLANG_MUSA_MOE_GEMV_SWIGLU_MAX_TOKENS="${SGLANG_MUSA_MOE_GEMV_SWIGLU_MAX_TOKENS:-5}"
+else
+  MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.8}"
+  PAGE_SIZE="${PAGE_SIZE:-}"
+  DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
+fi
 # TP>1 always replicates the Markov vocab weights. Setting this to 1 additionally
 # replicates the full target lm_head on every rank, trading substantial model
 # memory for lower communication latency. Replicas are startup snapshots, so
 # restart the workers after online target/draft weight updates.
-DSPARK_REPLICATE_VOCAB_WEIGHTS="${SGLANG_DSPARK_REPLICATE_VOCAB_WEIGHTS:-0}"
 PROFILE="${PROFILE:-0}"
 PROFILE_OUTPUT_DIR="${PROFILE_OUTPUT_DIR:-/data/shiven/profile_runs/${RUN_TAG}}"
 PROFILE_STEPS="${PROFILE_STEPS:-8}"
@@ -71,12 +78,30 @@ fi
 [ -n "$IMAGE" ] || { echo "no supported SGLang image found locally; set IMAGE=..." >&2; exit 1; }
 
 run_c() {
-  docker exec "$CONTAINER" bash -lc "$1"
+  local -a env_args=(
+    -e "SGLANG_MUSA_GEMV_AUTOTUNE_TOKENS=${SGLANG_MUSA_GEMV_AUTOTUNE_TOKENS:-0}"
+  )
+  local name value
+  for name in \
+    SGLANG_MUSA_GEMV_AUTOTUNE_WARMUP \
+    SGLANG_MUSA_GEMV_AUTOTUNE_ITERS \
+    SGLANG_MUSA_GEMV_AUTOTUNE_CONFIG \
+    SGLANG_MUSA_MOE_GEMV_SWIGLU_MAX_TOKENS \
+    SGLANG_MOE_CONFIG_DIR \
+    SGLANG_DSPARK_REPLICATE_VOCAB_WEIGHTS; do
+    value="${!name:-}"
+    [ -n "$value" ] && env_args+=(-e "$name=$value")
+  done
+  docker exec "${env_args[@]}" "$CONTAINER" bash -lc "$1"
 }
 
 sanitize_name() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '_'
 }
+
+TARGET_MODEL_NAME="${TARGET_MODEL_PATH%/}"
+TARGET_MODEL_NAME="${TARGET_MODEL_NAME##*/}"
+[ -n "$TARGET_MODEL_NAME" ] || { echo "cannot derive model name from TARGET_MODEL_PATH=$TARGET_MODEL_PATH" >&2; exit 1; }
 
 build_dataset() {
   local label="$1"
@@ -218,7 +243,10 @@ start_server() {
   local extra=""
   [ "$mode" = dspark ] && extra="--speculative-algorithm dspark --speculative-draft-model-path $draft_path --speculative-dspark-block-size 7"
   [ -n "$ATTENTION_BACKEND" ] && extra="$extra --attention-backend $ATTENTION_BACKEND"
+  [ -n "$PAGE_SIZE" ] && extra="$extra --page-size $PAGE_SIZE"
+  [ "$DISABLE_RADIX_CACHE" = 1 ] && extra="$extra --disable-radix-cache"
   local log="dspark_decode_${RUN_TAG}_${mode}_bs${bs}.log"
+  local served_model_name="${TARGET_MODEL_NAME}-${RUN_TAG}-${mode}-bs${bs}"
 
   stop_server
   run_c "
@@ -228,17 +256,6 @@ cd $SGLANG_REPO
 export PYTHONPATH=$SGLANG_REPO/python:/data/shiven/sglang/python
 export MUSA_VISIBLE_DEVICES=$GPU
 export MTHREADS_VISIBLE_DEVICES=$GPU
-export SGLANG_MUSA_GEMV_AUTOTUNE_TOKENS=$GEMV_AUTOTUNE_TOKENS
-export SGLANG_MUSA_GEMV_AUTOTUNE_WARMUP=$GEMV_AUTOTUNE_WARMUP
-export SGLANG_MUSA_GEMV_AUTOTUNE_ITERS=$GEMV_AUTOTUNE_ITERS
-export SGLANG_MUSA_GEMV_AUTOTUNE_CONFIG='$GEMV_AUTOTUNE_CONFIG'
-export SGLANG_DSPARK_REPLICATE_VOCAB_WEIGHTS='$DSPARK_REPLICATE_VOCAB_WEIGHTS'
-if [ -n '$MOE_GEMV_SWIGLU_MAX_TOKENS' ]; then
-  export SGLANG_MUSA_MOE_GEMV_SWIGLU_MAX_TOKENS='$MOE_GEMV_SWIGLU_MAX_TOKENS'
-fi
-if [ -n '$MOE_CONFIG_DIR' ]; then
-  export SGLANG_MOE_CONFIG_DIR='$MOE_CONFIG_DIR'
-fi
 nohup python3 -m sglang.launch_server \
   --model-path $model_path \
   --tokenizer-path $model_path \
@@ -254,7 +271,7 @@ nohup python3 -m sglang.launch_server \
   --disable-piecewise-cuda-graph \
   --skip-server-warmup \
   --watchdog-timeout 900 \
-  --served-model-name qwen3-8b-${RUN_TAG}-$mode-bs$bs \
+  --served-model-name $served_model_name \
   $extra \
   > /data/shiven/dataset/$log 2>&1 < /dev/null &
 echo \$! > $PID_FILE
@@ -270,7 +287,7 @@ run_client() {
   local dataset_slug
   dataset_slug="$(sanitize_name "$dataset_label")"
   local out="/data/shiven/dataset/${dataset_slug}/dspark_decode_${RUN_TAG}_${dataset_slug}_${mode}_bs${bs}_${num_examples}.json"
-  local model="qwen3-8b-${RUN_TAG}-${dataset_slug}-$mode-bs$bs"
+  local model="${TARGET_MODEL_NAME}-${RUN_TAG}-${mode}-bs${bs}"
 
   docker exec -i "$CONTAINER" bash -lc \
     "source /root/.virtualenvs/sglang-default/bin/activate && python3 - '$mode' '$model' '$bs' '$out' '$dataset_path' '$model_path' '$PORT' '$num_examples' '$SEED' '$MAX_NEW_TOKENS' '$TEMPERATURE' '$TOP_P' '$TOP_K' '$REQUEST_TIMEOUT'" <<'PY'
@@ -461,30 +478,30 @@ for bs in $BS_LIST; do
       run_client baseline "$bs" "$dataset_label" "$dataset_path" "$dataset_count" "$TARGET_MODEL_PATH"
       result="${HOST_DIR}/$(sanitize_name "$dataset_label")/dspark_decode_${RUN_TAG}_$(sanitize_name "$dataset_label")_baseline_bs${bs}_${dataset_count}.json"
       server_accept=$(server_accept_length baseline)
-      accept="$server_accept"
       batch_s=$(python3 -c "import json; print(json.load(open('$result'))['decode_batch_s'])")
       tps=$(python3 -c "import json; print(json.load(open('$result'))['decode_batch_tps'])")
       tokens=$(python3 -c "import json; print(json.load(open('$result'))['completion_tokens'])")
-      printf "%s,%s,%s,%s,%s,%s,%s,%s\n" "$dataset_label" baseline "$bs" "$accept" "$server_accept" "$batch_s" "$tps" "$tokens" >> "$CSV_PATH"
+      printf "%s,%s,%s,%s,%s,%s,%s,%s\n" "$dataset_label" baseline "$bs" "$server_accept" "$server_accept" "$batch_s" "$tps" "$tokens" >> "$CSV_PATH"
     done
     stop_server
   fi
 
-  for i in "${!DATASET_LABELS[@]}"; do
-    dataset_label="${DATASET_LABELS[$i]}"
-    dataset_path="${DATASET_TARGETS[$i]}"
-    dataset_count="${DATASET_COUNTS[$i]}"
-    start_server dspark "$bs" "$TARGET_MODEL_PATH" "$DRAFT_MODEL_PATH"
-    run_client dspark "$bs" "$dataset_label" "$dataset_path" "$dataset_count" "$TARGET_MODEL_PATH"
-    result="${HOST_DIR}/$(sanitize_name "$dataset_label")/dspark_decode_${RUN_TAG}_$(sanitize_name "$dataset_label")_dspark_bs${bs}_${dataset_count}.json"
-    server_accept=$(server_accept_length dspark)
-    accept="$server_accept"
-    batch_s=$(python3 -c "import json; print(json.load(open('$result'))['decode_batch_s'])")
-    tps=$(python3 -c "import json; print(json.load(open('$result'))['decode_batch_tps'])")
-    tokens=$(python3 -c "import json; print(json.load(open('$result'))['completion_tokens'])")
-    printf "%s,%s,%s,%s,%s,%s,%s,%s\n" "$dataset_label" dspark "$bs" "$accept" "$server_accept" "$batch_s" "$tps" "$tokens" >> "$CSV_PATH"
-    stop_server
-  done
+  if [ "$RUN_DSPARK" = 1 ]; then
+    for i in "${!DATASET_LABELS[@]}"; do
+      dataset_label="${DATASET_LABELS[$i]}"
+      dataset_path="${DATASET_TARGETS[$i]}"
+      dataset_count="${DATASET_COUNTS[$i]}"
+      start_server dspark "$bs" "$TARGET_MODEL_PATH" "$DRAFT_MODEL_PATH"
+      run_client dspark "$bs" "$dataset_label" "$dataset_path" "$dataset_count" "$TARGET_MODEL_PATH"
+      result="${HOST_DIR}/$(sanitize_name "$dataset_label")/dspark_decode_${RUN_TAG}_$(sanitize_name "$dataset_label")_dspark_bs${bs}_${dataset_count}.json"
+      server_accept=$(server_accept_length dspark)
+      batch_s=$(python3 -c "import json; print(json.load(open('$result'))['decode_batch_s'])")
+      tps=$(python3 -c "import json; print(json.load(open('$result'))['decode_batch_tps'])")
+      tokens=$(python3 -c "import json; print(json.load(open('$result'))['completion_tokens'])")
+      printf "%s,%s,%s,%s,%s,%s,%s,%s\n" "$dataset_label" dspark "$bs" "$server_accept" "$server_accept" "$batch_s" "$tps" "$tokens" >> "$CSV_PATH"
+      stop_server
+    done
+  fi
 done
 
 python3 - "$CSV_PATH" <<'PY'
