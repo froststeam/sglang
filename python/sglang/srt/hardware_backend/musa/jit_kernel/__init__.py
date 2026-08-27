@@ -19,6 +19,7 @@ from sglang.srt.hardware_backend.musa.jit_kernel.csrc import (
     per_token_group_quant_8bit,
     rmsnorm,
     rotary_embedding,
+    sigmoid_mul,
     topk_sigmoid,
     topk_softmax,
 )
@@ -58,6 +59,7 @@ __all__ = [
     "RMSNorm",
     "rms_norm_gated",
     "rotary_embedding",
+    "sigmoid_mul",
     "topk_sigmoid",
     "topk_softmax",
 ]

@@ -4,6 +4,7 @@ from sglang.srt.hardware_backend.musa.jit_kernel.csrc.activation import (
     act_and_mul,
     act_and_mul_masked,
     act_and_mul_masked_post_quant_fwd,
+    sigmoid_mul,
 )
 from sglang.srt.hardware_backend.musa.jit_kernel.csrc.gemv import (
     musa_gemv,
@@ -46,6 +47,7 @@ __all__ = [
     "act_and_mul",
     "act_and_mul_masked",
     "act_and_mul_masked_post_quant_fwd",
+    "sigmoid_mul",
     "moe_sum_reduce",
     "per_token_group_quant_8bit",
     "rmsnorm",

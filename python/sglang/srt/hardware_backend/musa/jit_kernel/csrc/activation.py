@@ -25,6 +25,51 @@ def _act_and_mul_masked_module():
     )
 
 
+@cache_once
+def _sigmoid_mul_module():
+    return load_musa_jit(
+        "sglang_musa_sigmoid_mul",
+        ("activation/sigmoid_mul.mu",),
+    )
+
+
+def _sigmoid_mul_impl(
+    gate: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    _sigmoid_mul_module().sgl_musa_sigmoid_mul(gate, value, output)
+
+
+@register_custom_op(
+    op_name="musa_sigmoid_mul",
+    mutates_args=["output"],
+)
+def _sigmoid_mul_custom(
+    gate: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    _sigmoid_mul_impl(gate, value, output)
+
+
+def sigmoid_mul(gate: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+    """Compute ``sigmoid(gate) * value`` in one MUSA JIT kernel."""
+    if (
+        gate.device.type != "musa"
+        or value.device != gate.device
+        or gate.shape != value.shape
+        or gate.dtype != value.dtype
+        or gate.dtype not in (torch.float16, torch.bfloat16)
+        or not gate.is_contiguous()
+        or not value.is_contiguous()
+    ):
+        return torch.sigmoid(gate) * value
+    output = torch.empty_like(value)
+    _sigmoid_mul_custom(gate, value, output)
+    return output
+
+
 def _activation_type_id(activation: str) -> int:
     if activation == "silu":
         return 0
