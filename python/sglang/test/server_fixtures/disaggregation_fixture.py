@@ -237,6 +237,32 @@ def get_rdma_devices_args():
         items = [x.strip() for x in val.split(",") if x.strip()]
         return items or None
 
+    def _get_visible_gpu_indices():
+        for var_name in (
+            "CUDA_VISIBLE_DEVICES",
+            "MUSA_VISIBLE_DEVICES",
+            "MTHREADS_VISIBLE_DEVICES",
+        ):
+            gpu_indices = _parse_list_env(var_name)
+            if gpu_indices:
+                logger.warning(
+                    "Resolved visible GPU indices from %s=%s", var_name, gpu_indices
+                )
+                return gpu_indices, var_name
+        return None, None
+
+    def _get_total_gpu_count():
+        try:
+            import torch
+
+            if hasattr(torch, "cuda") and torch.cuda.is_available():
+                return torch.cuda.device_count()
+            if hasattr(torch, "musa") and torch.musa.is_available():
+                return torch.musa.device_count()
+        except Exception:
+            pass
+        return 8
+
     def _pick_default_pair(rdma_all_devices):
         return [rdma_all_devices[0], rdma_all_devices[len(rdma_all_devices) // 2]]
 
@@ -251,20 +277,20 @@ def get_rdma_devices_args():
     n_rdma = len(rdma_all_devices)
 
     # 1. Get visible GPU indices
-    cuda_visible_devices = os.getenv("CUDA_VISIBLE_DEVICES")
-    if not cuda_visible_devices:
-        warnings.warn("CUDA_VISIBLE_DEVICES is not set. Using default RDMA devices.")
+    visible_gpu_indices, visible_gpu_env = _get_visible_gpu_indices()
+    if not visible_gpu_indices:
+        warnings.warn("Visible GPU env is not set. Using default RDMA devices.")
         return ",".join(_pick_default_pair(rdma_all_devices))
 
     try:
         # Convert to list of integers (handling possible spaces and empty strings)
-        gpu_indices = [
-            int(idx.strip()) for idx in cuda_visible_devices.split(",") if idx.strip()
-        ]
+        gpu_indices = [int(idx.strip()) for idx in visible_gpu_indices if idx.strip()]
         if not gpu_indices or len(gpu_indices) > 4:
             return ",".join(_pick_default_pair(rdma_all_devices))
     except ValueError:
-        warnings.warn(f"Invalid CUDA_VISIBLE_DEVICES format: {cuda_visible_devices}")
+        warnings.warn(
+            f"Invalid {visible_gpu_env} format: {','.join(visible_gpu_indices)}"
+        )
         return ",".join(_pick_default_pair(rdma_all_devices))
 
     # 2. Calculate base RDMA index group (each group of 4 GPUs uses consecutive devices)
@@ -278,12 +304,7 @@ def get_rdma_devices_args():
 
     # 3. Generate RDMA device names
     # Detect total GPUs on the node (not just visible ones)
-    try:
-        import torch
-
-        total_gpus = torch.cuda.device_count()
-    except Exception:
-        total_gpus = 8  # Fallback to common 8-GPU setup
+    total_gpus = _get_total_gpu_count()
 
     # Handle edge cases
     if total_gpus == 0:
