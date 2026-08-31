@@ -353,6 +353,9 @@ mr:musa-server-smoke-summary:
     - mr:musa-speculative-smoke:eagle3-1gpu
     - mr:musa-speculative-smoke:ngram-1gpu
     - mr:musa-speculative-smoke:mtp-4gpu
+    - mr:musa-pd-disaggregation:gsm8k-qwen35-35b-a3b-fp8-4gpu
+    - mr:musa-server-smoke:qwen35-35b-a3b-temp06-2gpu
+    - mr:musa-radix-prefix-cache:qwen35-35b-a3b-fp8-2gpu
   script:
     - python3 scripts/ci/musa/ci_summarize_smoke_artifacts.py
   artifacts:

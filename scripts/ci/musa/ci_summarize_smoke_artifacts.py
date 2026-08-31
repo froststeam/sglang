@@ -34,7 +34,7 @@ def display_model_name(model: str) -> str:
 
 def model_from_metrics_file(path: Path) -> str:
     stem = path.stem
-    for prefix in ("gsm8k__", "vlm__", "speculative__"):
+    for prefix in ("gsm8k__", "vlm__", "speculative__", "radix_prefix_cache__"):
         if stem.startswith(prefix):
             stem = stem[len(prefix) :]
             break
@@ -64,6 +64,24 @@ def dataset_name(metrics: dict, json_file: Path | None) -> str:
 
 
 def manifest_metrics(manifest: dict) -> dict:
+    if manifest.get("radix_prefix_cache") == "1":
+        prefix_len = manifest.get("radix_prefix_cache_prefix_len", "")
+        suffix_len = manifest.get("radix_prefix_cache_suffix_len", "")
+        try:
+            configured_prefix_ratio = float(prefix_len) / (
+                float(prefix_len) + float(suffix_len)
+            )
+        except (TypeError, ValueError, ZeroDivisionError):
+            configured_prefix_ratio = None
+        return {
+            "eval_name": "radix_prefix_cache",
+            "dataset": "radix_prefix_cache",
+            "metric": "cache_hit_rate",
+            "prefix_len": prefix_len,
+            "suffix_len": suffix_len,
+            "configured_prefix_ratio": configured_prefix_ratio,
+        }
+
     eval_value = manifest.get("smoke_eval", "")
     dataset = (
         manifest.get("smoke_vlm_dataset", "") if eval_value == "vlm" else eval_value
@@ -103,6 +121,43 @@ def parallel_name(manifest: dict) -> str:
     return "/".join(parts)
 
 
+def variant_name(manifest: dict) -> str:
+    parts = []
+    if manifest.get("pd_disaggregation") == "1":
+        parts.append("PD disaggregation")
+
+    temperature = manifest.get("sampling_temperature", "")
+    if temperature:
+        try:
+            temperature_value = float(temperature)
+        except ValueError:
+            temperature_value = None
+        if temperature_value is None or temperature_value != 0.0:
+            parts.append(f"temp={temperature}")
+
+    return ", ".join(parts)
+
+
+def display_model_with_variant(row: dict, metrics: dict, json_file: Path | None) -> str:
+    model = row["model"]
+    if (
+        row.get("variant")
+        and dataset_name(metrics, json_file) == "gsm8k"
+    ):
+        model = f"{model} ({row['variant']})"
+    return model
+
+
+def is_radix_prefix_cache(
+    metrics: dict, json_file: Path | None, manifest: dict
+) -> bool:
+    if manifest.get("radix_prefix_cache") == "1":
+        return True
+    if eval_name(metrics, json_file) == "radix_prefix_cache":
+        return True
+    return json_file is not None and json_file.name.startswith("radix_prefix_cache__")
+
+
 def load_manifest(job_dir: Path) -> dict:
     manifest = job_dir / "manifest.txt"
     data = {}
@@ -128,17 +183,23 @@ def main() -> None:
                 sorted(job_dir.glob("gsm8k__*.json"))
                 + sorted(job_dir.glob("vlm__*.json"))
                 + sorted(job_dir.glob("speculative__*.json"))
+                + sorted(job_dir.glob("radix_prefix_cache__*.json"))
             )
             if not json_files:
+                metrics = manifest_metrics(manifest)
                 rows.append(
                     {
                         "model": display_model_name(manifest.get("smoke_model", "")),
                         "parallel": parallel_name(manifest),
                         "suite": manifest.get("musa_run_suite", ""),
+                        "variant": variant_name(manifest),
                         "file": "",
-                        "metrics": manifest_metrics(manifest),
+                        "metrics": metrics,
                         "missing_metrics": True,
                         "speculative": False,
+                        "radix_prefix_cache": is_radix_prefix_cache(
+                            metrics, None, manifest
+                        ),
                     }
                 )
                 continue
@@ -156,6 +217,7 @@ def main() -> None:
                         "model": model_name(metrics, manifest, json_file),
                         "parallel": parallel_name(manifest),
                         "suite": manifest.get("musa_run_suite", ""),
+                        "variant": variant_name(manifest),
                         "file": str(json_file),
                         "metrics": metrics,
                         "missing_metrics": False,
@@ -165,6 +227,9 @@ def main() -> None:
                         # speculative artifact belongs in the speculative
                         # summary table.
                         "speculative": json_file.name.startswith("speculative__"),
+                        "radix_prefix_cache": is_radix_prefix_cache(
+                            metrics, json_file, manifest
+                        ),
                     }
                 )
 
@@ -184,12 +249,14 @@ def main() -> None:
         row
         for row in rows
         if not row.get("speculative")
+        and not row.get("radix_prefix_cache")
         and (
             not row.get("file")
             or Path(row["file"]).parent not in speculative_job_dirs
         )
     ]
     speculative_rows = [row for row in rows if row.get("speculative")]
+    radix_prefix_cache_rows = [row for row in rows if row.get("radix_prefix_cache")]
 
     lines = ["# MUSA Smoke Eval Summary", ""]
     if not rows:
@@ -206,7 +273,7 @@ def main() -> None:
             json_file = Path(row["file"]) if row.get("file") else None
             lines.append(
                 "| `{}` | {} | {} | {} | {} | {} |".format(
-                    row["model"],
+                    display_model_with_variant(row, metrics, json_file),
                     row.get("parallel", ""),
                     dataset_name(metrics, json_file),
                     fmt_int(metrics.get("num_examples_actual")),
@@ -243,6 +310,40 @@ def main() -> None:
             lines.append(
                 "| No speculative decoding artifacts found. | | | | | | |"
             )
+
+        lines.extend(
+            [
+                "",
+                "## Radix prefix cache evaluation",
+                "",
+                "| Model | Parallel | Prefix Ratio | Prefix Len | Suffix Len | "
+                "Hit Rate | Cached/Prompt Tokens |",
+                "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        if radix_prefix_cache_rows:
+            for row in radix_prefix_cache_rows:
+                metrics = row["metrics"]
+                total_cached = metrics.get("total_cached_tokens")
+                total_prompt = metrics.get("total_prompt_tokens")
+                token_ratio = (
+                    f"{fmt_int(total_cached)}/{fmt_int(total_prompt)}"
+                    if total_cached is not None and total_prompt is not None
+                    else ""
+                )
+                lines.append(
+                    "| `{}` | {} | {} | {} | {} | {} | {} |".format(
+                        row["model"],
+                        row.get("parallel", ""),
+                        fmt(metrics.get("configured_prefix_ratio")),
+                        fmt_int(metrics.get("prefix_len")),
+                        fmt_int(metrics.get("suffix_len")),
+                        fmt(metrics.get("cache_hit_rate")),
+                        token_ratio,
+                    )
+                )
+        else:
+            lines.append("| No radix prefix cache artifacts found. | | | | | | |")
 
     summary_md = SUMMARY_ROOT / "summary.md"
     summary_md.write_text("\n".join(lines) + "\n")

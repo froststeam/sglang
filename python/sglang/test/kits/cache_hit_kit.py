@@ -1,6 +1,8 @@
 import asyncio
 import json
+import os
 import time
+from pathlib import Path
 
 import aiohttp
 import requests
@@ -227,6 +229,199 @@ def _get_page_size(base_url: str) -> int:
         return info.get("page_size", 1)
     except Exception:
         return 1
+
+
+def _safe_model_stem(model: str) -> str:
+    return model.replace("/", "_").replace(":", "_")
+
+
+def _valid_token_ids(tokenizer) -> list[int]:
+    vocab = tokenizer.get_vocab()
+    special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+    token_ids = sorted(
+        int(token_id)
+        for token_id in vocab.values()
+        if isinstance(token_id, int) and token_id not in special_ids
+    )
+    if not token_ids:
+        raise ValueError("Tokenizer did not expose any non-special token ids.")
+    return token_ids
+
+
+def _build_token_sequence(
+    token_ids: list[int],
+    length: int,
+    offset: int,
+    stride: int,
+) -> list[int]:
+    vocab_size = len(token_ids)
+    return [token_ids[(offset + i * stride) % vocab_size] for i in range(length)]
+
+
+def run_fixed_prefix_cache_hit_test(
+    base_url: str,
+    model_path: str,
+    prefix_len: int = 1024,
+    suffix_len: int = 1024,
+    num_groups: int = 4,
+    prompts_per_group: int = 4,
+    output_len: int = 32,
+    min_hit_rate: float = 0.45,
+    max_parallel: int = 16,
+    seed: int = 1,
+) -> dict:
+    """Run a deterministic shared-prefix workload and verify radix cache hits.
+
+    Each group sends one warmup request and one branch-seed request before
+    measured requests reuse exactly `prefix_len` input ids and diverge for
+    `suffix_len` ids.
+    """
+    if prefix_len <= 0 or suffix_len <= 0:
+        raise ValueError("prefix_len and suffix_len must be positive.")
+    if num_groups <= 0:
+        raise ValueError("num_groups must be positive.")
+    if prompts_per_group < 3:
+        raise ValueError(
+            "prompts_per_group must include warmup, branch-seed, and measured prompts."
+        )
+
+    generate_url = f"{base_url}/generate"
+    tokenizer = get_tokenizer(model_path)
+    token_ids = _valid_token_ids(tokenizer)
+    page_size = max(int(_get_page_size(base_url)), 1)
+
+    requests.post(f"{base_url}/flush_cache", timeout=30).raise_for_status()
+    time.sleep(1)
+
+    prefixes = []
+    suffixes = []
+    stride = 997
+    for group_idx in range(num_groups):
+        group_base = seed * 100003 + group_idx * 10007
+        prefixes.append(
+            _build_token_sequence(token_ids, prefix_len, group_base, stride)
+        )
+        suffixes.append(
+            [
+                _build_token_sequence(
+                    token_ids,
+                    suffix_len,
+                    group_base + (prompt_idx + 1) * 1009,
+                    stride + prompt_idx + 1,
+                )
+                for prompt_idx in range(prompts_per_group)
+            ]
+        )
+
+    warmup_payloads = [
+        gen_payload(prefixes[group_idx] + suffixes[group_idx][0], output_len)
+        for group_idx in range(num_groups)
+    ]
+    warmup_responses = asyncio.run(
+        _send_round(warmup_payloads, generate_url, max_parallel)
+    )
+    for group_idx, response in enumerate(warmup_responses):
+        assert response.success, f"Warmup group {group_idx} failed: {response.error}"
+
+    branch_seed_payloads = [
+        gen_payload(prefixes[group_idx] + suffixes[group_idx][1], output_len)
+        for group_idx in range(num_groups)
+    ]
+    branch_seed_responses = asyncio.run(
+        _send_round(branch_seed_payloads, generate_url, max_parallel)
+    )
+    for group_idx, response in enumerate(branch_seed_responses):
+        assert response.success, (
+            f"Branch-seed group {group_idx} failed: {response.error}"
+        )
+
+    measured_payloads = []
+    for group_idx in range(num_groups):
+        for prompt_idx in range(2, prompts_per_group):
+            measured_payloads.append(
+                gen_payload(
+                    prefixes[group_idx] + suffixes[group_idx][prompt_idx], output_len
+                )
+            )
+
+    measured_responses = asyncio.run(
+        _send_round(measured_payloads, generate_url, max_parallel)
+    )
+
+    per_request = []
+    total_prompt = 0
+    total_cached = 0
+    total_ttft = 0.0
+    expected_cached = (prefix_len // page_size) * page_size
+    expected_hit_rate = expected_cached / (prefix_len + suffix_len)
+
+    for request_idx, response in enumerate(measured_responses):
+        assert response.success, (
+            f"Measured request {request_idx} failed: {response.error}"
+        )
+        assert response.cached_tokens >= expected_cached, (
+            f"Measured request {request_idx}: cached_tokens={response.cached_tokens}, "
+            f"expected>={expected_cached}, page_size={page_size}"
+        )
+
+        total_prompt += response.prompt_len
+        total_cached += response.cached_tokens
+        total_ttft += response.ttft
+        per_request.append(
+            {
+                "request_index": request_idx,
+                "prompt_tokens": response.prompt_len,
+                "cached_tokens": response.cached_tokens,
+                "ttft": response.ttft,
+            }
+        )
+
+    measured_count = len(measured_responses)
+    cache_hit_rate = total_cached / total_prompt if total_prompt > 0 else 0.0
+    average_ttft = total_ttft / measured_count if measured_count > 0 else 0.0
+    assert cache_hit_rate >= min_hit_rate, (
+        f"cache_hit_rate={cache_hit_rate:.4f} is below min_hit_rate={min_hit_rate:.4f}"
+    )
+
+    result = {
+        "eval_name": "radix_prefix_cache",
+        "model": model_path,
+        "prefix_len": prefix_len,
+        "suffix_len": suffix_len,
+        "prompt_len": prefix_len + suffix_len,
+        "configured_prefix_ratio": prefix_len / (prefix_len + suffix_len),
+        "cache_hit_rate": cache_hit_rate,
+        "min_hit_rate": min_hit_rate,
+        "expected_hit_rate": expected_hit_rate,
+        "expected_cached_tokens_per_request": expected_cached,
+        "page_size": page_size,
+        "num_groups": num_groups,
+        "prompts_per_group": prompts_per_group,
+        "warmup_requests": len(warmup_responses),
+        "branch_seed_requests": len(branch_seed_responses),
+        "measured_requests": measured_count,
+        "total_prompt_tokens": total_prompt,
+        "total_cached_tokens": total_cached,
+        "average_ttft": average_ttft,
+        "per_request": per_request,
+    }
+
+    report_dir = Path(
+        os.environ.get("SGLANG_EVAL_REPORT_DIR")
+        or os.environ.get("MUSA_SMOKE_ARTIFACT_DIR", "/tmp")
+    )
+    report_dir.mkdir(parents=True, exist_ok=True)
+    result_filename = (
+        report_dir / f"radix_prefix_cache__{_safe_model_stem(model_path)}.json"
+    )
+    result_filename.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    print(f"Writing radix prefix cache results to {result_filename}")
+    print(
+        f"  Radix prefix cache hit_rate={cache_hit_rate:.4f}, "
+        f"cached={total_cached}/{total_prompt} tokens, page_size={page_size}"
+    )
+
+    return result
 
 
 def run_multiturn_cache_hit_test(

@@ -19,9 +19,12 @@ for model_var in \
   MUSA_SMOKE_QWEN_DENSE_TP_MODEL \
   MUSA_SMOKE_JOYAI_LLM_FLASH_MODEL \
   MUSA_SMOKE_QWEN_MOE_TP_MODEL \
+  MUSA_SMOKE_QWEN35_35B_A3B_TEMP06_MODEL \
+  MUSA_RADIX_PREFIX_CACHE_MODEL \
   MUSA_SMOKE_QWEN_MOE_MODEL \
   MUSA_SMOKE_GEMMA4_26B_A4B_MODEL \
   MUSA_SMOKE_QWEN3_VL_32B_MODEL \
+  MUSA_PD_QWEN35_MOE_MODEL \
   MUSA_SPEC_DSPARK_TARGET_MODEL \
   MUSA_SPEC_EAGLE3_TARGET_MODEL \
   MUSA_SPEC_MTP_MODEL; do
@@ -119,15 +122,35 @@ PY
 )"
 read -r smoke_tp smoke_ep smoke_pp smoke_dp smoke_parallel <<<"${parallel_info}"
 
+pd_disaggregation="0"
+if [[ "${MUSA_RUN_SUITE:-}" == *pd-disaggregation* ]] || [[ -n "${MUSA_PD_QWEN35_MOE_MODEL:-}" ]]; then
+  pd_disaggregation="1"
+fi
+if [[ -z "${smoke_parallel}" && -n "${MUSA_PD_PARALLEL:-}" ]]; then
+  smoke_parallel="${MUSA_PD_PARALLEL}"
+fi
+if [[ -z "${smoke_parallel}" && -n "${MUSA_RADIX_PREFIX_CACHE_PARALLEL:-}" ]]; then
+  smoke_parallel="${MUSA_RADIX_PREFIX_CACHE_PARALLEL}"
+fi
+
+sampling_temperature="${MUSA_SMOKE_GSM8K_TEMPERATURE:-${MUSA_PD_GSM8K_TEMPERATURE:-}}"
+radix_prefix_cache="0"
+if [[ "${MUSA_RUN_SUITE:-}" == *radix-prefix-cache* ]] || [[ -n "${MUSA_RADIX_PREFIX_CACHE_MODEL:-}" ]]; then
+  radix_prefix_cache="1"
+fi
+
 shopt -s nullglob
 marker_file="${artifact_dir}/.start"
 
 if [[ -f "${marker_file}" ]]; then
   while IFS= read -r -d "" file; do
-    cp -f "${file}" "${artifact_dir}/"
+    dst="${artifact_dir}/$(basename "${file}")"
+    if [[ ! -e "${dst}" ]]; then
+      cp -f "${file}" "${dst}"
+    fi
   done < <(
     find /tmp -maxdepth 1 -type f \
-      \( -name 'gsm8k__*.html' -o -name 'gsm8k__*.json' -o -name 'vlm__*.html' -o -name 'vlm__*.json' \) \
+      \( -name 'gsm8k__*.html' -o -name 'gsm8k__*.json' -o -name 'vlm__*.html' -o -name 'vlm__*.json' -o -name 'radix_prefix_cache__*.json' \) \
       -newer "${marker_file}" -print0 2>/dev/null
   )
 
@@ -158,6 +181,7 @@ report_files=(
   "${artifact_dir}"/vlm__*.html
   "${artifact_dir}"/vlm__*.json
   "${artifact_dir}"/speculative__*.json
+  "${artifact_dir}"/radix_prefix_cache__*.json
 )
 mudmp_files=()
 if [[ -d "${artifact_dir}/mudmp" ]]; then
@@ -179,6 +203,11 @@ fi
   echo "smoke_vlm_metric=${MUSA_SMOKE_VLM_METRIC:-}"
   echo "smoke_vlm_limit=${MUSA_SMOKE_VLM_LIMIT:-}"
   echo "smoke_model=${smoke_model}"
+  echo "pd_disaggregation=${pd_disaggregation}"
+  echo "radix_prefix_cache=${radix_prefix_cache}"
+  echo "radix_prefix_cache_prefix_len=${MUSA_RADIX_PREFIX_CACHE_PREFIX_LEN:-}"
+  echo "radix_prefix_cache_suffix_len=${MUSA_RADIX_PREFIX_CACHE_SUFFIX_LEN:-}"
+  echo "sampling_temperature=${sampling_temperature}"
   echo "smoke_tp=${smoke_tp}"
   echo "smoke_ep=${smoke_ep}"
   echo "smoke_pp=${smoke_pp}"
@@ -215,6 +244,7 @@ json_files = (
     sorted(artifact_dir.glob("gsm8k__*.json"))
     + sorted(artifact_dir.glob("vlm__*.json"))
     + sorted(artifact_dir.glob("speculative__*.json"))
+    + sorted(artifact_dir.glob("radix_prefix_cache__*.json"))
 )
 summary = artifact_dir / "summary.md"
 

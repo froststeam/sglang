@@ -34,6 +34,75 @@ stage-b:musa-unit:
         pytest sgl-kernel/tests/test_torch_defaults_reset.py
       fi
 
+mr:musa-pd-disaggregation:gsm8k-qwen35-35b-a3b-fp8-4gpu:
+  needs:
+    - mr:musa-install-dependency
+  stage: stage-b
+  timeout: 50m
+  extends:
+    - .musa-4gpu-test-job
+    - .rules-merge-request
+    - .musa-registered-suite-job
+  variables:
+    MUSA_RUN_SUITE: "stage-b-test-4-gpu-musa-pd-disaggregation-smoke"
+    MUSA_RUN_SUITE_TIMEOUT_PER_FILE: "2400"
+    MUSA_PD_QWEN35_MOE_MODEL: "/data/models/Qwen3.5-35B-A3B-FP8"
+    MUSA_PD_PARALLEL: "P:TP2/D:TP2"
+    MUSA_PD_GSM8K_DATA_PATH: "/data/eval/gsm8k/test.jsonl"
+    MUSA_PD_GSM8K_NUM_EXAMPLES: "200"
+    MUSA_PD_GSM8K_NUM_THREADS: "16"
+    MUSA_PD_GSM8K_MAX_TOKENS: "512"
+    MUSA_PD_GSM8K_MIN_SCORE: "0.90"
+    MUSA_PD_GSM8K_CHAT_TEMPLATE_KWARGS: '{"enable_thinking": false}'
+    MUSA_PD_GSM8K_REASONING_EFFORT: "none"
+
+mr:musa-server-smoke:qwen35-35b-a3b-temp06-2gpu:
+  needs:
+    - mr:musa-install-dependency
+  stage: stage-b
+  timeout: 70m
+  extends:
+    - .musa-2gpu-test-job
+    - .rules-merge-request
+    - .musa-registered-suite-job
+  variables:
+    MUSA_RUN_SUITE: "stage-b-test-2-gpu-musa-qwen35-35b-a3b-temp06-smoke"
+    MUSA_RUN_SUITE_TIMEOUT_PER_FILE: "3600"
+    MUSA_SMOKE_SERVER_TIMEOUT: "900"
+    MUSA_SMOKE_COMMON_EXTRA_ARGS: "--disable-piecewise-cuda-graph --attention-backend fa3 --disable-overlap-schedule --chunked-prefill-size 2048"
+    MUSA_SMOKE_QWEN35_35B_A3B_TEMP06_MODEL: "/data/models/Qwen3.5-35B-A3B"
+    MUSA_SMOKE_QWEN35_35B_A3B_TEMP06_EXTRA_ARGS: "--linear-attn-prefill-backend flashinfer --linear-attn-decode-backend flashinfer --moe-runner-backend auto --mamba-scheduler-strategy extra_buffer --mamba-track-interval 128 --max-running-requests 64 --mem-fraction-static 0.70 --cuda-graph-bs 1 2 4 8 16 32 64"
+    MUSA_SMOKE_GSM8K_DATA_PATH: "/data/eval/gsm8k/test.jsonl"
+    MUSA_SMOKE_GSM8K_NUM_EXAMPLES: "1319"
+    MUSA_SMOKE_GSM8K_NUM_THREADS: "16"
+    MUSA_SMOKE_GSM8K_MAX_TOKENS: "512"
+    MUSA_SMOKE_GSM8K_MIN_SCORE: "0.85"
+    MUSA_SMOKE_GSM8K_TEMPERATURE: "0.6"
+    MUSA_SMOKE_GSM8K_CHAT_TEMPLATE_KWARGS: '{"enable_thinking": false}'
+    MUSA_SMOKE_GSM8K_REASONING_EFFORT: "none"
+
+mr:musa-radix-prefix-cache:qwen35-35b-a3b-fp8-2gpu:
+  needs:
+    - mr:musa-install-dependency
+  stage: stage-b
+  timeout: 40m
+  extends:
+    - .musa-2gpu-test-job
+    - .rules-merge-request
+    - .musa-registered-suite-job
+  variables:
+    MUSA_RUN_SUITE: "stage-b-test-2-gpu-musa-radix-prefix-cache-smoke"
+    MUSA_RUN_SUITE_TIMEOUT_PER_FILE: "1800"
+    MUSA_RADIX_PREFIX_CACHE_MODEL: "/data/models/Qwen3.5-35B-A3B-FP8"
+    MUSA_RADIX_PREFIX_CACHE_PARALLEL: "TP2"
+    MUSA_RADIX_PREFIX_CACHE_PREFIX_LEN: "1024"
+    MUSA_RADIX_PREFIX_CACHE_SUFFIX_LEN: "1024"
+    MUSA_RADIX_PREFIX_CACHE_GROUPS: "4"
+    MUSA_RADIX_PREFIX_CACHE_PROMPTS_PER_GROUP: "4"
+    MUSA_RADIX_PREFIX_CACHE_OUTPUT_LEN: "32"
+    MUSA_RADIX_PREFIX_CACHE_MIN_HIT_RATE: "0.45"
+    MUSA_RADIX_PREFIX_CACHE_MAX_PARALLEL: "16"
+
 # Reserved for the next phase once 2/4/8 GPU MUSA runners are available.
 # stage-b:2gpu-musa:
 #   stage: stage-b
