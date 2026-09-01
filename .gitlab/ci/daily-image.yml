@@ -1,5 +1,6 @@
 daily:image-build:
   stage: daily-image
+  timeout: 90m
   extends:
     - .image-builder-job
     - .rules-daily-image
