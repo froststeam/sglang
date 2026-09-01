@@ -69,6 +69,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader i
 )
 from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.musa_graph import MusaGraphCallable
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -91,6 +92,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.srt.environ import envs as srt_envs
 from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import (
     RolloutDenoisingMixin,
 )
@@ -102,6 +104,17 @@ from sglang.multimodal_gen.utils import PRECISION_TO_TYPE, dict_to_3d_list
 from sglang.srt.utils.common import get_compiler_backend
 
 logger = init_logger(__name__)
+
+
+def _model_has_fp8_weights(model: nn.Module) -> bool:
+    """Detect actual FP8 weights without relying on a model ``dtype`` field."""
+    quant_config = getattr(model, "quant_config", None)
+    if quant_config is not None and "fp8" in type(quant_config).__name__.lower():
+        return True
+    return any(
+        parameter.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        for parameter in model.parameters()
+    )
 
 
 @dataclass(slots=True)
@@ -205,6 +218,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self.profiler = None
         self._is_warmed_up = False
         self._extra_func_kwarg_names_cache: dict[int, tuple[bool, frozenset[str]]] = {}
+        self._musa_graph_callables: dict[int, MusaGraphCallable] = {}
+        self._musa_fp8_model_ids: dict[int, bool] = {}
+        self._musa_graph_parallel_safe = False
 
     def _infer_transformer_attention_backend(self) -> AttentionBackendEnum | None:
         backends = {
@@ -1393,6 +1409,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         latents: torch.Tensor,
     ) -> "torch.Tensor | tuple[torch.Tensor, ...]":
         """Run all CFG branch forward passes and combine into the final noise estimate."""
+        # The complete DiT forward, including Attention/SP collectives, is
+        # captured as one MUSA graph for supported fixed-shape CFG/SP runs.
+        self._musa_graph_parallel_safe = True
         cfg_scale = server_args.pipeline_config.get_classifier_free_guidance_scale(
             batch, current_guidance_scale
         )
@@ -1599,6 +1618,19 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             getattr(current_model, "forward", current_model),
             {"guidance": guidance},
         )
+        graph_key = id(current_model)
+        graph_enabled = (
+            srt_envs.SGLANG_MUSA_ENABLE_DIT_GRAPH.get()
+            and current_platform.is_musa()
+            and not self._cache_dit_enabled
+            and self._musa_graph_parallel_safe
+        )
+        if graph_enabled:
+            graph_fn = self._musa_graph_callables.get(graph_key)
+            if graph_fn is None:
+                graph_fn = MusaGraphCallable(current_model, enabled=True)
+                self._musa_graph_callables[graph_key] = graph_fn
+            current_model = graph_fn
         return current_model(
             hidden_states=latent_model_input,
             timestep=timestep,
