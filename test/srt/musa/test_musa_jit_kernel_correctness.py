@@ -182,3 +182,19 @@ def test_rms_norm_gated_tilelang_matches_triton():
     torch.musa.synchronize()
 
     torch.testing.assert_close(out_tilelang, out_triton, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("batch_size", [1, 5, 8])
+def test_sigmoid_mul_musa_jit_matches_torch(batch_size):
+    from sglang.srt.hardware_backend.musa.jit_kernel import sigmoid_mul
+
+    torch.manual_seed(batch_size)
+    gate = torch.randn(
+        batch_size, 2048, device="musa", dtype=torch.bfloat16
+    )
+    value = torch.randn_like(gate)
+    actual = sigmoid_mul(gate, value)
+    expected = torch.sigmoid(gate.float()) * value.float()
+    torch.musa.synchronize()
+
+    torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=1e-2)

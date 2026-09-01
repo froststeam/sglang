@@ -103,6 +103,7 @@ if _is_musa:
     from sglang.srt.hardware_backend.musa.jit_kernel import RMSNorm as RMSNormGated
     from sglang.srt.hardware_backend.musa.jit_kernel import (
         fused_qkvzba_split_reshape_cat_contiguous,
+        sigmoid_mul,
     )
 else:
     from sglang.jit_kernel.triton.gdn_fused_proj import (
@@ -215,7 +216,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         # State parameters
         self.dt_bias = nn.Parameter(
-            torch.ones(self.num_v_heads // self.attn_tp_size),
+            torch.ones(
+                self.num_v_heads // self.attn_tp_size,
+                dtype=torch.float32,
+            ),
         )
         self.A_log = nn.Parameter(
             torch.empty(self.num_v_heads // self.attn_tp_size, dtype=torch.float32),
@@ -913,8 +917,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         )
 
         if self.attn_output_gate:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
+            if _is_musa:
+                attn_output = sigmoid_mul(gate, attn_output)
+            else:
+                gate = torch.sigmoid(gate)
+                attn_output = attn_output * gate
 
         output, _ = self.o_proj(attn_output)
         return output
