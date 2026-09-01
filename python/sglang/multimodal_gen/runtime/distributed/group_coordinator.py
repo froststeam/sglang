@@ -403,6 +403,20 @@ class GroupCoordinator:
             with torch.cuda.stream(stream):
                 yield graph_capture_context
         else:
+            # MUSA graph capture still needs the custom collective registration
+            # contexts. Their IPC buffers are allocated once and reused by every
+            # graph replay; only the launch is captured on the graph stream.
+            if current_platform.is_musa():
+                from contextlib import ExitStack
+
+                with ExitStack() as stack:
+                    for comm in (self.ca_comm, self.cag_comm, self.ca2a_comm):
+                        if comm is not None and hasattr(comm, "capture"):
+                            stack.enter_context(comm.capture())
+                    if graph_capture_context is None:
+                        graph_capture_context = GraphCaptureContext(None)
+                    yield graph_capture_context
+                return
             # For non-CUDA platforms (MPS, CPU), just yield the context without stream management
             if graph_capture_context is None:
                 # Create a dummy context for non-CUDA platforms

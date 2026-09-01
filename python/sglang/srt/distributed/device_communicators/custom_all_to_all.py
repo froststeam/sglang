@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import math
+from contextlib import contextmanager
 from typing import Optional, Union
 
 import torch
@@ -48,6 +49,7 @@ class MusaJitCustomAllToAll:
         self._opened_ipc_ptrs: list[int] = []
         self.meta_ptrs: list[int] = []
         self.output_storage: Optional[torch.Tensor] = None
+        self._IS_CAPTURING = False
 
         if not _is_musa:
             return
@@ -275,6 +277,16 @@ class MusaJitCustomAllToAll:
             self.world_size,
         )
         return output
+
+    @contextmanager
+    def capture(self):
+        """Keep pre-registered IPC buffers/slot allocator stable during graph capture."""
+        previous = self._IS_CAPTURING
+        self._IS_CAPTURING = True
+        try:
+            yield
+        finally:
+            self._IS_CAPTURING = previous
 
     def _next_output(
         self, shape: torch.Size | tuple[int, ...], numel: int

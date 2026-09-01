@@ -358,6 +358,8 @@ class Envs:
     SGLANG_MUSA_USE_JIT_ALL_GATHER = EnvBool(False)
     # Opt in: this path uses single-node IPC and a fixed per-rank output buffer.
     SGLANG_MUSA_USE_JIT_ALL_TO_ALL = EnvBool(False)
+    # Opt-in full DiT graph replay on MUSA.
+    SGLANG_MUSA_ENABLE_DIT_GRAPH = EnvBool(False)
     # Force attention TP tensor all-gather and reduce-scatter through PyNccl.
     SGLANG_MUSA_ENABLE_ATTN_TP_PYNCCL = EnvBool(False)
     # Round-robin disaggregation IB devices across GPUs by logical GPU ID
