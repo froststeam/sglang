@@ -26,14 +26,15 @@ from sglang.srt.mem_cache.pool_host.base import (
 from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 from sglang.srt.platforms import current_platform
-from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_mps, is_musa, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_musa = is_musa()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
-if _is_cuda or _is_hip:
+if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_mla,
@@ -89,7 +90,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         # helpers in hicache.cuh are guarded by USE_ROCM and the staged
         # write-back kernel has a ROCm path, so enable them on HIP too. This
         # keeps the ROCm write-back path consistent with CUDA.
-        self.can_use_jit = (_is_cuda or _is_hip) and can_use_hicache_jit_kernel(
+        self.can_use_jit = (_is_cuda or _is_hip or _is_musa) and can_use_hicache_jit_kernel(
             element_size=self.kv_cache_dim * self.dtype.itemsize
         )
 
@@ -229,7 +230,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         # The staged write-back JIT kernel builds with hipcc and has a ROCm
         # path, so enable it on HIP too (consistent with the CUDA path).
         self.can_use_write_back_jit = (
-            _is_cuda or _is_hip
+            _is_cuda or _is_hip or _is_musa
         ) and can_use_write_back_jit_kernel(
             element_size=self.kv_cache_dim * self.dtype.itemsize,
         )

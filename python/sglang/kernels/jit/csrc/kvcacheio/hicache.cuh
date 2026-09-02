@@ -42,9 +42,9 @@ using PackageType = decltype(get_mem_package<kUnit>());
 // NVIDIA exposes an explicit "do not allocate in L1" cache hint via PTX. ROCm
 // has no equivalent PTX, but non-temporal (streaming) loads/stores express the
 // same intent for one-shot HiCache write-back traffic that should not pollute
-// the cache. Guard the PTX behind USE_ROCM so the JIT module also compiles with
-// hipcc; see python/sglang/kernels/jit/utils/compile.py for the ROCm build flags.
-#ifdef USE_ROCM
+// the cache. Guard the PTX behind the non-CUDA build macros so the JIT module
+// also compiles with hipcc and mcc; see the JIT compiler flags for each backend.
+#if defined(USE_ROCM) || defined(USE_MUSA)
 // Native Clang vector types so a single __builtin_nontemporal_{load,store} maps
 // to one vectorized global_{load,store}_dwordx{2,4}. Issuing N independent
 // 32-bit nontemporal ops instead leaves merging to the LoadStoreVectorizer,
@@ -56,7 +56,7 @@ typedef uint32_t native_uint4 __attribute__((ext_vector_type(4)));
 #endif
 
 SGL_DEVICE uint1 load_nc(const uint1* __restrict__ src) {
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(USE_MUSA)
   uint32_t tmp;
   asm volatile("ld.global.L1::no_allocate.b32 %0,[%1];" : "=r"(tmp) : "l"(src));
   return uint1{tmp};
@@ -66,7 +66,7 @@ SGL_DEVICE uint1 load_nc(const uint1* __restrict__ src) {
 }
 
 SGL_DEVICE uint2 load_nc(const uint2* __restrict__ src) {
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(USE_MUSA)
   uint32_t tmp0, tmp1;
   asm volatile("ld.global.L1::no_allocate.v2.b32 {%0,%1},[%2];" : "=r"(tmp0), "=r"(tmp1) : "l"(src));
   return uint2{tmp0, tmp1};
@@ -77,7 +77,7 @@ SGL_DEVICE uint2 load_nc(const uint2* __restrict__ src) {
 }
 
 SGL_DEVICE uint4 load_nc(const uint4* __restrict__ src) {
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(USE_MUSA)
   uint32_t tmp0, tmp1, tmp2, tmp3;
   asm volatile("ld.global.L1::no_allocate.v4.b32 {%0,%1,%2,%3},[%4];"
                : "=r"(tmp0), "=r"(tmp1), "=r"(tmp2), "=r"(tmp3)
@@ -90,7 +90,7 @@ SGL_DEVICE uint4 load_nc(const uint4* __restrict__ src) {
 }
 
 SGL_DEVICE void store_nc(uint1* __restrict__ dst, const uint1& value) {
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(USE_MUSA)
   uint32_t tmp = value.x;
   asm volatile("st.global.L1::no_allocate.b32 [%0],%1;" ::"l"(dst), "r"(tmp));
 #else
@@ -99,7 +99,7 @@ SGL_DEVICE void store_nc(uint1* __restrict__ dst, const uint1& value) {
 }
 
 SGL_DEVICE void store_nc(uint2* __restrict__ dst, const uint2& value) {
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(USE_MUSA)
   uint32_t tmp0 = value.x;
   uint32_t tmp1 = value.y;
   asm volatile("st.global.L1::no_allocate.v2.b32 [%0],{%1,%2};" ::"l"(dst), "r"(tmp0), "r"(tmp1));
@@ -109,7 +109,7 @@ SGL_DEVICE void store_nc(uint2* __restrict__ dst, const uint2& value) {
 }
 
 SGL_DEVICE void store_nc(uint4* __restrict__ dst, const uint4& value) {
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(USE_MUSA)
   uint32_t tmp0 = value.x;
   uint32_t tmp1 = value.y;
   uint32_t tmp2 = value.z;

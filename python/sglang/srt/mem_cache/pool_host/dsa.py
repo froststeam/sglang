@@ -26,14 +26,15 @@ from sglang.srt.mem_cache.pool_host.common import (
     get_allocator_from_storage,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_mps, is_musa, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_musa = is_musa()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
-if _is_cuda or _is_hip:
+if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_mla,
@@ -187,7 +188,7 @@ class DSAIndexerPoolHost(HostKVCache):
         ):
             return
 
-        self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
+        self.can_use_write_back_jit = (_is_cuda or _is_hip or _is_musa) and can_use_write_back_jit_kernel(
             element_size=self.indexer_page_stride_size * self.indexer_dtype.itemsize,
         )
         staging_page_capacity = min(

@@ -15,11 +15,14 @@ class MusaDeviceMixin(CudaDeviceMixin):
     device_name: str = "musa"
     device_type: str = "musa"
 
-    def get_torch_distributed_backend_str(self) -> str:
-        return "mccl"
-
 
 class MusaSRTPlatform(MusaDeviceMixin, SRTPlatform):
     """Default in-tree MUSA SRT platform."""
 
-    capabilities = PlatformCapabilities(supports_triton=True, graph_capture=True)
+    capabilities = PlatformCapabilities(
+        supports_triton=True,
+        supports_fp8=True,
+        graph_capture=True,
+        piecewise_graph=True,
+        hicache_device_kernels=True,
+    )
