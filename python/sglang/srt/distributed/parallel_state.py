@@ -157,6 +157,11 @@ def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)
 
 
+def _should_skip_musa_empty_tensor_collective(tensor: torch.Tensor) -> bool:
+    """Skip zero-sized MUSA collectives unsupported by the backend."""
+    return _is_musa and tensor.numel() == 0
+
+
 @register_custom_op(mutates_args=["tensor"])
 @register_split_op()
 def inplace_all_reduce(tensor: torch.Tensor, group_name: str) -> None:
