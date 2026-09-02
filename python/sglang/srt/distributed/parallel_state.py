@@ -994,7 +994,7 @@ class GroupCoordinator:
         crs_comm = self.crs_comm
         return (
             _is_musa
-            and self.group_name == "attention_tp"
+            and (self.group_name == "attention_tp" or self is _ATTN_TP)
             and crs_comm is not None
             and not crs_comm.disabled
         )
@@ -1003,7 +1003,7 @@ class GroupCoordinator:
         cag_comm = self.cag_comm
         return (
             _is_musa
-            and self.group_name == "attention_tp"
+            and (self.group_name == "attention_tp" or self is _ATTN_TP)
             and cag_comm is not None
             and not cag_comm.disabled
         )
